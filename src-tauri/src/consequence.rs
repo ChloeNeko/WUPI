@@ -929,6 +929,63 @@ pub enum Polarity {
     Debuff,
 }
 
+/// (2026-08-22 second playtest pass — the injury-as-buff miscast) An
+/// affliction label NEVER reads as a Buff: the playtest tracker stamped the
+/// player's four minor wounds as `buff` polarity
+/// (`[EFFECT minor_foot_injury buff 0]`) and they counted in the buff
+/// column of `count_by_polarity` — drifting `derive_condition` upward off
+/// injuries. A label carrying an unambiguous affliction stem keeps its text
+/// but flips to `Polarity::Debuff`; everything else passes through
+/// untouched. Substring match — every stem below is affliction-only in any
+/// compound ("minor_foot_injury", "bleeding_arrow_wound"). Pure so the
+/// coercion is unit-testable.
+///
+/// (2026-08-24 review) Resistance markers reconcile the coercion with the
+/// illness lane: a label naming PROTECTION ("Poison Resistance", "Disease
+/// Immunity", "Waterproof Cloak", "Blessing of Protection") is ABOUT the
+/// harm, never suffering it — the affliction scan used to flip such buffs
+/// to Debuff, and `derive_health_tier` then read the Debuff + SICK_STEMS
+/// combination as a phantom SICK condition. A resistance marker coerces to
+/// Buff in BOTH directions and short-circuits the affliction scan; plain
+/// harmful keywords only flip when no marker is present.
+///
+/// (2026-08-25 fix) The resistance stems match at WORD boundaries, not raw
+/// substrings — "Irresistible Pain" (⊃ "resist") and "Unprotected" (⊃
+/// "protect") are real afflictions the raw contains flipped to Buff.
+/// Prefix stems (resist/immun/protect) anchor at word START; the -proof
+/// family anchors at word END (fireproof, waterproof). The affliction arm
+/// keeps its substring form (its stems are affliction-only in compounds).
+pub fn coerce_effect_polarity(label: &str, polarity: Polarity) -> Polarity {
+    const AFFLICTION_STEMS: &[&str] = &[
+        "injur", "wound", "fracture", "sprain", "bruise", "bleed",
+        "poison", "venom", "illness", "sick", "diseas", "fever", "infect",
+        "nausea", "pain", "ache",
+    ];
+    // Stem forms cover the inflections: resist/resists/resistant/resistance,
+    // immune/immunity/immunized, fireproof/waterproof/-proof,
+    // protect/protected/protection.
+    const RESISTANCE_PREFIX_STEMS: &[&str] = &["resist", "immun", "protect"];
+    const RESISTANCE_SUFFIX_STEMS: &[&str] = &["proof"];
+    let key = label.trim().to_lowercase();
+    let words: Vec<&str> = key
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let resistance = words.iter().any(|w| {
+        RESISTANCE_PREFIX_STEMS.iter().any(|stem| w.starts_with(stem))
+            || RESISTANCE_SUFFIX_STEMS.iter().any(|stem| w.ends_with(stem))
+    });
+    if resistance {
+        return Polarity::Buff;
+    }
+    if polarity == Polarity::Buff {
+        if AFFLICTION_STEMS.iter().any(|stem| key.contains(stem)) {
+            return Polarity::Debuff;
+        }
+    }
+    polarity
+}
+
 /// (2026-08-17 E4B shakedown P1b) The approved kinded-tag domain. `kind` is a
 /// MECHANIC ROUTE, not free text: `"disguise"` routes the tag into the
 /// disguise Referee gate (auto-pass vs scrutiny). The E4B stamped
@@ -938,13 +995,28 @@ pub enum Polarity {
 /// from the lethality condition-penalty DC. Every new mechanic lane that
 /// starts reading a kind must add its id here FIRST. Empty string = generic
 /// (always valid).
+/// (2026-08-24 Part II B7) The `equipped:<slug>` PREFIX family joins the
+/// domain — gear-borne conditions ("Cursed Gauntlets", kind:
+/// `equipped:cursed-gauntlets`) that live exactly as long as the item sits
+/// in its slot: the `[EQUIP]` unequip arm removes every live tag of the
+/// leaving item's kind (gear-borne conditions die with the gear, zero new
+/// machinery). Kinded tags already skip `count_by_polarity`, so the lane
+/// can't distort the lethality DC.
 pub const APPROVED_TAG_KINDS: &[&str] = &["disguise"];
 
-/// True when `kind` is the generic empty string or an approved mechanic lane.
-/// The apply path strips unapproved kinds (keeping the tag as a pure
-/// buff/debuff — polarity preserved) instead of persisting the miscategorization.
+/// The equipped-lane prefix (`equipped:<kebab-item-slug>`).
+pub const EQUIPPED_TAG_KIND_PREFIX: &str = "equipped:";
+
+/// True when `kind` is the generic empty string, an approved mechanic lane,
+/// or an `equipped:<slug>` lane member (the slug is normalized by
+/// [`sanitize_tag_kind`]). The apply path strips unapproved kinds (keeping
+/// the tag as a pure buff/debuff — polarity preserved) instead of persisting
+/// the miscategorization.
 pub fn valid_tag_kind(kind: &str) -> bool {
-    kind.is_empty() || APPROVED_TAG_KINDS.contains(&kind)
+    kind.is_empty()
+        || APPROVED_TAG_KINDS.contains(&kind)
+        || (kind.starts_with(EQUIPPED_TAG_KIND_PREFIX)
+            && kind.len() > EQUIPPED_TAG_KIND_PREFIX.len())
 }
 
 /// Label terms that plausibly describe a DISGUISE (a worn identity). The
@@ -984,11 +1056,25 @@ fn label_describes_disguise(label: &str) -> bool {
 /// ([`DISGUISE_LABEL_TERMS`]). Anything else returns `""`: the tag degrades
 /// to a pure buff/debuff (polarity preserved) with a one-line warning on
 /// stderr. Mechanical strip per the P1b spec — no prompt text involved.
+/// (2026-08-24 Part II B7) The `equipped:` lane normalizes its slug with
+/// `kebabify` so the tracker's free-form emission and the unequip arm's
+/// derivation (also kebabify of the item name) agree EXACTLY — the lane
+/// dies the moment the gear leaves the slot.
 pub fn sanitize_tag_kind(raw_kind: &str, label: &str) -> String {
     let normalized = raw_kind.trim().to_lowercase();
+    if let Some(slug) = normalized.strip_prefix(EQUIPPED_TAG_KIND_PREFIX) {
+        let slug = crate::site_map::kebabify(slug);
+        if slug.is_empty() {
+            eprintln!(
+                "[DEBUG] [EFFECT] stripped equipped-lane kind {raw_kind:?} — no item slug"
+            );
+            return String::new();
+        }
+        return format!("{EQUIPPED_TAG_KIND_PREFIX}{slug}");
+    }
     if !valid_tag_kind(&normalized) {
         eprintln!(
-            "[DEBUG] [EFFECT] stripped unapproved tag_kind {raw_kind:?} — tag kept as a pure buff/debuff (approved lanes: {APPROVED_TAG_KINDS:?})"
+            "[DEBUG] [EFFECT] stripped unapproved tag_kind {raw_kind:?} — tag kept as a pure buff/debuff (approved lanes: {APPROVED_TAG_KINDS:?} + {EQUIPPED_TAG_KIND_PREFIX}<slug>)"
         );
         return String::new();
     }
@@ -1371,6 +1457,166 @@ impl FrustrationState {
 mod tests {
     use super::*;
 
+    // ---- (2026-08-23 hazard referees) the "Impaired" rest tag ----
+
+    #[test]
+    fn impaired_rest_tag_is_bleary_not_sick() {
+        // The Rest Interruption Referee's tag: a BLEARY wake-up condition,
+        // never an illness. Pinned here so the label can never silently
+        // drift into the illness cascade — "Impaired" must not match
+        // SICK_STEMS / INFECTED_STEMS / ILLNESS_WORDS (whole-word "ill"
+        // must not fire on it either), so a healthy body with an Impaired
+        // tag keeps its wound grade (NOT Sick/Infected) while still
+        // counting as a pure Debuff in count_by_polarity (the lethality
+        // condition_penalty — the bleary-eyed ambush).
+        let now = 10_000;
+        let impaired = StatusTag {
+            label: "Impaired".into(),
+            polarity: Polarity::Debuff,
+            expires_at: now + 30,
+            source: "interrupted rest".into(),
+            kind: String::new(),
+        };
+        let healthy: HashMap<BodyPart, BodyPartState> = HashMap::new();
+        assert_eq!(
+            derive_health_tier(&healthy, std::slice::from_ref(&impaired), now),
+            HealthTier::Excellent,
+            "'Impaired' must not derive Sick/Infected"
+        );
+        assert_eq!(
+            count_by_polarity(&[impaired.clone()], Polarity::Debuff, now),
+            1,
+            "'Impaired' is a pure Debuff — it counts in condition_penalty"
+        );
+    }
+
+    // ---- Effect polarity coercion (2026-08-22 second playtest pass) ----
+
+    #[test]
+    fn coerce_effect_polarity_flips_affliction_buffs() {
+        // The playtest's exact miscast: four minor wounds stamped `buff`.
+        assert_eq!(
+            coerce_effect_polarity("minor_foot_injury", Polarity::Buff),
+            Polarity::Debuff
+        );
+        assert_eq!(
+            coerce_effect_polarity("minor_wrist_injury buff", Polarity::Buff),
+            Polarity::Debuff
+        );
+        assert_eq!(
+            coerce_effect_polarity("Arrow Wound", Polarity::Buff),
+            Polarity::Debuff
+        );
+        assert_eq!(
+            coerce_effect_polarity("bleeding", Polarity::Buff),
+            Polarity::Debuff
+        );
+        // Real buffs pass through untouched.
+        assert_eq!(
+            coerce_effect_polarity("Berserker Rage", Polarity::Buff),
+            Polarity::Buff
+        );
+        assert_eq!(
+            coerce_effect_polarity("Blessing of Iron", Polarity::Buff),
+            Polarity::Buff
+        );
+        // Debuffs (already right) and empty labels pass through.
+        assert_eq!(
+            coerce_effect_polarity("minor_foot_injury", Polarity::Debuff),
+            Polarity::Debuff
+        );
+        assert_eq!(coerce_effect_polarity("", Polarity::Buff), Polarity::Buff);
+    }
+
+    /// (2026-08-24 review) Resistance markers beat the affliction scan, in
+    /// BOTH directions — the old coercion flipped "Poison Resistance" buffs
+    /// to Debuff, and the illness lane then read the combination as a
+    /// phantom SICK condition.
+    #[test]
+    fn coerce_effect_polarity_resistance_markers_stay_buff() {
+        // A resistance/immunity/-proof/protection label keeps (or gains)
+        // Buff polarity — it is ABOUT the harm, not suffering it.
+        for label in [
+            "Poison Resistance",
+            "Disease Immunity",
+            "Venom Immune",
+            "Waterproof",
+            "Fireproof Cloak",
+            "Blessing of Protection",
+            "protected by the sun priest",
+        ] {
+            assert_eq!(
+                coerce_effect_polarity(label, Polarity::Buff),
+                Polarity::Buff,
+                "'{label}' names protection — it must stay a Buff"
+            );
+            assert_eq!(
+                coerce_effect_polarity(label, Polarity::Debuff),
+                Polarity::Buff,
+                "'{label}' names protection — it must coerce UP to Buff"
+            );
+        }
+        // Plain harmful keywords still flip when NO marker is present.
+        assert_eq!(
+            coerce_effect_polarity("poison", Polarity::Buff),
+            Polarity::Debuff
+        );
+        assert_eq!(
+            coerce_effect_polarity("Sick", Polarity::Buff),
+            Polarity::Debuff
+        );
+    }
+
+    /// (2026-08-25 fix) Word-boundary resistance stems: mid-word embeddings
+    /// ("irresistible" ⊃ resist, "unprotected" ⊃ protect) are AFFLICTIONS,
+    /// not protection markers — the raw substring scan flipped real debuffs
+    /// to Buff.
+    #[test]
+    fn coerce_effect_polarity_word_boundary_resistance() {
+        assert_eq!(
+            coerce_effect_polarity("Irresistible Pain", Polarity::Debuff),
+            Polarity::Debuff
+        );
+        assert_eq!(
+            coerce_effect_polarity("Unprotected", Polarity::Debuff),
+            Polarity::Debuff
+        );
+        // Word-boundary inflections still read as protection.
+        assert_eq!(
+            coerce_effect_polarity("Poison Resistant", Polarity::Buff),
+            Polarity::Buff
+        );
+        assert_eq!(
+            coerce_effect_polarity("Weatherproof", Polarity::Buff),
+            Polarity::Buff
+        );
+    }
+
+    /// (2026-08-24 review) The reconciliation end-to-end: a "Poison
+    /// Resistance" tag must NOT derive the phantom SICK tier. Before the
+    /// fix, the coercion flipped it to Debuff and `derive_health_tier` read
+    /// the (Debuff + "poison" SICK_STEM) combination as illness.
+    #[test]
+    fn poison_resistance_tag_does_not_derive_sick() {
+        let now = 10_000;
+        let healthy: HashMap<BodyPart, BodyPartState> = HashMap::new();
+        let tag = StatusTag {
+            label: "Poison Resistance".into(),
+            // The polarity the applier stamps (post-coercion) is Buff —
+            // derive_health_tier only reads PURE Debuffs, so no Sick.
+            polarity: coerce_effect_polarity("Poison Resistance", Polarity::Buff),
+            expires_at: now + 120,
+            source: "quaffed an antidote".into(),
+            kind: String::new(),
+        };
+        assert_eq!(tag.polarity, Polarity::Buff, "the coercion must keep it a Buff");
+        assert_eq!(
+            derive_health_tier(&healthy, std::slice::from_ref(&tag), now),
+            HealthTier::Excellent,
+            "a poison RESISTANCE must never read as being poisoned"
+        );
+    }
+
     // ---- Driver taxonomy ----
 
     #[test]
@@ -1546,17 +1792,29 @@ mod tests {
     }
 
     #[test]
-    fn derive_condition_minor_wound_is_haggard() {
-        let mut wounds = HashMap::new();
-        wounds.insert(BodyPart::LeftHand, BodyPartState::Yellow);
-        assert_eq!(derive_condition(&wounds, 0, 0), Condition::Haggard);
+    fn derive_condition_minor_wound_band() {
+        // Points system (2026-08-20 unification): a lone Yellow LIMB is
+        // 1 pt — far below the 8-pt Good band → still Unscathed. Only a
+        // CORE yellow (Head/Neck/UpperTorso floor: yellow → Good) reads
+        // Haggard.
+        let mut limb = HashMap::new();
+        limb.insert(BodyPart::LeftHand, BodyPartState::Yellow);
+        assert_eq!(derive_condition(&limb, 0, 0), Condition::Unscathed);
+        let mut core = HashMap::new();
+        core.insert(BodyPart::UpperTorso, BodyPartState::Yellow);
+        assert_eq!(derive_condition(&core, 0, 0), Condition::Haggard);
     }
 
     #[test]
-    fn derive_condition_medium_wound_is_wounded() {
-        let mut wounds = HashMap::new();
-        wounds.insert(BodyPart::LeftUpperArm, BodyPartState::Orange);
-        assert_eq!(derive_condition(&wounds, 0, 0), Condition::Wounded);
+    fn derive_condition_medium_wound_band() {
+        // Same split: a lone Orange LIMB is 2 pts (below the band) →
+        // Unscathed; a CORE orange (floor: orange → Fair) reads Wounded.
+        let mut limb = HashMap::new();
+        limb.insert(BodyPart::LeftUpperArm, BodyPartState::Orange);
+        assert_eq!(derive_condition(&limb, 0, 0), Condition::Unscathed);
+        let mut core = HashMap::new();
+        core.insert(BodyPart::Neck, BodyPartState::Orange);
+        assert_eq!(derive_condition(&core, 0, 0), Condition::Wounded);
     }
 
     #[test]
@@ -1574,12 +1832,14 @@ mod tests {
     }
 
     #[test]
-    fn derive_condition_amputated_alone_is_critical() {
-        // A single amputation is shock-critical, not Downed (the body is
-        // holding on but only just).
+    fn derive_condition_amputated_alone_is_wounded() {
+        // Points system (2026-08-20 unification): a lone Black limb = 16
+        // pts → the 12-17 Fair band → Wounded. NOT Critical — a stable
+        // amputee is wounded, not dying (see health_points' doc) — and
+        // not Downed (the shock escalation needs a second severe wound).
         let mut wounds = HashMap::new();
         wounds.insert(BodyPart::LeftHand, BodyPartState::Black);
-        assert_eq!(derive_condition(&wounds, 0, 0), Condition::Critical);
+        assert_eq!(derive_condition(&wounds, 0, 0), Condition::Wounded);
     }
 
     #[test]
@@ -1689,17 +1949,20 @@ mod tests {
     }
 
     #[test]
-    fn health_tier_black_limbs_score_zero() {
-        // Black (amputated) limbs don't count toward health — 0 points each.
+    fn health_tier_black_limbs_score_sixteen() {
+        // Black (amputated) limbs score 16 pts each — the doubling ladder
+        // COMPLETED (2026-08-20 unification; the old Black=0 read a
+        // triple-amputee as Excellent). 3 Blacks = 48 pts → Critical.
         assert_eq!(
             derive_health_tier(&limb_wounds(3, BodyPartState::Black), &[], 0),
-            HealthTier::Excellent
+            HealthTier::Critical
         );
-        // …and a black limb never pushes a load over a band edge
-        // (2 purple + 1 black = 16 pts → Fair, not Poor).
+        // …and a black limb pushes loads over band edges like any other:
+        // 2 purple + 1 black = 8+8+16 = 32 pts → Critical (24+), not the
+        // pre-unification 16-pt Fair.
         let mut w = limb_wounds(2, BodyPartState::Purple);
         w.insert(BodyPart::LeftHand, BodyPartState::Black);
-        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Fair);
+        assert_eq!(derive_health_tier(&w, &[], 0), HealthTier::Critical);
     }
 
     #[test]
@@ -2245,6 +2508,52 @@ mod tests {
         assert_eq!(sanitize_tag_kind(" Disguise ", "city guard uniform"), "disguise");
         assert_eq!(sanitize_tag_kind("disguise", "traveler's cloak"), "disguise");
         assert_eq!(sanitize_tag_kind("disguise", "masked beggar persona"), "disguise");
+    }
+
+    // ---- (2026-08-24 Part II B7) the equipped:<slug> lane -----------------
+
+    #[test]
+    fn equipped_lane_is_valid_and_slug_normalized() {
+        // The lane validates; the slug kebabifies so the tracker's emission
+        // and the unequip arm's derivation agree exactly.
+        assert!(valid_tag_kind("equipped:flame-dagger"));
+        assert!(valid_tag_kind("equipped:cursed_gauntlets".replace('_', "-").as_str()));
+        assert!(!valid_tag_kind("equipped:"));
+        assert!(!valid_tag_kind("equipped"));
+        assert_eq!(
+            sanitize_tag_kind("equipped:Cursed Gauntlets", "creeping numbness"),
+            "equipped:cursed-gauntlets"
+        );
+        assert_eq!(
+            sanitize_tag_kind(" EQUIPPED:Flame_Dagger ", "itching grip"),
+            "equipped:flame-dagger"
+        );
+        // A bare slug strips to generic (no item = no lane).
+        assert_eq!(sanitize_tag_kind("equipped:", "anything"), "");
+    }
+
+    #[test]
+    fn equipped_lane_tags_skip_polarity_count() {
+        // Kinded tags never distort the lethality DC — the lane included.
+        let now = 1_000i64;
+        let tags = vec![
+            StatusTag {
+                label: "wretched chill".into(),
+                polarity: Polarity::Debuff,
+                expires_at: 10_000,
+                source: String::new(),
+                kind: "equipped:frozen-crown".into(),
+            },
+            StatusTag {
+                label: "battle calm".into(),
+                polarity: Polarity::Buff,
+                expires_at: 10_000,
+                source: String::new(),
+                kind: String::new(),
+            },
+        ];
+        assert_eq!(count_by_polarity(&tags, Polarity::Debuff, now), 0);
+        assert_eq!(count_by_polarity(&tags, Polarity::Buff, now), 1);
     }
 
     #[test]

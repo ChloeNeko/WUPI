@@ -256,8 +256,11 @@ pub struct AuthoredProperty {
 // ── Pure curves ───────────────────────────────────────────────────────────
 
 /// The lifestyle cost at a given node prosperity — the inverse curve
-/// `ceil(base × 100 / pct)` clamped to `[base, base × COST_MULTIPLIER_CAP]`.
-/// Hard times cost more everywhere; they never cost infinity.
+/// `ceil(base × 100 / pct)`: hard times cost more (prosperity 25 → the
+/// `base × COST_MULTIPLIER_CAP` ceiling), boom discounts (200 → half
+/// price). The prosperity clamp already bounds `raw` to
+/// `[ceil(base/2), 4×base]`; the explicit floor of 1 only guards the
+/// zero case (a nonzero base never costs nothing).
 pub fn lifestyle_cost(base: u32, prosperity: u8) -> u32 {
     if base == 0 {
         return 0;
@@ -265,7 +268,7 @@ pub fn lifestyle_cost(base: u32, prosperity: u8) -> u32 {
     let pct = prosperity.clamp(PROSPERITY_MIN, PROSPERITY_MAX) as u64;
     let raw = (base as u64 * 100 + pct - 1) / pct;
     let cap = base as u64 * COST_MULTIPLIER_CAP as u64;
-    raw.clamp(base as u64, cap) as u32
+    raw.clamp(1, cap) as u32
 }
 
 /// Prosperity-scaled daily revenue: `floor(revenue × pct / 100)`.
@@ -384,6 +387,53 @@ pub fn format_money(amount: i64, label: &str) -> String {
     format!("{sign}{}", body.join(" "))
 }
 
+/// (2026-08-22 second playtest pass — the fabricated wealth gain) Does the
+/// narrative window carry any money-MOVEMENT signal? The 0.29.1 playtest
+/// tracker emitted `[LEDGER wealth +12]` off the player *mentioning* coin
+/// ("counting the coins in my coinpurse" — an inspection, not an exchange)
+/// and the schema minted coin that never existed. A GAIN is grounded only
+/// when the window carries a transfer verb; coin NOUNS ("coinpurse",
+/// "silver") are deliberately NOT signals — they describe, they don't move.
+/// Word-boundary, case-insensitive; an EMPTY corpus fails OPEN (the
+/// `narrative_grounded` convention — a degenerate window never rejects).
+/// SPENDS stay ungated (the insufficient-funds check owns them). A false
+/// negative (an obliquely-narrated reward) costs one coached turn; a false
+/// positive mints permanent coin — the list skews unambiguous on purpose.
+pub fn wealth_gain_grounded(corpus: &[&str]) -> bool {
+    if corpus.is_empty() {
+        return true;
+    }
+    const TRANSFER_STEMS: &[&str] = &[
+        "paid", "pays", "payment", "repay", "repaid", "repayment",
+        "reward", "rewards", "rewarded",
+        "earns", "earned", "earnings",
+        "loot", "loots", "looted", "looting",
+        "pillage", "pillaged", "plunder", "plunders", "plundered",
+        "steals", "stole", "stolen",
+        "receives", "received",
+        "sell", "sells", "sold", "selling",
+        "wage", "wages", "salary", "bounty", "bounties", "payout",
+        "handout", "handouts",
+        // (2026-08-23 audit) The high-frequency phrasings the playtest class
+        // kept hitting: direct giving + collection verbs. PAST-TENSE verb
+        // forms only — the shared noun forms ("hands", "tips", "pockets")
+        // describe, they don't move coin (the "his pockets jingled" class
+        // would ground the exact fabrication this gate exists to stop).
+        "gave", "given", "gives",
+        "granted", "granting",
+        "handed",
+        "tipped",
+        "gifted",
+        "collect", "collects", "collected", "collecting",
+        "pocketed",
+    ];
+    corpus.iter().any(|text| {
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .any(|w| TRANSFER_STEMS.contains(&w.to_lowercase().as_str()))
+    })
+}
+
 /// The `<economy_anchor>` block (2026-08-21 Chloe addendum): the Rust-owned
 /// relative price ladder rendered inside `<world_state>` — the
 /// anti-price-hallucination scaffolding. Deterministic values ONLY (the
@@ -436,7 +486,17 @@ pub fn render_economy_anchor(s: &WorldSchema) -> Option<String> {
 /// Emission discipline: TRANSITION-ONLY directives (a state entered/left —
 /// deficit, seizure, lapse, starving, recovery, till-dipped). Routine
 /// accrual and wages are silent (the ledger line shows them).
-pub fn settle_daily_economy(s: &mut WorldSchema, now_minutes: i64) -> (Vec<String>, bool) {
+///
+/// (2026-08-23 Playground) `freeze_survival` — the FREEZE CLAMPS god flag
+/// threaded from its caller: when true the INSOLVENCY arm skips the stamina
+/// drain + the "Starving" stamp (+ its directive). The money math still
+/// runs (pocket drained, tills dipped) — only the survival punishment is
+/// suppressed. No prompt-text changes anywhere (Prime Mandate untouched).
+pub fn settle_daily_economy(
+    s: &mut WorldSchema,
+    now_minutes: i64,
+    freeze_survival: bool,
+) -> (Vec<String>, bool) {
     let mut directives: Vec<String> = Vec::new();
     let mut mutated = false;
 
@@ -587,7 +647,12 @@ pub fn settle_daily_economy(s: &mut WorldSchema, now_minutes: i64) -> (Vec<Strin
             if remaining > 0 {
                 // Could not pay → Starving (once; the tag is permanent, the
                 // illness cascade + health-tier derive the rest).
-                if !s.status_tags.iter().any(starving_label) {
+                // (2026-08-23 Playground) FREEZE CLAMPS skips this arm —
+                // no drain, no stamp, no directive — WITHOUT falling into
+                // the solvent else-branch (a frozen insolvent day must not
+                // CLEAR Starving or emit recovery lines; the money math
+                // above already ran).
+                if !s.status_tags.iter().any(starving_label) && !freeze_survival {
                     crate::consequence::upsert_tag(
                         &mut s.status_tags,
                         StatusTag {
@@ -775,6 +840,28 @@ mod tests {
         }
     }
 
+    // ── Wealth-gain grounding (2026-08-22 second playtest pass) ──────────
+
+    #[test]
+    fn wealth_gain_grounded_gates_on_transfer_verbs() {
+        // Empty corpus fails OPEN (the narrative_grounded convention).
+        assert!(wealth_gain_grounded(&[]));
+        // The playtest's exact fabrication — coin NOUNS never ground a gain.
+        assert!(!wealth_gain_grounded(&[
+            "*I whistle, counting the coins in my coinpurse now with this*",
+        ]));
+        assert!(!wealth_gain_grounded(&["\"Three silver to find Rhet,\" she quotes"]));
+        // Real flows ground.
+        assert!(wealth_gain_grounded(&["the guildmaster paid me twelve silver"]));
+        assert!(wealth_gain_grounded(&["I loot the corpse's purse"]));
+        assert!(wealth_gain_grounded(&["she sells the ears to the guild"]));
+        assert!(wealth_gain_grounded(&["a reward of 5 silver, earned in full"]));
+        // Word-boundary + case-insensitive: "Repayment" (no substring
+        // accident), and "coinpurse" must NOT match any stem.
+        assert!(wealth_gain_grounded(&["Repayment arrives by courier"]));
+        assert!(!wealth_gain_grounded(&["coinpurse coinpurse coinpurse"]));
+    }
+
     // ── Curves ────────────────────────────────────────────────────────────
 
     #[test]
@@ -904,13 +991,13 @@ mod tests {
     #[test]
     fn settlement_accrues_per_day_and_stamps() {
         let mut s = schema_with_property(property("town", 10, 3)); // net +7
-        let (dirs, mutated) = settle_daily_economy(&mut s, 2 * 1440);
+        let (dirs, mutated) = settle_daily_economy(&mut s, 2 * 1440, false);
         assert!(mutated);
         assert!(dirs.is_empty(), "routine accrual is silent");
         assert_eq!(s.properties["forge"].treasury_balance, 14);
         assert_eq!(s.properties["forge"].last_settled_minutes, 2 * 1440);
         // Idempotence within the same day.
-        let (_, mutated2) = settle_daily_economy(&mut s, 2 * 1440 + 300);
+        let (_, mutated2) = settle_daily_economy(&mut s, 2 * 1440 + 300, false);
         assert!(!mutated2);
         assert_eq!(s.properties["forge"].treasury_balance, 14);
     }
@@ -918,18 +1005,18 @@ mod tests {
     #[test]
     fn settlement_tracks_deficit_transitions_and_collapse() {
         let mut s = schema_with_property(property("town", 0, 5)); // net −5
-        let (dirs, _) = settle_daily_economy(&mut s, 1440);
+        let (dirs, _) = settle_daily_economy(&mut s, 1440, false);
         assert_eq!(dirs.len(), 1, "deficit ENTRY is a transition directive");
         assert!(dirs[0].contains("deficit"));
         assert_eq!(s.properties["forge"].treasury_balance, -5);
         assert_eq!(s.properties["forge"].deficit_days, 1);
         // Day 2..6: still in deficit, no new directive.
-        let (dirs, _) = settle_daily_economy(&mut s, 6 * 1440);
+        let (dirs, _) = settle_daily_economy(&mut s, 6 * 1440, false);
         assert!(dirs.is_empty(), "ongoing deficit is silent");
         assert_eq!(s.properties["forge"].deficit_days, 6);
         assert_eq!(s.properties["forge"].treasury_balance, -30);
         // Day 7: seizure.
-        let (dirs, _) = settle_daily_economy(&mut s, 7 * 1440);
+        let (dirs, _) = settle_daily_economy(&mut s, 7 * 1440, false);
         assert!(!s.properties.contains_key("forge"), "collapsed at 7 deficit days");
         assert!(dirs.iter().any(|d| d.contains("seized")));
         // (2026-08-20 audit) The order vec carries no dead id after a
@@ -942,7 +1029,7 @@ mod tests {
                 ..property("town", 0, 5)
             },
         );
-        let (dirs, _) = settle_daily_economy(&mut s, 8 * 1440);
+        let (dirs, _) = settle_daily_economy(&mut s, 8 * 1440, false);
         assert!(
             dirs.iter()
                 .any(|d| d.contains("seized") && d.contains("mara's holdings")),
@@ -956,12 +1043,12 @@ mod tests {
     #[test]
     fn settlement_recovery_resets_deficit() {
         let mut s = schema_with_property(property("town", 0, 5));
-        settle_daily_economy(&mut s, 2 * 1440);
+        settle_daily_economy(&mut s, 2 * 1440, false);
         assert_eq!(s.properties["forge"].deficit_days, 2);
         // The town booms (node prosperity 200 doubles revenue) — but upkeep
         // still wins at revenue 0. Instead: revenue now exceeds upkeep.
         s.properties.get_mut("forge").unwrap().daily_revenue = 10;
-        settle_daily_economy(&mut s, 3 * 1440);
+        settle_daily_economy(&mut s, 3 * 1440, false);
         assert_eq!(s.properties["forge"].deficit_days, 0, "net-positive day resets the streak");
         // −10 accrued + net +5/day × 1 day… (−10 at day 2, then +5 at day 3).
         assert_eq!(s.properties["forge"].treasury_balance, -10 + 5);
@@ -983,13 +1070,13 @@ mod tests {
             absent_days: 0,
         });
         // Day 1-2: paid while away (presence-free), absence counted.
-        let (dirs, mutated) = settle_daily_economy(&mut s, 2 * 1440);
+        let (dirs, mutated) = settle_daily_economy(&mut s, 2 * 1440, false);
         assert!(mutated);
         assert_eq!(s.player_state.wealth, 8);
         assert_eq!(s.player_state.jobs[0].absent_days, 2);
         assert!(dirs.is_empty(), "wages are silent");
         // Day 3: contract lapses.
-        let (dirs, _) = settle_daily_economy(&mut s, 3 * 1440);
+        let (dirs, _) = settle_daily_economy(&mut s, 3 * 1440, false);
         assert_eq!(s.player_state.wealth, 12, "the lapsing day still pays");
         assert!(s.player_state.jobs.is_empty());
         assert!(dirs.iter().any(|d| d.contains("lapsed")));
@@ -1006,7 +1093,7 @@ mod tests {
             last_settled_minutes: 0,
             absent_days: 2,
         });
-        settle_daily_economy(&mut s, 1440);
+        settle_daily_economy(&mut s, 1440, false);
         assert_eq!(s.player_state.jobs[0].absent_days, 0, "presence resets the counter");
         assert_eq!(s.player_state.jobs.len(), 1);
     }
@@ -1050,7 +1137,7 @@ mod tests {
                 ..property("town", 0, 0)
             },
         );
-        let (dirs, mutated) = settle_daily_economy(&mut s, 1440);
+        let (dirs, mutated) = settle_daily_economy(&mut s, 1440, false);
         assert!(mutated);
         // 10 due: 5 from pocket + 3 from the inn till, 2 short → Starving.
         assert_eq!(s.player_state.wealth, 0);
@@ -1088,7 +1175,7 @@ mod tests {
                 ..property("town", 0, 0)
             },
         );
-        let (dirs, mutated) = settle_daily_economy(&mut s, 1440);
+        let (dirs, mutated) = settle_daily_economy(&mut s, 1440, false);
         assert!(mutated);
         // Fully paid: pocket 5 + till 5 of 8.
         assert_eq!(s.player_state.wealth, 0);
@@ -1113,7 +1200,7 @@ mod tests {
             kind: String::new(),
         });
         s.player_state.wealth = 10;
-        let (dirs, _) = settle_daily_economy(&mut s, 2 * 1440);
+        let (dirs, _) = settle_daily_economy(&mut s, 2 * 1440, false);
         assert!(s.status_tags.is_empty(), "solvent day clears Starving");
         assert!(dirs.iter().any(|d| d.contains("eating properly")));
         assert_eq!(s.player_state.wealth, 6);
@@ -1132,7 +1219,7 @@ mod tests {
             kind: String::new(),
         });
         s.player_state.stamina = crate::player_state::Stamina::Winded;
-        settle_daily_economy(&mut s, 3 * 1440);
+        settle_daily_economy(&mut s, 3 * 1440, false);
         assert_eq!(
             s.status_tags.iter().filter(|t| t.label == "Starving").count(),
             1,
@@ -1148,9 +1235,37 @@ mod tests {
     #[test]
     fn squatter_and_empty_economy_settle_nothing() {
         let mut s = WorldSchema::default();
-        let (dirs, mutated) = settle_daily_economy(&mut s, 30 * 1440);
+        let (dirs, mutated) = settle_daily_economy(&mut s, 30 * 1440, false);
         assert!(!mutated);
         assert!(dirs.is_empty());
+    }
+
+    #[test]
+    fn freeze_survival_skips_starving_stamp_and_drain() {
+        // (2026-08-23 Playground) FREEZE CLAMPS: an insolvent lifestyle day
+        // still drains the pocket (the money math runs), but the "Starving"
+        // stamp + the stamina drain + the hunger directive never land.
+        let mut make = || {
+            let mut s = WorldSchema::default();
+            s.travel_graph.current_node = Some("town".into());
+            s.player_state.lifestyle = Lifestyle::Comfortable;
+            s.player_state.wealth = 0;
+            s
+        };
+        let mut frozen = make();
+        let (dirs, mutated) = settle_daily_economy(&mut frozen, 2 * 1440, true);
+        assert!(mutated, "the settle still ran (stamps advanced)");
+        assert!(
+            !frozen.status_tags.iter().any(|t| t.label == "Starving"),
+            "no Starving stamp while frozen"
+        );
+        assert!(dirs.is_empty(), "no hunger directive while frozen: {dirs:?}");
+        // The unfrozen twin DOES starve (the pin that freeze suppresses a
+        // real arm, not a dead one).
+        let mut live = make();
+        let (dirs, _) = settle_daily_economy(&mut live, 2 * 1440, false);
+        assert!(live.status_tags.iter().any(|t| t.label == "Starving"));
+        assert!(!dirs.is_empty());
     }
 
     // ── Conservation invariant ────────────────────────────────────────────
@@ -1178,7 +1293,7 @@ mod tests {
         });
         s.player_state.lifestyle = Lifestyle::Modest; // −2/day
         let before = player_net_worth(&s);
-        settle_daily_economy(&mut s, 7 * 1440);
+        settle_daily_economy(&mut s, 7 * 1440, false);
         let after = player_net_worth(&s);
         // 7 × (4 + 3 − 2) = +35 exactly.
         assert_eq!(after - before, 35);
@@ -1191,7 +1306,9 @@ mod tests {
     #[test]
     fn ledger_line_caps_and_marks() {
         let mut s = WorldSchema::default();
-        for i in 0..6 {
+        // 10 properties against the live LEDGER_PROMPT_CAP of 8 → the
+        // first 8 render (sorted BTreeMap order) + a (+2 more) marker.
+        for i in 0..10 {
             s.properties.insert(
                 format!("p{i}"),
                 Property {
@@ -1212,7 +1329,7 @@ mod tests {
         let line = render_ledger_line(&s).expect("properties exist");
         assert!(line.starts_with("p0@town +2/day till 0 (owner mara)"));
         assert!(line.contains("BANKRUPT 2d"), "deficit marker rides: {line}");
-        assert!(line.contains("(+2 more)"), "cap 4 + overflow marker");
+        assert!(line.contains("(+2 more)"), "cap 8 + overflow marker");
         assert!(render_ledger_line(&WorldSchema::default()).is_none());
     }
 

@@ -37,6 +37,14 @@ function fmtTime(ms) {
   } catch (_) { return ''; }
 }
 
+// (2026-08-24 review fix) The ONE sanctioned closer — the npc-dossier
+// pattern. A module-level ref so BOTH the one-at-a-time sweep in open and
+// closeSavesModal run the PREVIOUS popup's FULL teardown (listeners +
+// element). The old bare `el.remove()` sweeps orphaned the document-capture
+// Esc handler, which later stole an Escape from whatever modal was open
+// next (renderWorlds sweeps via closeSavesModal on every screen entry).
+let activeSavesClose = null;
+
 // Open the popup on `host` (the worlds screen — the card modal stays open
 // behind it). opts:
 //   cardId   — the partition whose saves are listed (+ deletes)
@@ -45,8 +53,8 @@ function fmtTime(ms) {
 //   onSelect — receives the chosen SaveMeta
 export function openSavesModal(host, opts) {
   if (!host) return;
-  // One popup at a time (the raw-editor pattern: a leftover can only exist
-  // if a close was interrupted, so a plain replace is enough).
+  // One popup at a time: run the live popup's full teardown first.
+  closeSavesModal();
   host.querySelectorAll('.fable-saves-popup-overlay').forEach((el) => el.remove());
 
   const overlay = document.createElement('div');
@@ -77,10 +85,12 @@ export function openSavesModal(host, opts) {
     if (e.key === 'Escape') { e.stopPropagation(); close(); }
   };
   function close() {
+    if (activeSavesClose === close) activeSavesClose = null;
     overlay.removeEventListener('click', onBackdrop);
     document.removeEventListener('keydown', onEsc, { capture: true });
     overlay.remove();
   }
+  activeSavesClose = close;
   overlay.addEventListener('click', onBackdrop);
   document.addEventListener('keydown', onEsc, { capture: true });
   overlay.querySelector('.fable-saves-popup-close').addEventListener('click', close);
@@ -90,9 +100,14 @@ export function openSavesModal(host, opts) {
 
 // Remove any popup living on `host` (renderWorlds calls this on every screen
 // entry — a popup left behind by a resumed game must not cover the grid).
-export function closeSavesModal(host) {
-  if (!host) return;
-  host.querySelectorAll('.fable-saves-popup-overlay').forEach((el) => el.remove());
+// (2026-08-24 review fix) Runs the live popup's FULL teardown — the old bare
+// element sweep orphaned the document-capture Esc handler.
+export function closeSavesModal() {
+  if (activeSavesClose) {
+    const close = activeSavesClose;
+    activeSavesClose = null;
+    close();
+  }
 }
 
 // Render the list into an open popup. Same shape as the retired screen's

@@ -9,19 +9,22 @@
 // the **inspection panel** (engine/inventory-panel.js): clicking the backpack
 // blooms 6 gems onto the paperdoll's body regions; selecting a gem reveals
 // the inspection panel above the backpack, which renders that zone's items as
-// a paginated button list + a contextual action popup (CONSUME/EQUIP/POCKET/
+// a paginated button list + a contextual action popup (CONSUME/EQUIP/POUCH/
 // STORE/DISCARD) with an EQUIP destination sub-menu. The typed Rust inventory
-// model (equipment.rs: 6 slots × 2 layers + belt + pack, each item carrying a
-// behavior-tag set) is mutated by the [EQUIP]/[BELT]/[PACK] brackets (tagged
-// via the tracker) OR by the inspection panel's UI actions (which fire
-// fable_schema_set with an event_note trace the next narrator turn sees).
+// model (equipment.rs: 6 slots × 2 layers + belt + pouch + pack, each item
+// carrying a behavior-tag set) is mutated by the [EQUIP]/[BELT]/[PACK]
+// brackets (tagged via the tracker) OR by the inspection panel's UI actions
+// (which fire fable_schema_set with an event_note trace the next narrator
+// turn sees). The POUCH dock icon (2026-08-23 pouch ruling, between the
+// gender toggle + the calendar) opens the SAME panel as the wallet view —
+// player_state.pouch, the auto-routed coin/keys/ID/small-valuables stack.
 // (History: the original 2026-08-02 drag-and-drop panel + the 2026-08-07
 // hover overlay/widgets were deleted; the Soul Gems system replaced them.)
 // The ambient time-of-day tint + Chronos & Climate panel was REMOVED on
 // 2026-08-03 to be redone later.
 //
 // The drawer mechanics below are UNCHANGED — stage.js's hover-strip +
-// edge-lock wiring drives this drawer identically to the right Wupi drawer.
+// drawer-tab wiring drives this drawer identically to the right Wupi drawer.
 // =============================================================
 
 import MALE_URL from '../assets/paperdoll_male.png';
@@ -55,14 +58,27 @@ import {
   setGender as setSoulGemGender, soulGemSet, SOUL_GEM_DATA_ATTR,
 } from './soul-gem.js';
 // The INVENTORY PANEL — the item inspection surface rendered into the
-// #inventory-panel-slot when a Soul Gem is selected. Owns the 6-zone data
-// aggregation (equipment/belt/pack → the gem's category), the paginated
+// #inventory-panel-slot when a Soul Gem is selected (or the POUCH icon is
+// clicked — the wallet view, 2026-08-23). Owns the 6-zone data
+// aggregation (equipment/belt/pouch/pack → the gem's category), the paginated
 // fixed-button list (exactly 6 visible, scroll jumps by 1 button), + the
-// contextual action popup (CONSUME/EQUIP/POCKET/STORE/DISCARD). Encumbrance
+// contextual action popup (CONSUME/EQUIP/POUCH/STORE/DISCARD). Encumbrance
 // + storage limits are intentionally NOT rendered (ripped out per spec).
 import {
   renderInventoryPanel, clearInventoryPanel,
 } from './inventory-panel.js';
+// The FOG-OF-WAR SITE MAP (2026-08-23) — the Multihog-style knowledge-
+// filtered node graph rendered under the location card's headline when the
+// current node carries a hidden site map (fable_site_map_get). mountSiteMap
+// owns the SVG + the injury-heatmap-style hover tooltip; the data arrives
+// Rust-side-filtered (unrevealed truth never crosses the IPC).
+import {
+  mountSiteMap,
+  siteMapLabel,
+  wireGrabPanning,
+  wireWheelZoom,
+  buildMapLegend,
+} from './site-map.js';
 // paintDebugOverlay is the DEV-ONLY hitbox verification layer from
 // body-parts.js (window.__wupiDebug.showHitboxes). body-parts.js is already
 // pulled into the main chunk via injury-heatmap.js above, so we static-import
@@ -123,6 +139,36 @@ const CALENDAR_SVG = `
   <line x1="16" y1="3" x2="16" y2="6.5"/>
 </svg>`;
 
+// ── The POUCH glyph (2026-08-23 pouch ruling; redrawn 2026-08-24) ────────────
+// A drawstring coin-purse read from the top down: a flared three-point ruffle
+// bloom (two outward-flaring wings + a taller center petal — the bloomed
+// fabric opening, fanning past the cinch) FLOATS just above the cord — the
+// visible air gap between ruffle and band is deliberate: it keeps the cinch
+// reading as its own tied line (petals merging into the band render as mud
+// at this stroke weight) and matches how a real drawstring scrunch sits.
+// Below it: the horizontal cinch band (slightly wider than the bag's neck,
+// tied AROUND the fabric) with two string ends hanging down over the belly
+// (a per-path stroke-width 0.9 override — cords read finer than fabric; the
+// right cord hangs a touch longer than the left, cords are never even),
+// then a CONCAVE pinch flaring into a sagging low-bellied teardrop — an
+// open, clean silhouette (no inner marks; the pinch kills the balloon read
+// of the first draft). Same line-art discipline as the other dock icons
+// (outline-only via currentColor, butt/miter caps, the shared ICON_STROKE
+// weight) so it reads as one family with calendar/weather/location + matches
+// the gender glyph's stroke weight. Clicking it opens the POUCH panel (the
+// wallet view — same inspection-panel UI as the Soul Gems, see showPouchSlot).
+const POUCH_SVG = `
+<svg class="hud-status-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+     ${ICON_STROKE} xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <path d="M9.5 6.3 C8.9 5.8 8.5 5.2 8.3 4.4 C9.2 4.5 10 4.9 10.6 5.5"/>
+  <path d="M10.6 5.5 C10.8 4.6 11.3 3.8 12 3.2 C12.7 3.8 13.2 4.6 13.4 5.5"/>
+  <path d="M13.4 5.5 C14 4.9 14.8 4.5 15.7 4.4 C15.5 5.2 15.1 5.8 14.5 6.3"/>
+  <path d="M9.2 7.1 H14.8"/>
+  <path stroke-width="0.9" d="M11.2 7.1 C10.9 8.4 10.7 9.8 10.5 11.2"/>
+  <path stroke-width="0.9" d="M12.8 7.1 C13.1 8.6 13.4 10.4 13.5 12.6"/>
+  <path d="M9.2 7.1 C8.4 9.1 6.4 11.4 5.7 13.5 C4.9 17.2 8 20.4 12 20.4 C16 20.4 19.1 17.2 18.3 13.5 C17.6 11.4 15.6 9.1 14.8 7.1"/>
+</svg>`;
+
 // Weather glyph set — one SVG per mapped condition. The matcher below picks
 // the closest line-art glyph; an unknown/empty condition falls back to the
 // sun-cloud default. All outline-only, currentColor, butt/miter caps.
@@ -136,43 +182,59 @@ const WEATHER_SVGS = {
   storm: `<svg class="hud-status-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" ${ICON_STROKE} xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M6.5 13a4 4 0 0 1 0-8 5 5 0 0 1 9.4-1.3A4.5 4.5 0 0 1 18 13z"/><polyline points="13,14 10.5,18 13,18 11,22"/></svg>`,
 };
 
-// Location glyph set — keyed to the travel node's `setting` hint (schema.rs)
-// when available, else a sensible default sign. Outline-only, currentColor,
-// butt/miter caps. The `home` (safe zone) + `hostile` keys ship in the map for
-// forward-compat with a future zone-safety field; today only indoor/outdoor/
-// default are reachable (the backend has no safe-zone/hostile classification).
-const LOCATION_SVGS = {
-  default: `<svg class="hud-status-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" ${ICON_STROKE} xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M12 21s-6.5-6-6.5-11a6.5 6.5 0 0 1 13 0c0 5-6.5 11-6.5 11z"/><circle cx="12" cy="10" r="2.5"/></svg>`,
-  indoor: `<svg class="hud-status-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" ${ICON_STROKE} xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M4 21V9.5l8-5 8 5V21"/><path d="M9.5 21v-6h5v6"/><line x1="4" y1="21" x2="20" y2="21"/></svg>`,
-  outdoor: `<svg class="hud-status-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" ${ICON_STROKE} xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M3.5 21h17"/><path d="M7 21V11.5l5-4 5 4V21"/><path d="M12 3.5v3.5"/><path d="M3.5 16.5l3.5-2.7 5 2.7 5-2.7 3.5 2.7"/></svg>`,
-  home: `<svg class="hud-status-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" ${ICON_STROKE} xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M3.5 11.5L12 4l8.5 7.5"/><path d="M5.5 10v10h13V10"/><path d="M10 20v-5h4v5"/></svg>`,
-  hostile: `<svg class="hud-status-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" ${ICON_STROKE} xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M12 3l9 16H3z"/><line x1="12" y1="10" x2="12" y2="14"/><circle cx="12" cy="16.8" r="0.6" fill="currentColor" stroke="none"/></svg>`,
-};
+// Location glyph — a TREASURE TRI-FOLD MAP STANDING VERTICALLY (2026-08-24,
+// Chloe): an accordion of three panels + two full-height vertical folds,
+// spanning the full 3→21 dock width (18 units — the widest dock glyph,
+// Chloe's 2026-08-25 widening). The zigzag TOP edge shows the fold
+// displacement, and the bottom edge zigzags IN PHASE with it — the folds
+// run the map's full height, so it rests on its fold edges and reads as
+// STANDING upright. The fold lines are a hairline 0.4 per-path override
+// (EXACTLY 0.4 — Chloe's ruling; do not retune); the outline keeps the
+// shared ICON_STROKE weight.
+//
+// Treasure marks (2026-08-24, Chloe; tuned through 2026-08-25): a BRIGHT-
+// RED X in the upper-left panel — ~3.2-unit span, thin 0.75 strokes,
+// tilted ~18° counter-clockwise. The WHITE marks are a very small thin
+// dashed BACKWARDS-S (mirrored S: upper hook bulging right, lower hook
+// bulging left then exiting right to the bottom-right tip; the top tip
+// starts to the RIGHT of the X — Chloe's 2026-08-25 reposition, it sat
+// weird directly below the X; 0.55-wide, 0.9-on-1.0 dashes, round caps) —
+// first erased entirely (2026-08-25
+// ruling), then REINSTATED same day as this backwards-S (Chloe's final
+// word — the S trail supersedes the erase ruling). The trail is emitted
+// AFTER the fold lines so the dashes cross OVER the bronze creases. The
+// red + white are FIXED colors — a DELIBERATE exception to the family's
+// currentColor rule (they read as ink marks ON the map; do not "fix" them
+// to currentColor). The X's NEON-RED highlight glow (hover + active-dock)
+// lives in fable.css under `.treasure-x` — the SVG path carries that class.
+// The X + trail use round caps — marker strokes, not
+// cut paper edges. ONE fixed glyph for every node: this replaced the
+// setting→glyph swap (pin/house/mountain variants retired same day — a
+// folded map is location-generic; the node's live data drives the slide-up
+// card, not the icon). Outline stays family-true: currentColor,
+// butt/miter caps.
+const LOCATION_SVG = `
+<svg class="hud-status-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+     ${ICON_STROKE} xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <path d="M3 6.6 L9 4.4 L15 6.6 L21 4.4 L21 17.6 L15 19.8 L9 17.6 L3 19.8 Z"/>
+  <path stroke-width="0.4" d="M9 4.4 V17.6"/>
+  <path stroke-width="0.4" d="M15 6.6 V19.8"/>
+  <path class="treasure-x" stroke="#ff4b4b" stroke-width="0.75" stroke-linecap="round"
+        d="M4.6 7.85 L7.45 9.35 M5.25 10.05 L6.75 7.15"/>
+  <path stroke="#ffffff" stroke-width="0.5" stroke-linecap="round"
+        stroke-dasharray="0.9 1.25"
+        d="M8.3 9.2 C11.2 8.5 13.7 9.1 13.1 11 C12.5 13.2 10.5 13.6 10.8 15 C11.2 16 15.2 17.1 19.3 16.2"/>
+</svg>`;
 
-// Maps a travel node's free-form `setting` hint to a location glyph key.
-// Backend only emits 'indoor' / 'outdoor' / '' (schema.rs Node.setting); a
-// future zone-safety field could route to 'home' / 'hostile' here. Pure.
-function classifyLocation(setting) {
-  const s = String(setting || '').toLowerCase().trim();
-  if (s === 'indoor') return 'indoor';
-  if (s === 'outdoor') return 'outdoor';
-  return 'default';
-}
-
-// ─── Drawer mechanics (UNCHANGED from the 2026-08-01 empty shell) ─────────
+// ─── Drawer mechanics — UNCHANGED. stage.js drives these. ─────────────────
+// (2026-08-25 lock redesign) The edgeLockVisible + actionPopupOpen probes
+// and onDrawerMouseLeave are GONE — stage.js owns auto-close via a distance
+// check on the stage mousemove (the pointer must clear the drawer's inner
+// edge by DRAWER_CLOSE_GRACE_PX, with the action-popup + lock guards applied
+// there). This module exposes only the state the bar + close paths read.
 let drawerEl = null;
 let isOpen = false;
 let locked = false;
-let edgeLockVisible = () => false;
-// Inventory action-popup visibility probe: set by stage.js via
-// setActionPopupProbe. The action popup is appended to document.body (so it
-// can overlay the drawer edge), so moving the mouse from a drawer item button
-// onto the popup fires the drawer's mouseleave → the unlocked drawer would
-// yank in mid-click. While this probe returns true, auto-close on mouseleave
-// is SUPPRESSED so the user can reach + click CONSUME/EQUIP/etc. Mirrors the
-// edgeLockVisible probe pattern (same "reaching for something outside the
-// drawer" problem).
-let actionPopupOpen = () => false;
 
 // ─── DEV-ONLY hitbox overlay state ──────────────────────────────────────────
 // True while the body-parts debug overlay (window.__wupiDebug.showHitboxes) is
@@ -200,6 +262,18 @@ function normGender(g) {
 // live data after a narrator turn without a fresh IPC (refreshAll drives both).
 let activeCardDock = null;            // null | 'calendar' | 'weather' | 'location'
 let lastSnap = null;                  // { playerName, cardName, clock, weather, node }
+
+// ─── POUCH panel state (2026-08-23 pouch ruling) ─────────────────────────
+// True while the POUCH panel (the wallet view — the SAME #inventory-panel-slot
+// the Soul Gems use, titled "POUCH") is open. Mutually exclusive with a gem
+// selection by construction: opening the pouch retracts the gems, selecting a
+// gem calls showInventorySlot which clears this flag, and hideInventorySlot
+// (the single close chokepoint for the slot) resets it.
+let pouchOpen = false;
+
+// Bound-once guard for the document-level inventory outside-click closer
+// (wired in buildLeftDrawer — see the click-outside block there).
+let inventoryOutsideClickBound = false;
 
 // ─── refreshAll render-ownership token (#37) ──────────────────────────────
 // Two concurrent refreshAll() calls (turn-end at stage.js + drawer-open)
@@ -328,6 +402,10 @@ export function buildLeftDrawer() {
       <button type="button" class="hud-dock-btn" data-gender-btn
               data-gender="${normGender(gender)}" aria-label="Toggle silhouette gender"
              ></button>
+      <button type="button" class="hud-dock-btn" data-pouch-btn
+              aria-label="Pouch">
+        <span class="hud-dock-icon">${POUCH_SVG}</span>
+      </button>
       <button type="button" class="hud-dock-btn" data-dock="calendar"
               aria-label="Calendar">
         <span class="hud-dock-icon">${CALENDAR_SVG}</span>
@@ -339,7 +417,7 @@ export function buildLeftDrawer() {
       </button>
       <button type="button" class="hud-dock-btn" data-dock="location"
               aria-label="Location">
-        <span class="hud-dock-icon" data-location-icon>${LOCATION_SVGS.default}</span>
+        <span class="hud-dock-icon" data-location-icon>${LOCATION_SVG}</span>
       </button>
     </div>
     <div class="info-card-container" data-info-card aria-hidden="true">
@@ -494,6 +572,27 @@ function wireInteractions(root) {
     });
   }
 
+  // ── The POUCH (2026-08-23 pouch ruling) ─────────────────────────────
+  // The wallet view: clicking the pouch icon reveals the SAME inspection
+  // panel the Soul Gems use, titled "POUCH", rendering the player_state.pouch
+  // stack. Clicking again closes it. Mutually exclusive with the gem bloom:
+  // opening the pouch retracts any open gems; the gems' own selection path
+  // (showInventorySlot) clears the pouch state. The .is-active class mirrors
+  // the info-card icons' open-state treatment.
+  const pouchBtn = root.querySelector('[data-pouch-btn]');
+  if (pouchBtn) {
+    pouchBtn.addEventListener('click', (e) => {
+      e.stopPropagation(); // don't bubble to the click-outside-close handler
+      playUIClink();
+      if (pouchOpen) {
+        hideInventorySlot();
+        return;
+      }
+      closeSoulGems();     // retract any bloom + clear the gem selection
+      showPouchSlot();
+    });
+  }
+
   // ── Slide-up info cards (calendar / weather / location) ─────────────
   // Clicking one of the three dock icons toggles its card; re-clicking the
   // active icon closes it; clicking anywhere in the drawer OUTSIDE the dock +
@@ -543,6 +642,9 @@ function wireInteractions(root) {
   if (backpack) {
     backpack.addEventListener('click', () => {
       playUIClink();
+      // The pouch panel yields to the bloom — clicking the backpack while the
+      // POUCH view is open closes it first so the gems own the panel slot.
+      if (pouchOpen) hideInventorySlot();
       toggleSoulGems();
       // Closing the gem overlay also hides the inspection slot — the panel
       // only makes sense while a gem is selectable. soulGemsOpen() is read
@@ -569,6 +671,29 @@ function wireInteractions(root) {
       hideInventorySlot();           // deselected → hide
     }
   });
+
+  // ── Click-outside closes the inventory panel (2026-08-24 Chloe) ─────
+  // A click anywhere outside the drawer while the #inventory-panel-slot is
+  // visible (gem view OR the pouch view) immediately closes the panel +
+  // retracts the gem bloom. The action popup (.inv-action-popup) lives on
+  // document.body, so it's exempted here — its own outside-click handler is
+  // the authority for popup-level dismissal, and closing the whole slot under
+  // a click the user aimed AT the popup would eat the action. Capture phase
+  // so this settles before any stage-level handlers can mutate the DOM the
+  // visibility check reads. Bound once per process (buildLeftDrawer can run
+  // on every stage build — a bare addEventListener would stack duplicates).
+  if (!inventoryOutsideClickBound) {
+    inventoryOutsideClickBound = true;
+    document.addEventListener('click', (e) => {
+      if (!drawerEl) return;
+      const slot = drawerEl.querySelector('#inventory-panel-slot.is-visible');
+      if (!slot) return;
+      if (e.target && e.target.closest && e.target.closest('.inv-action-popup')) return;
+      if (drawerEl.contains(e.target)) return;
+      closeSoulGems();          // retract the bloom + clear the gem selection (no-op if closed)
+      hideInventorySlot();      // the single close chokepoint (also resets the pouch view)
+    }, true);
+  }
 }
 
 // Reveal the #inventory-panel-slot for the given gem id. The slot is a
@@ -577,6 +702,25 @@ function wireInteractions(root) {
 // list. Flips the .is-visible class so the CSS opacity/transform transition
 // animates it in, then hands the body off to the inventory panel renderer.
 function showInventorySlot(gemId) {
+  pouchOpen = false;                  // a gem selection supersedes the pouch view
+  syncPouchActiveState();
+  const gem = soulGemSet().find((g) => g.id === gemId);
+  revealPanelSlot(gem ? gem.label : gemId, gemId);
+}
+
+// Reveal the #inventory-panel-slot as the POUCH (the wallet view) — the same
+// surface the gems use, titled "POUCH", rendering the player_state.pouch stack
+// (2026-08-23 pouch ruling). Caller guarantees the gems are retracted.
+function showPouchSlot() {
+  pouchOpen = true;
+  syncPouchActiveState();
+  revealPanelSlot('POUCH', 'pouch');
+}
+
+// The shared reveal: measure fresh, build the header + body, flip .is-visible,
+// and hand the body to the inventory panel renderer (the 'pouch' key reads the
+// pouch stack via inventory-panel.js's CATEGORY_MAP).
+function revealPanelSlot(headerLabel, slotKey) {
   if (!drawerEl) return;
   const slot = drawerEl.querySelector('#inventory-panel-slot');
   if (!slot) return;
@@ -585,29 +729,47 @@ function showInventorySlot(gemId) {
   // with layout settling, so every reveal measures fresh. This is the panel's
   // own hook (the gem-open path's repositionToBody doesn't fire on gem-select).
   repositionSlotOnly();
-  // Label the panel with the slot name. soulGemSet() maps id → label.
-  const gem = soulGemSet().find((g) => g.id === gemId);
-  const label = gem ? gem.label : gemId;
-  // Header (the category name) + an empty body the inventory-panel fills.
-  slot.innerHTML = `<div class="inventory-slot-header">${label}</div>` +
-    `<div class="inventory-slot-body" data-slot="${gemId}"></div>`;
+  // Header (the category name) + the body inventory-panel fills. (2026-08-24
+  // flicker fix) On a gem SWITCH, KEEP the existing body element — rebuilding
+  // the whole slot destroyed the painted list a frame before the async fetch
+  // repainted it, flashing the panel's background transparency. The header
+  // swaps synchronously; the body keeps showing the previous zone's list
+  // until renderInventoryPanel replaces its contents in one atomic paint
+  // (which itself no longer routes through the '…' placeholder — see
+  // inventory-panel.js).
+  let bodyEl = slot.querySelector('.inventory-slot-body');
+  if (bodyEl) {
+    slot.innerHTML = '';
+    const header = document.createElement('div');
+    header.className = 'inventory-slot-header';
+    header.textContent = headerLabel;
+    slot.appendChild(header);
+    bodyEl.setAttribute('data-slot', slotKey); // keep the marker in sync with the new zone
+    slot.appendChild(bodyEl);
+  } else {
+    slot.innerHTML = `<div class="inventory-slot-header">${headerLabel}</div>` +
+      `<div class="inventory-slot-body" data-slot="${slotKey}"></div>`;
+    bodyEl = slot.querySelector('.inventory-slot-body');
+  }
   slot.setAttribute('aria-hidden', 'false');
   slot.classList.add('is-visible');
   // Hand the body to the inventory panel renderer. It fetches the live schema,
-  // aggregates the gem's category items, + paints the paginated button list.
+  // aggregates the category items, + paints the paginated button list.
   // Best-effort: a failure leaves the empty body (the panel reveal isn't blocked).
-  const bodyEl = slot.querySelector('.inventory-slot-body');
   if (bodyEl) {
-    renderInventoryPanel(bodyEl, gemId).catch((e) => {
+    renderInventoryPanel(bodyEl, slotKey).catch((e) => {
       console.warn('[left-drawer] inventory panel render failed:', e);
     });
   }
 }
 
-// Hide the #inventory-panel-slot (a gem was deselected, or the overlay
-// closed). Clears the inventory panel state + flips .is-visible off so the CSS
-// transition animates it out.
+// Hide the #inventory-panel-slot (a gem was deselected, the overlay closed, or
+// the pouch was toggled off). Clears the inventory panel state + flips
+// .is-visible off so the CSS transition animates it out. This is the SINGLE
+// close chokepoint for the slot — the pouch state resets here too.
 function hideInventorySlot() {
+  pouchOpen = false;
+  syncPouchActiveState();
   if (!drawerEl) return;
   clearInventoryPanel();          // drop the panel module's state + close any popup
   const slot = drawerEl.querySelector('#inventory-panel-slot');
@@ -619,6 +781,14 @@ function hideInventorySlot() {
   setTimeout(() => {
     if (!slot.classList.contains('is-visible')) slot.innerHTML = '';
   }, 240);
+}
+
+// Mirror the pouch button's open state onto .is-active (the same persistent
+// lit treatment the info-card icons use while their card is open).
+function syncPouchActiveState() {
+  if (!drawerEl) return;
+  const btn = drawerEl.querySelector('[data-pouch-btn]');
+  if (btn) btn.classList.toggle('is-active', pouchOpen);
 }
 
 // Paint the gender glyph into the single toggle button + tag it with the
@@ -843,9 +1013,11 @@ export function setScrubberMinutes(minutes) {
 //     card shows the node's name + its indoor/outdoor setting (or
 //     "Undiscovered" when dormant).
 //
-// Each cluster's icon SWAPS to a condition-appropriate line-art SVG when the
-// live data resolves (sun for clear, cloud for overcast, etc.) so the HUD
-// reads the state at a glance; the click card carries the text.
+// Calendar + Weather react to the live data ON the icon (the calendar's day
+// badge; the weather glyph swaps to a condition-appropriate SVG — sun for
+// clear, cloud for overcast) so the HUD reads the state at a glance. The
+// Location glyph is a FIXED tri-fold map (2026-08-24 — the setting→glyph
+// swap retired; the slide-up card carries the text).
 // ===========================================================================
 
 // Maps a free-form weather condition phrase to a line-art glyph key. Pure.
@@ -891,7 +1063,7 @@ function clockTime12h(clock) {
 function renderStatusRow(snap) {
   if (!drawerEl) return;
   lastSnap = snap;                       // cache for the info-card renderers
-  const { weather, node } = snap;
+  const { weather } = snap;
 
   // ── Calendar ──────────────────────────────────────────────────────
   // (2026-08-21, Chloe) The day number is BACK on the icon — now parsed from
@@ -910,11 +1082,11 @@ function renderStatusRow(snap) {
   const wIcon = drawerEl.querySelector('[data-weather-icon]');
   if (wIcon) wIcon.innerHTML = WEATHER_SVGS[wKey] || WEATHER_SVGS.default;
 
-  // ── Location (setting → icon swap) ────────────────────────────────
-  const lSetting = (node && node.setting) || '';
-  const lKey = classifyLocation(lSetting);
-  const lIcon = drawerEl.querySelector('[data-location-icon]');
-  if (lIcon) lIcon.innerHTML = LOCATION_SVGS[lKey] || LOCATION_SVGS.default;
+  // ── Location ──────────────────────────────────────────────────────
+  // No icon work: the glyph is the FIXED tri-fold map stamped at build time
+  // (2026-08-24 — the setting→icon swap retired with it). The node's live
+  // data reaches the player through the slide-up card + the open-card
+  // refresh below.
 
   // If a card is currently open, refresh its body so a narrator turn's
   // world-state change reflects live (clock advanced, weather drifted, etc.).
@@ -974,6 +1146,21 @@ function prettySlug(k) {
   return spaced.replace(/(^|\s)([a-z])/g, (m, a, b) => a + b.toUpperCase());
 }
 
+// Location display-name purifier (2026-08-26, Chloe ruling: parentheses
+// NEVER appear in a location, and meta-qualifiers like "variable by scene"
+// are authored junk): strips every balanced/unbalanced parenthetical run +
+// collapses whitespace. Applied to the card headline (and the hosted-
+// building tag) so legacy saves seeded before the Rust-side purifier still
+// render clean — display-only, the stored node id/name are untouched.
+function cleanLocationName(s) {
+  let out = String(s || '');
+  // Balanced runs first ("Earth (variable by scene)"), then any dangling
+  // opener-to-end / start-to-closer fragment a hand-edit could leave.
+  out = out.replace(/\([^()]*\)/g, ' ');
+  out = out.replace(/\([^()]*$/g, ' ').replace(/^[^()]*\)/g, ' ');
+  return out.replace(/\s+/g, ' ').trim();
+}
+
 // ===========================================================================
 // §3  SLIDE-UP INFO CARDS — click-to-open (2026-08-06)
 // One card, three possible bodies (calendar / weather / location). Only one
@@ -1016,24 +1203,66 @@ function buildInfoCardHTML(dock) {
     if (!node || !node.name) {
       return `<div class="info-card-headline info-card-dim">Undiscovered</div>`;
     }
-    // Flat travel graph — no region/city/inn breadcrumb exists (flagged in the
-    // plan). Headline is the node name; tag is the indoor/outdoor setting.
-    // A future zone-safety field could render [ Safe Zone ] / [ Hostile ] here.
+    // Headline is the node name; tags are the indoor/outdoor setting and —
+    // while the player stands inside a hosted building (2026-08-23) — the
+    // building's name as a second tag line (the district stays the headline).
+    // (2026-08-25 demo transfer) Tags render the word ALONE — no brackets,
+    // no italics. Settlement nodes carry no setting tag (indoor/outdoor
+    // only).
     const setting = (node.setting || '').toLowerCase().trim();
     const tagLabel = setting === 'indoor' ? 'Indoor'
                    : setting === 'outdoor' ? 'Outdoor'
                    : '';
-    const tag = tagLabel ? `<div class="info-card-tag">[ ${escapeHtml(tagLabel)} ]</div>` : '';
-    return `<div class="info-card-headline">${escapeHtml(node.name)}</div>${tag}`;
+    const tag = tagLabel ? `<div class="info-card-tag">${escapeHtml(tagLabel)}</div>` : '';
+    // (2026-08-26) Parenthetical qualifiers never render in a location —
+    // cleanLocationName strips them at display time for legacy saves.
+    const bTag = node.building
+      ? `<div class="info-card-tag">${escapeHtml(cleanLocationName(node.building))}</div>`
+      : '';
+    // (2026-08-23; redesigned 2026-08-25) The FOG-OF-WAR SITE MAP rides
+    // under the headline when the current node carries one: the threat
+    // caption + the grab-pannable / wheel-zoomable graph. The morphing
+    // hamburger MAP KEY (Area / Path / Marker) mounts into the wrap in
+    // renderInfoCardBody — it needs live DOM. The SVG itself mounts
+    // post-innerHTML there too (mountSiteMap needs live DOM for the
+    // tooltip wiring).
+    const mapWrap = snap.siteMap
+      ? `<div class="site-map-wrap">
+           <div class="site-map-label">${escapeHtml(siteMapLabel(snap.siteMap))}</div>
+           <div class="site-map-scroll" data-site-map-scroll></div>
+         </div>`
+      : '';
+    // (2026-08-26) The headline runs through cleanLocationName — a legacy
+    // seeded node like "Earth (variable by scene)" renders as "Earth". A name
+    // that cleans to nothing falls back to the raw text (never blank).
+    const headline = cleanLocationName(node.name) || node.name;
+    return `<div class="info-card-headline">${escapeHtml(headline)}</div>${tag}${bTag}${mapWrap}`;
   }
   return '';
 }
 
-// Render the active card's body into the container. Pure DOM write.
+// Render the active card's body into the container. Pure DOM write — plus
+// the site-map mount: the graph SVG + its tooltip need live DOM, so they
+// attach right after the innerHTML assignment (idempotent re-render), with
+// grab-panning + wheel zoom + the morphing map key on the same elements.
 function renderInfoCardBody(dock) {
   if (!drawerEl) return;
   const body = drawerEl.querySelector('[data-info-card-body]');
-  if (body) body.innerHTML = buildInfoCardHTML(dock);
+  if (!body) return;
+  body.innerHTML = buildInfoCardHTML(dock);
+  const scroll = body.querySelector('[data-site-map-scroll]');
+  if (scroll && lastSnap && lastSnap.siteMap) {
+    mountSiteMap(scroll, lastSnap.siteMap);
+    wireGrabPanning(scroll);
+    wireWheelZoom(scroll);
+    // The static key overlays the frame's bottom-left — outside the scroll
+    // surface, so it never moves with pan/zoom.
+    if (scroll.parentElement) scroll.parentElement.appendChild(buildMapLegend());
+  }
+  // Grow the card while a map is present (CSS §D: 26% → 52% of drawer
+  // height — Chloe 2026-08-23 "you may make the UI itself taller").
+  const card = drawerEl.querySelector('[data-info-card]');
+  if (card) card.classList.toggle('has-map', !!scroll);
 }
 
 // Title-case a free-form condition phrase ("heavy rain" → "Heavy Rain") for the
@@ -1074,6 +1303,7 @@ function closeInfoCard() {
   const card = drawerEl.querySelector('[data-info-card]');
   if (card) {
     card.classList.remove('is-open');
+    card.classList.remove('has-map'); // collapse the grown map card too
     card.setAttribute('aria-hidden', 'true');
   }
   drawerEl.querySelectorAll('[data-dock]').forEach((b) => b.classList.remove('is-active'));
@@ -1125,17 +1355,20 @@ export async function refreshAll() {
   let weather = '';
   let calendar = '';                       // schema.calendar (authored [DATE] label)
   let node = null;
+  let siteMap = null;                      // fable_site_map_get slice (or null: no map)
   let bodyMap = null;                 // player_state.body (PascalCase→PascalCase) or null
   let detailsMap = null;              // player_state.injury_details (wire key → string[]) or null
 
   try {
     // DEV PREVIEW: skip the IPCs (no backend) — serve the mock card + schema
-    // so the heatsink + header render real test data.
-    const [cardRes, schema] = isDevPreview()
-      ? [getDevActiveCard(), getDevSchema()]
+    // so the heatsink + header render real test data. (No site map in the
+    // preview — the dev schema carries none.)
+    const [cardRes, schema, siteMapRes] = isDevPreview()
+      ? [getDevActiveCard(), getDevSchema(), null]
       : await Promise.all([
           invoke('fable_active_card_get').catch(() => null),
           invoke('fable_schema_get').catch(() => null),
+          invoke('fable_site_map_get').catch(() => null),
         ]);
     // fable_active_card_get → { name, player_name } (object) when a game is
     // active, or null when none is. The player_name may be the empty string
@@ -1159,6 +1392,19 @@ export async function refreshAll() {
           node = { name: found.name || prettySlug(cur), setting: found.setting || '' };
         }
       }
+      // Hosted-interior breadcrumb (2026-08-23): while the player stands
+      // inside a building, the settlement map's current_building names the
+      // Building asset — resolve its diegetic name for the location card's
+      // second tag line. site_maps rides the schema wire whenever non-empty.
+      const maps = schema.site_maps;
+      if (cur && maps && typeof maps === 'object') {
+        const parent = maps[cur];
+        const bId = parent && parent.current_building;
+        if (bId && Array.isArray(parent.assets)) {
+          const b = parent.assets.find((a) => a && a.id === bId);
+          if (node && b && typeof b.name === 'string' && b.name) node.building = b.name;
+        }
+      }
       // player_state.body is the per-part injury map (PascalCase wire keys
       // → PascalCase BodyPartState). May be absent on a fresh/dormant schema;
       // null routes the heatmap to the no-op render path (renders nothing).
@@ -1168,6 +1414,12 @@ export async function refreshAll() {
       // tooltip's detail list under the header. Absent on old saves / dormant
       // schemas → null → tooltip renders the header only (no detail list).
       detailsMap = (schema.player_state && schema.player_state.injury_details) || null;
+    }
+    // The fog-of-war site map slice (null when the current node carries no
+    // map — outdoors / unmapped — or when every area was somehow dropped).
+    if (siteMapRes && typeof siteMapRes === 'object' && Array.isArray(siteMapRes.areas)
+        && siteMapRes.areas.length > 0) {
+      siteMap = siteMapRes;
     }
   } catch (_) {
     // swallow — dormant fallbacks below stand.
@@ -1188,7 +1440,7 @@ export async function refreshAll() {
   setScrubberMinutes(clock ? (Number(clock.current_minutes) || DEFAULT_CLOCK_MINUTES) : DEFAULT_CLOCK_MINUTES);
 
   // The 3-icon row.
-  renderStatusRow({ playerName, cardName, clock, weather, node, calendar });
+  renderStatusRow({ playerName, cardName, clock, weather, node, calendar, siteMap });
 
   // The injury heatmap: paint over the paperdoll from the live body map.
   // Best-effort — a paint failure is logged + dropped (never blocks the UI
@@ -1243,9 +1495,14 @@ export function closeDrawer() {
   isOpen = false;
   drawerEl.classList.remove('open');
   drawerEl.setAttribute('aria-hidden', 'true');
+  // (2026-08-25 v2) An explicit close resets the lock (Esc, the distance
+  // close clearing the last holdout) — the tab must never wear a padlock on
+  // a closed drawer. Auto-close never fires while locked, so this only
+  // affects deliberate closes.
+  if (locked) { locked = false; drawerEl.classList.remove('locked'); }
   // Any open slide-up card collapses on drawer close (Chloe 2026-08-06: never
-  // leave a card "active" behind a closed drawer — mouseleave/edge-lock/reset
-  // all route through here, so this is the single chokepoint).
+  // leave a card "active" behind a closed drawer — distance-close/window-exit/
+  // reset all route through here, so this is the single chokepoint).
   closeInfoCard();
   // Retract the soul gems too — an open inventory shouldn't dangle behind a
   // closed drawer. closeSoulGems() is a no-op if already closed (so a drawer
@@ -1262,21 +1519,11 @@ export function toggleLock() {
   if (drawerEl) drawerEl.classList.toggle('locked', locked);
   return locked;
 }
-export function setEdgeLockProbe(probe) {
-  edgeLockVisible = typeof probe === 'function' ? probe : () => false;
-}
-// Wire the inventory action-popup visibility probe (the popup lives on
-// document.body, so reaching for it fires the drawer's mouseleave). See the
-// actionPopupOpen decl above for the full rationale.
-export function setActionPopupProbe(probe) {
-  actionPopupOpen = typeof probe === 'function' ? probe : () => false;
-}
-export function onDrawerMouseLeave() {
-  if (locked) return;
-  if (edgeLockVisible()) return;
-  if (actionPopupOpen()) return;   // user is reaching for the popup — hold
-  closeDrawer();
-}
+// (2026-08-25 lock redesign) setEdgeLockProbe / setActionPopupProbe /
+// onDrawerMouseLeave were removed here — stage.js's distance-based
+// auto-close (stage mousemove + DRAWER_CLOSE_GRACE_PX, with the
+// action-popup guard applied at the call site) replaced the mouseleave
+// trigger, and the probes only fed it.
 // Hard reset (called from teardownStage on stage exit). Wipes HUD state too
 // so a stale paperdoll from the prior session can't flash on re-entry.
 export function resetLeftDrawer() {

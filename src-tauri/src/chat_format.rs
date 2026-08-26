@@ -76,6 +76,14 @@ pub struct ParsedOutput {
     pub raw: String,
 }
 
+impl ParsedOutput {
+    /// The empty turn — cancelled hybrid handoffs + the API-direct seed
+    /// (2026-08-24). Replaces the struct-literal sprawl at those sites.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
 /// The set of model families we know how to format for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelFamily {

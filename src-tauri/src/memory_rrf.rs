@@ -18,7 +18,7 @@
 //! keeping this in its own file is so the §3A promise ("retrieval math is
 //! unit-testable without the embedding backend") is enforced by construction.
 //!
-//! # Why dense-only flooring (AGENTS.md §2M)
+//! # Why the dense floor is the rejection authority on BOTH paths
 //!
 //! The original v1 RRF (2026-07-13) fused on RANK ALONE and discarded the raw
 //! scores. That meant a near-random dense hit at cosine 0.25 would still
@@ -32,16 +32,18 @@
 //! cyberpunk": the shared name gives weak lexical overlap but the scenes are
 //! semantically distant, landing cosine around 0.25-0.35, below the floor.
 //!
-//! The sparse (BM25) path is deliberately NOT floored. Two reasons:
-//! 1. BM25's absolute scale is model-dependent (document-length normalization,
-//!    IDF behavior) and unreliable as a universal threshold: a floor that
-//!    works for one corpus mis-tunes for another.
-//! 2. The dense floor is already the rejection authority. Sparse only adds
-//!    precision-boost on memories that PASSED the dense floor. Flooring sparse
-//!    too would be a second rejection gate with no calibration story, and
-//!    min-max on it would be RELATIVE to the retrieved set (it maps the
-//!    best-of-the-batch to 1.0 regardless of whether the batch is all garbage)
-//!    - exactly the failure mode that defeated v1.
+//! (2026-08-24 bug-1 fix) The sparse path now passes the SAME gate — at the
+//! store layer, BEFORE fusion ([`gate_sparse_on_floor`]): every FTS5
+//! candidate's TRUE cosine against the query is verified (from the dense
+//! list's distance when present, else against its stored vec0 vector fetched
+//! by rowid at the call site) and below-floor candidates are dropped from
+//! the sparse list before `fuse_scored_rrf` sees it. BM25 is rank-only
+//! precision-boost on memories that already PASSED the floor — never an
+//! independent recall path a lexical bleed can ride. The pure
+//! `fuse_scored_rrf` itself still floors only its dense INPUT (callers hand
+//! it pre-gated lists); BM25's own score stays unusable as a threshold
+//! (model- and corpus-dependent scale), which is exactly why the gate
+//! reuses the DENSE cosine decision instead of inventing a BM25 cut.
 //!
 //! # Rank indexing is 1-BASED (not 0)
 //!
@@ -145,13 +147,73 @@ impl Default for FusionWeights {
     }
 }
 
+/// (2026-08-24 bug-1 fix) The sparse-path dense-floor gate: verify EVERY
+/// sparse candidate on TRUE cosine against the query and drop the ones below
+/// the same per-class floor the dense list uses. Runs at the STORE layer
+/// BEFORE [`fuse_scored_rrf`] so a cross-topic BM25 bleed can never ride the
+/// sparse contribution into the prompt ungated — the floor is the rejection
+/// authority; BM25 only precision-boosts what already passed it.
+///
+/// Cosine sources, in order:
+/// 1. The candidate is in `dense` (the RAW vec0 top-k, pre-floor): its L2
+///    distance is authoritative and converted here with the exact same
+///    `cos = 1 − d²/2` the fuse uses — one source of truth, no re-fetch.
+///    (A below-floor dense member is ALSO dropped from the sparse list:
+///    having been semantically evaluated and rejected, it must not re-enter
+///    through the lexical side door.)
+/// 2. Sparse-only (not in the dense top-k): `sparse_cosines` carries the
+///    Rust-computed TRUE cosine of the (single, once-embedded) query vector
+///    against the candidate's stored vec0 vector, fetched by rowid at the
+///    call site (`memory::sparse_candidate_cosines`).
+///
+/// **Missing-vector policy: DROP.** A candidate in NEITHER the dense list
+/// NOR `sparse_cosines` cannot be verified, and the floor is the rejection
+/// authority — an unverifiable candidate must not bypass the gate.
+/// (Unreachable in practice: every three-table insert writes vec0.)
+///
+/// Per-class floors mirror the fuse exactly: `codex_ids` members use
+/// `codex_floor`, everything else `dense_cosine_floor`. Order is preserved,
+/// so the 1-based ranks the fuse assigns downstream are ranks among
+/// survivors — the same contract the floored dense list already has.
+pub fn gate_sparse_on_floor(
+    sparse: &[(MemoryId, f32)],
+    dense: &[(MemoryId, f32)],
+    sparse_cosines: &HashMap<MemoryId, f32>,
+    dense_cosine_floor: f32,
+    codex_ids: &HashSet<MemoryId>,
+    codex_floor: f32,
+) -> Vec<(MemoryId, f32)> {
+    let mut out = Vec::with_capacity(sparse.len());
+    for (id, bm25) in sparse.iter() {
+        let floor = if codex_ids.contains(id) {
+            codex_floor
+        } else {
+            dense_cosine_floor
+        };
+        // Same conversion + formula as the fuse's dense floor: one decision.
+        let cosine = dense
+            .iter()
+            .find(|(d, _)| d == id)
+            .map(|(_, distance)| 1.0 - distance * distance / 2.0)
+            .or_else(|| sparse_cosines.get(id).copied());
+        if let Some(cos) = cosine {
+            if cos >= floor {
+                out.push((*id, *bm25));
+            }
+        } // None → unverifiable → dropped (the documented policy above)
+    }
+    out
+}
+
 /// Fuse two ranked, scored lists into one sorted ranking with a hard dense
 /// floor and weighted RRF.
 ///
 /// # Inputs
 ///
 /// - `sparse`: `(id, bm25_raw)` best-first. Lower (more-negative) BM25 is a
-///   better match. UNFLOORED: see module docs for why.
+///   better match. This fn applies NO sparse threshold — the store layer
+///   pre-gates the list through [`gate_sparse_on_floor`] on the same dense
+///   cosine floor before handing it over (see module docs).
 /// - `dense`: `(id, distance)` best-first. Lower distance is better. The
 ///   vec0 metric is L2 on unit-normalized vectors; cosine is recovered at
 ///   this single conversion point as `cos = 1 − d²/2` (exact for unit
@@ -286,6 +348,7 @@ pub fn fuse_scored_rrf(
                 session_id: None,
                 parent_uuid: None,
                 turn_uuid: None,
+                pinned: false,
             },
             score: a.score,
             debug: DebugScores {
@@ -295,6 +358,78 @@ pub fn fuse_scored_rrf(
             },
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// (2026-08-24 Part II B6) Scene-proximity tie-breaker
+// ---------------------------------------------------------------------------
+
+/// The scene's anchor terms: the names of every PRESENT NPC + the current
+/// travel node id, built at the `search_fable_visible` call site from the
+/// live schema. Used ONLY to break EXACT score ties — a memory mentioning
+/// the here-and-now lifts above an equal-scored memory that doesn't.
+#[derive(Debug, Clone, Default)]
+pub struct SceneProximityTerms {
+    /// Case-insensitive needles (lowercased once at build; matching lowercases
+    /// the haystack per entry).
+    pub needles: Vec<String>,
+}
+
+impl SceneProximityTerms {
+    pub fn new(needles: Vec<String>) -> Self {
+        Self {
+            needles: needles
+                .into_iter()
+                .map(|n| n.trim().to_lowercase())
+                // a 1-2 char "name" matches noise — CHARS, not bytes (one
+                // CJK char is 3 bytes and would pass a byte-length gate)
+                .filter(|n| n.chars().count() >= 3)
+                .collect(),
+        }
+    }
+
+    fn mentions_any(&self, haystack_lower: &str) -> bool {
+        self.needles.iter().any(|n| haystack_lower.contains(n.as_str()))
+    }
+}
+
+/// PURE stable re-rank among EXACT fused-score ties: a tied entry whose text
+/// mentions a proximity needle (a present NPC's name / the current node id)
+/// lifts above tied non-mentions; non-tied entries NEVER move; ties with
+/// equal mention-ness keep the id-ascending order the fuse sort guarantees.
+/// Runs on the HYDRATED entries (text is filled by `fetch_entries` AFTER the
+/// fuse — the fused shells carry empty `text_content`), which is why this
+/// lives beside the fuse but is called from `search_fable_visible`.
+/// `None` = today's behavior, bit-for-bit. Pure; no I/O.
+pub fn apply_proximity_tie_break(
+    ranked: &mut [crate::memory::RankedMemory],
+    proximity: Option<&SceneProximityTerms>,
+) {
+    let Some(terms) = proximity else {
+        return;
+    };
+    if terms.needles.is_empty() || ranked.len() < 2 {
+        return;
+    }
+    let mention: Vec<bool> = ranked
+        .iter()
+        .map(|r| terms.mentions_any(&r.entry.text_content.to_lowercase()))
+        .collect();
+    // Decorate-sort-undecorate over (score desc, mention first, id asc) —
+    // equivalent to a stable partition inside each EXACT-tie group because
+    // id-ascending is unique per entry.
+    let mut order: Vec<usize> = (0..ranked.len()).collect();
+    order.sort_by(|&a, &b| {
+        ranked[b]
+            .score
+            .partial_cmp(&ranked[a].score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| mention[b].cmp(&mention[a]))
+            .then_with(|| ranked[a].entry.id.cmp(&ranked[b].entry.id))
+    });
+    let rearranged: Vec<crate::memory::RankedMemory> =
+        order.into_iter().map(|i| ranked[i].clone()).collect();
+        ranked.clone_from_slice(&rearranged);
 }
 
 #[cfg(test)]
@@ -472,5 +607,145 @@ mod tests {
         assert!(seven.debug.dense_cosine.is_none());
         assert!(seven.debug.dense_rank.is_none());
         assert_eq!(seven.debug.sparse_rank, Some(1));
+    }
+
+    // ---- (2026-08-24 bug-1) the sparse-path dense-floor gate --------------
+
+    #[test]
+    fn gate_drops_sparse_only_candidates_below_the_floor() {
+        // id 1 at cosine 0.30 (episodic floor 0.40) → dropped; id 2 at 0.80
+        // survives with its position (and rank) preserved.
+        let s = vec![sparse(1, 1.0), sparse(2, 0.9)];
+        let cosines: HashMap<MemoryId, f32> = [(1, 0.30), (2, 0.80)].into_iter().collect();
+        let gated = gate_sparse_on_floor(&s, &[], &cosines, 0.40, &HashSet::new(), CODEX_DENSE_FLOOR);
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0].0, 2, "only the above-floor sparse-only candidate survives");
+        // The survivor keeps its raw bm25 score (rank order is positional).
+        assert_eq!(gated[0].1, s[1].1);
+    }
+
+    #[test]
+    fn gate_uses_the_dense_distance_for_dense_list_members() {
+        // id 3 IS in the dense raw list at cosine 0.10 (below floor 0.40) —
+        // the dense floor already rejects it there, and the gate must also
+        // strip its SPARSE contribution (no re-entry through the lexical
+        // side door) using the SAME distance, not a fetched vector.
+        let s = vec![sparse(3, 1.0), sparse(4, 0.5)];
+        let d = vec![dense(3, 0.10), dense(4, 0.80)];
+        // sparse_cosines deliberately carries NO entry for id 3 — if the
+        // gate consulted it instead of the dense list it would drop 3 as
+        // "unverifiable" only by accident; assert the dense-distance path by
+        // giving id 4 a WRONG map value (0.05) the gate must IGNORE.
+        let cosines: HashMap<MemoryId, f32> = [(4, 0.05)].into_iter().collect();
+        let gated = gate_sparse_on_floor(&s, &d, &cosines, 0.40, &HashSet::new(), CODEX_DENSE_FLOOR);
+        assert_eq!(gated.len(), 1, "only id 4 survives");
+        assert_eq!(gated[0].0, 4, "id 4's dense distance (0.80) wins over its bogus map entry");
+    }
+
+    #[test]
+    fn gate_applies_the_codex_floor_to_codex_entries() {
+        // Same shape as codex_floor_lets_codex_survive_below_episodic_floor,
+        // on the sparse path: codex id at 0.15 survives floor 0.10, an
+        // episodic id at 0.15 dies against floor 0.25.
+        let s = vec![sparse(1, 1.0), sparse(2, 0.9)];
+        let codex_ids: HashSet<MemoryId> = [1].into_iter().collect();
+        let cosines: HashMap<MemoryId, f32> = [(1, 0.15), (2, 0.15)].into_iter().collect();
+        let gated = gate_sparse_on_floor(&s, &[], &cosines, 0.25, &codex_ids, 0.10);
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0].0, 1, "the codex entry clears its lower floor");
+    }
+
+    #[test]
+    fn gate_drops_candidates_missing_a_vector() {
+        // id 9 is sparse-only and absent from the cosine map (no vec0 row):
+        // unverifiable → DROPPED (the documented policy — the floor is the
+        // rejection authority, not a hint).
+        let s = vec![sparse(9, 1.0), sparse(10, 1.0)];
+        let cosines: HashMap<MemoryId, f32> = [(10, 0.90)].into_iter().collect();
+        let gated = gate_sparse_on_floor(&s, &[], &cosines, 0.40, &HashSet::new(), CODEX_DENSE_FLOOR);
+        assert_eq!(gated.len(), 1);
+        assert_eq!(gated[0].0, 10);
+    }
+
+    #[test]
+    fn gate_passes_everything_through_when_all_clear_the_floor() {
+        let s = vec![sparse(1, 1.0), sparse(2, 0.9), sparse(3, 0.8)];
+        let d = vec![dense(2, 0.90)];
+        let cosines: HashMap<MemoryId, f32> = [(1, 0.95), (3, 0.85)].into_iter().collect();
+        let gated = gate_sparse_on_floor(&s, &d, &cosines, 0.40, &HashSet::new(), CODEX_DENSE_FLOOR);
+        assert_eq!(gated, s, "order + scores preserved bit-for-bit when nothing is floored");
+    }
+
+    // ---- (2026-08-24 Part II B6) scene-proximity tie-break ----------------
+
+    /// A hydrated shell: real text (the fuse emits empty text; the tie-break
+    /// only ever sees post-fetch_entries rows in production).
+    fn hydrated(id: MemoryId, score: f32, text: &str) -> RankedMemory {
+        RankedMemory {
+            entry: crate::memory::MemoryEntry {
+                id,
+                text_content: text.to_string(),
+                timestamp: 0,
+                role: crate::memory::Role::System,
+                chunk_index: 0,
+                salience: 0.0,
+                metadata_json: None,
+                card_id: String::new(),
+                session_id: None,
+                parent_uuid: None,
+                turn_uuid: None,
+                pinned: false,
+            },
+            score,
+            debug: DebugScores::default(),
+        }
+    }
+
+    #[test]
+    fn proximity_promotes_only_within_exact_ties() {
+        // ids 1+2 TIE at 0.05; ids 3+4 tie higher at 0.09. id 2 + id 3
+        // mention the present NPC "Mara".
+        let mut rows = vec![
+            hydrated(1, 0.05, "a stranger bargains at the docks"),
+            hydrated(2, 0.05, "Mara laughs at the jest"),
+            hydrated(3, 0.09, "Mara pockets the coin"),
+            hydrated(4, 0.09, "the harbor bell tolls"),
+        ];
+        let terms = SceneProximityTerms::new(vec!["Mara".into(), "ironhaven".into()]);
+        apply_proximity_tie_break(&mut rows, Some(&terms));
+        let ids: Vec<MemoryId> = rows.iter().map(|r| r.entry.id).collect();
+        // 3 (tie-leader group, mention) then 4 (same tie, no mention) — the
+        // higher-score GROUP never moves below; 2 lifts above 1 inside
+        // their own tie only.
+        assert_eq!(ids, vec![3, 4, 2, 1], "mention promotes within ties only");
+    }
+
+    #[test]
+    fn proximity_never_moves_distinct_scores() {
+        let mut rows = vec![
+            hydrated(1, 0.09, "a stranger bargains at the docks"),
+            hydrated(2, 0.05, "Mara laughs at the jest"),
+        ];
+        let terms = SceneProximityTerms::new(vec!["Mara".into()]);
+        apply_proximity_tie_break(&mut rows, Some(&terms));
+        let ids: Vec<MemoryId> = rows.iter().map(|r| r.entry.id).collect();
+        assert_eq!(ids, vec![1, 2], "a lower-scored mention cannot jump a non-tie");
+    }
+
+    #[test]
+    fn proximity_none_or_empty_is_today() {
+        let original = vec![
+            hydrated(1, 0.05, "Mara laughs"),
+            hydrated(2, 0.05, "a stranger bargains"),
+        ];
+        // None = bit-for-bit today's order (id ascending among ties).
+        let mut rows = original.clone();
+        apply_proximity_tie_break(&mut rows, None);
+        assert_eq!(rows[0].entry.id, 1);
+        // Empty needle set = no-op (nothing present to anchor on).
+        let mut rows2 = original;
+        apply_proximity_tie_break(&mut rows2, Some(&SceneProximityTerms::default()));
+        assert_eq!(rows2[0].entry.id, 1);
+        assert_eq!(rows2[1].entry.id, 2);
     }
 }

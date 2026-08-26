@@ -248,10 +248,22 @@ function balanceHeadText(el) {
 // player-picker modal). Mounted on the card's .fable-screen so it layers
 // above whichever surface the card lives on (Creator review or the picker
 // modal). Esc / backdrop click / ✕ all close + restore focus to the trigger.
+// (2026-08-24 review fix) The ONE sanctioned closer — the npc-dossier
+// pattern: a module-level ref so a re-open runs the PREVIOUS popup's FULL
+// teardown. The old bare `el.remove()` sweep orphaned the document-capture
+// Esc handler, which later stole an Escape from whatever modal was open
+// next (the card can be re-rendered under a live popup by the creator's
+// stale-turn firewall or a picker re-entry).
+let activeIdDetailsClose = null;
+
 function openIdDetails(card, btn, sectionsHtml) {
   const mount = card.closest('.fable-screen') || document.body;
-  // One popup at a time — a leftover can only exist if a close animation was
-  // interrupted, so a plain replace is enough.
+  // One popup at a time: run the live popup's full teardown first.
+  if (activeIdDetailsClose) {
+    const close = activeIdDetailsClose;
+    activeIdDetailsClose = null;
+    close();
+  }
   mount.querySelectorAll('[data-id-details]').forEach((el) => el.remove());
 
   // Popup title: the card's NAME — the header text (2026-08-20 Chloe; the old
@@ -287,6 +299,7 @@ function openIdDetails(card, btn, sectionsHtml) {
     if (e.key === 'Escape') { e.stopPropagation(); closeModal(); }
   };
   const closeModal = () => {
+    if (activeIdDetailsClose === closeModal) activeIdDetailsClose = null;
     overlay.removeEventListener('click', onBackdrop);
     document.removeEventListener('keydown', onEsc, { capture: true });
     overlay.classList.remove('is-open');
@@ -296,6 +309,7 @@ function openIdDetails(card, btn, sectionsHtml) {
     btn.setAttribute('aria-expanded', 'false');
     btn.focus();
   };
+  activeIdDetailsClose = closeModal;
 
   overlay.addEventListener('click', onBackdrop);
   overlay.querySelector('[data-id-details-close]').addEventListener('click', closeModal);

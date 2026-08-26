@@ -29,16 +29,16 @@
 // =============================================================
 
 /// A standalone, reusable player identity. Serialized to
-/// `apps/fable/players/<id>/<id>.json`. `id` is derived from `name`
-/// (slugified) on write; the field is round-tripped for read paths.
+/// `apps/fable/players/<Name>/<Name>.player` (XML). `id` is derived from
+/// `name` (slugified) on write; the field is round-tripped for read paths.
 ///
 /// `portrait` carries the ABSOLUTE portrait path on the wire (resolved at
 /// load by `load_player_portrait` — the file is the namesake
 /// `<Name>.<ext>` sibling; presence is a stat fact, no XML field).
 #[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
 pub struct SavedPlayer {
-    /// Slug identifier (also the folder name). Slugified from `name` on
-    /// write by the IPC layer; round-tripped on read.
+    /// Slug identifier. Slugified from `name` on write by the IPC layer;
+    /// round-tripped on read.
     #[serde(default)]
     pub id: String,
 
@@ -46,35 +46,6 @@ pub struct SavedPlayer {
     /// non-empty after trim. This is what gets copied into the card's
     /// `player_name` anchor at game start.
     pub name: String,
-
-    /// Free-form identity / backstory prose. LEGACY — the Player Creator no
-    /// longer emits this (2026-08-04 overhaul: players don't have prose
-    /// fields; identity is the structured trait set below). Retained on the
-    /// struct + in the validator so pre-overhaul JSON + any future writer
-    /// stays bounded + deserializes cleanly. Optional.
-    ///
-    /// `skip_serializing_if` (2026-08-05): a `None` value is OMITTED from the
-    /// JSON (not written as `null`) — the Player Creator never populates
-    /// these, so new player files stay clean of dead `"description": null`
-    /// keys. The `#[serde(default)]` still deserializes old JSON that carries
-    /// the field, so back-compat reads are unaffected.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-
-    /// Physical appearance prose. LEGACY (see `description`). Optional.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub appearance: Option<String>,
-
-    /// Personality / demeanor / voice prose. LEGACY (see `description`).
-    /// NPC-only in practice — the cast editor writes this, not the Player
-    /// Creator. Optional.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub personality: Option<String>,
-
-    /// Signature carried items / accessories prose. LEGACY (see
-    /// `description`). Optional.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub accessories: Option<String>,
 
     /// The character's history / backstory prose (NEW 2026-08-11). Optional —
     /// the Player Creator's Backstory slide can be skipped; a skipped backstory
@@ -158,18 +129,6 @@ pub struct SavedPlayer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub horn: Option<String>,
 
-    /// Clothing / outfit items as a chip list from the dynamic-list
-    /// slide. Each entry is one garment ("travel cloak", "leather
-    /// boots"). None when the slide was left empty (omitted from JSON).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub clothing: Option<Vec<String>>,
-
-    // --- Optional descriptive identity fields (2026-08-13). The Player
-    // Wizard's GLM interview MAY surface these; all optional + omitted from
-    // JSON when None. At game attach each seeds a `player.*` schema entity
-    // (mirrors `backstory`) so the narrator reads them as identity ground
-    // truth — NOT gameplay state (no body/wealth mutation; the identity-only
-    // invariant, §6C, holds).
     /// Occupation / trade ("blacksmith", "caravan guard"). Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job: Option<String>,
@@ -179,15 +138,6 @@ pub struct SavedPlayer {
     /// Visible identifying marks — scars / tattoos / birthmarks. Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distinguishing_marks: Option<String>,
-    /// Carried gear chip list (like `clothing`). Optional.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gear: Option<Vec<String>>,
-    /// Carried tools chip list. Optional.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tools: Option<Vec<String>>,
-    /// Carried weapons chip list. Optional.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub weapons: Option<Vec<String>>,
 
     // --- Custom extensions (2026-08-13). Any extra stat / asset /
     // reputation / currency / tracker the player requests that does NOT fit
@@ -358,12 +308,12 @@ const CUSTOM_TAG_VALUE_MAX: usize = 500;
 ///
 /// Checks:
 ///   • name required + non-empty after trim + ≤ NAME_MAX chars
-///   • each prose field (if present) ≤ PROSE_MAX chars
+///   • the prose field (backstory, if present) ≤ PROSE_MAX chars
 ///   • each trait field (if present) ≤ TRAIT_MAX chars + non-empty
 ///     after trim (empty traits should be None, not ""). Gender is a
 ///     free-form trait (2026-08-13: no longer restricted to male/female).
-///   • each chip list — clothing / gear / tools / weapons (if present):
-///     each entry ≤ TRAIT_MAX + non-empty + no control chars
+///   • each `<inventory>` sibling list (if present): each entry ≤
+///     TRAIT_MAX + non-empty + no control chars
 ///   • custom_tags (if present): keys ≤ CUSTOM_TAG_KEY_MAX, values ≤
 ///     CUSTOM_TAG_VALUE_MAX, no control chars
 ///   • NO control characters ([\x00-\x08\x0B\x0C\x0E-\x1F]) in any
@@ -392,13 +342,7 @@ pub fn validate_player(p: &SavedPlayer) -> Result<(), String> {
     if p.name.contains('\n') || p.name.contains('\r') {
         return Err("Name must be a single line.".into());
     }
-    for (label, val) in [
-        ("Description", &p.description),
-        ("Appearance", &p.appearance),
-        ("Personality", &p.personality),
-        ("Accessories", &p.accessories),
-        ("Backstory", &p.backstory),
-    ] {
+    for (label, val) in [("Backstory", &p.backstory)] {
         if let Some(s) = val {
             let s = s.trim();
             if s.chars().count() > PROSE_MAX {
@@ -426,14 +370,7 @@ pub fn validate_player(p: &SavedPlayer) -> Result<(), String> {
             }
         }
     }
-    // Chip lists: clothing / gear / tools / weapons. Each entry must be a
-    // non-empty, bounded label. The v2 <inventory> sibling rides the same
-    // per-entry rule (the DTO path previously bypassed every cap —
-    // 2026-08-20 audit).
-    validate_chip_list("Clothing", p.clothing.as_deref().unwrap_or(&[]))?;
-    validate_chip_list("Gear", p.gear.as_deref().unwrap_or(&[]))?;
-    validate_chip_list("Tools", p.tools.as_deref().unwrap_or(&[]))?;
-    validate_chip_list("Weapons", p.weapons.as_deref().unwrap_or(&[]))?;
+    // The v2 <inventory> sibling lists: each entry a non-empty, bounded label.
     if let Some(inv) = &p.inventory {
         validate_chip_list("Clothing", &inv.clothing)?;
         validate_chip_list("Equipped", &inv.equipped)?;
@@ -466,9 +403,9 @@ pub fn validate_player(p: &SavedPlayer) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate a chip-list field (`clothing` / `gear` / `tools` / `weapons` /
-/// the `<inventory>` sibling's lists): each entry non-empty after trim,
-/// ≤ `TRAIT_MAX`, no control chars. Shared so all the lists share one rule.
+/// Validate a chip-list field (the `<inventory>` sibling's lists): each entry
+/// non-empty after trim, ≤ `TRAIT_MAX`, no control chars. Shared so all the
+/// lists share one rule.
 fn validate_chip_list(label: &str, items: &[String]) -> Result<(), String> {
     for c in items {
         let c = c.trim();
@@ -623,13 +560,27 @@ pub fn parse_player_xml(xml: &str) -> anyhow::Result<SavedPlayer> {
         .then_some(doc.root_element())
         .ok_or_else(|| anyhow::anyhow!("root element must be <player>"))?;
 
+    // (2026-08-24 data-loss guard, same as sim_card::parse) A NON-EMPTY
+    // tail must be well-formed XML: the sibling readers below are lenient
+    // (warn + default), so a tail with one raw `&`/`<` outside CDATA
+    // parsed with the inventory/properties siblings silently defaulted —
+    // and the next render_player_xml rewrite then permanently dropped
+    // them from disk. Refuse the file instead; nothing rewrites a husk.
+    if !tail.trim().is_empty() {
+        let wrapped = format!("<wupi_player_siblings>{tail}</wupi_player_siblings>");
+        if let Err(e) = roxmltree::Document::parse(&wrapped) {
+            anyhow::bail!(
+                "player sibling tail (after </player>) is not well-formed XML: {e} — \
+                 fix the raw & or < outside CDATA; refusing to parse because a \
+                 lenient parse would default the siblings and the next rewrite \
+                 would delete them"
+            );
+        }
+    }
+
     let mut p = SavedPlayer {
         id: String::new(),
         name: String::new(),
-        description: None,
-        appearance: None,
-        personality: None,
-        accessories: None,
         backstory: None,
         gender: None,
         race: None,
@@ -646,13 +597,9 @@ pub fn parse_player_xml(xml: &str) -> anyhow::Result<SavedPlayer> {
         ears: None,
         tail: None,
         horn: None,
-        clothing: None,
         job: None,
         weakness: None,
         distinguishing_marks: None,
-        gear: None,
-        tools: None,
-        weapons: None,
         custom_tags: None,
         persona: None,
         inventory: None,
@@ -765,21 +712,6 @@ pub fn parse_player_xml(xml: &str) -> anyhow::Result<SavedPlayer> {
         }
     }
 
-    // Legacy free-prose identity blocks (multi-paragraph — kept raw; the
-    // line-block grammar cannot carry them).
-    for (tag, field) in [("description", &mut p.description), ("appearance", &mut p.appearance)] {
-        if let Some(t) = root
-            .children()
-            .find(|c| c.is_element() && c.has_tag_name(tag))
-            .map(crate::sim_card::node_text)
-        {
-            let t = t.trim().to_owned();
-            if !t.is_empty() {
-                *field = Some(t);
-            }
-        }
-    }
-
     // <inventory> sibling (outside </player>).
     let inv_text = crate::sim_card::sibling_text(tail, &["inventory"]).unwrap_or_default();
     if !inv_text.trim().is_empty() {
@@ -839,14 +771,16 @@ pub fn render_player_xml(p: &SavedPlayer) -> String {
     // The name is flattened to single-line: a newline inside it would
     // forge a second line in the labeled block (the line-block grammar
     // cannot carry it; the validator rejects new captures, the flatten
-    // covers legacy JSON + the boot migration).
+    // covers hand-edited files).
     let mut body = String::new();
     let name = p.name.split_whitespace().collect::<Vec<_>>().join(" ");
     if !name.is_empty() {
         body.push_str(&format!("Name: {name}\n"));
     }
     for (label, value) in player_identity_lines(p) {
-        body.push_str(&format!("{label}: {value}\n"));
+        // labeled_line: multi-line values round-trip (continuation lines
+        // carry the '|' marker the parser folds back).
+        body.push_str(&crate::sim_card::labeled_line(label, &value));
     }
     xml.push_str(&format!("  <identity><![CDATA[\n{}  ]]></identity>\n", cdata_body(&body)));
 
@@ -856,7 +790,7 @@ pub fn render_player_xml(p: &SavedPlayer) -> String {
     let mut persona_body = String::new();
     let mut push = |label: &str, v: Option<&str>| {
         if let Some(s) = v.map(str::trim).filter(|s| !s.is_empty()) {
-            persona_body.push_str(&format!("{label}: {s}\n"));
+            persona_body.push_str(&crate::sim_card::labeled_line(label, s));
         }
     };
     push("Personality", persona.and_then(|x| x.personality.as_deref()));
@@ -872,17 +806,6 @@ pub fn render_player_xml(p: &SavedPlayer) -> String {
             "  <persona><![CDATA[\n{}  ]]></persona>\n",
             cdata_body(&persona_body)
         ));
-    }
-
-    // Legacy free-prose identity fields (pre-v2 JSON): dedicated CDATA
-    // blocks — they can be multi-paragraph, which the labeled-line grammar
-    // cannot carry. Omitted entirely when empty (2026-08-20 audit H2:
-    // previously validated + parsed but never emitted, so the first XML
-    // write destroyed them).
-    for (tag, v) in [("description", &p.description), ("appearance", &p.appearance)] {
-        if let Some(s) = v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            xml.push_str(&format!("  <{tag}><![CDATA[\n{}\n  ]]></{tag}>\n", cdata_body(s)));
-        }
     }
 
     if let Some(tags) = &p.custom_tags {
@@ -941,7 +864,7 @@ pub fn render_player_cache_block(p: &SavedPlayer) -> String {
         out.push_str(&format!("Name: {name}\n"));
     }
     for (label, value) in player_identity_lines(p) {
-        out.push_str(&format!("{label}: {value}\n"));
+        out.push_str(&crate::sim_card::labeled_line(label, &value));
     }
     let persona = p.persona.as_ref();
     let mut persona_rows: Vec<(&'static str, String)> = Vec::new();
@@ -961,14 +884,9 @@ pub fn render_player_cache_block(p: &SavedPlayer) -> String {
     if !persona_rows.is_empty() {
         out.push('\n');
         for (label, value) in persona_rows {
-            out.push_str(&format!("{label}: {value}\n"));
-        }
-    }
-    // Legacy free-prose identity paragraphs (same payload rule as the file:
-    // present → narrator reads them, absent → nothing rendered).
-    for (label, v) in [("Description", &p.description), ("Appearance", &p.appearance)] {
-        if let Some(s) = v.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            out.push_str(&format!("\n{label}:\n{s}\n"));
+            // labeled_line continuation markers keep a multi-line value
+            // from reading as forged extra label lines in the prompt.
+            out.push_str(&crate::sim_card::labeled_line(label, &value));
         }
     }
     if let Some(tags) = &p.custom_tags {
@@ -1028,52 +946,6 @@ fn cdata_body(s: &str) -> String {
     s.replace("]]>", "]]]]><![CDATA[>")
 }
 
-/// Fold the LEGACY JSON chip lists (clothing/gear/tools/weapons) into the v2
-/// `inventory` model when no explicit inventory exists — the boot migration
-/// + read paths call this so one model serves the attach seam. Returns a
-/// clone; the original is untouched.
-pub fn fold_legacy_lists(p: &SavedPlayer) -> SavedPlayer {
-    let mut out = p.clone();
-    if out.inventory.is_none() {
-        let mut inv = PlayerInventory::default();
-        if let Some(c) = &out.clothing {
-            inv.clothing = c.iter().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()).collect();
-        }
-        // Legacy free-text accessories (the pre-v2 string field) split onto
-        // the v2 accessories rack (2026-08-20 audit H2: previously folded
-        // nowhere — the first XML write destroyed them).
-        if let Some(a) = &out.accessories {
-            inv.accessories = crate::sim_card::split_csv(a);
-        }
-        let mut stored: Vec<String> = Vec::new();
-        for list in [&out.gear, &out.tools, &out.weapons] {
-            if let Some(items) = list {
-                for s in items {
-                    let s = s.trim();
-                    if !s.is_empty() {
-                        stored.push(s.to_owned());
-                    }
-                }
-            }
-        }
-        inv.stored = stored;
-        if !inv.is_empty() {
-            out.inventory = Some(inv);
-        }
-    }
-    // Legacy top-level personality (pre-overhaul JSON) folds into the
-    // opt-in persona block so it survives the XML rewrite.
-    if out.persona.is_none() {
-        if let Some(per) = out.personality.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            out.persona = Some(PlayerPersona {
-                personality: Some(per.to_owned()),
-                ..Default::default()
-            });
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1082,10 +954,6 @@ mod tests {
         SavedPlayer {
             id: String::new(),
             name: name.into(),
-            description: None,
-            appearance: None,
-            personality: None,
-            accessories: None,
             backstory: None,
             gender: None,
             race: None,
@@ -1102,13 +970,9 @@ mod tests {
             ears: None,
             tail: None,
             horn: None,
-            clothing: None,
             job: None,
             weakness: None,
             distinguishing_marks: None,
-            gear: None,
-            tools: None,
-            weapons: None,
             custom_tags: None,
             persona: None,
             inventory: None,
@@ -1140,14 +1004,14 @@ mod tests {
     #[test]
     fn validate_rejects_control_chars() {
         let mut bad = p("Alex");
-        bad.description = Some("has a null\0 here".into());
+        bad.backstory = Some("has a null\0 here".into());
         assert!(validate_player(&bad).is_err());
     }
 
     #[test]
     fn validate_allows_newlines_in_prose() {
         let mut ok = p("Alex");
-        ok.description = Some("line one\nline two\r\nthree".into());
+        ok.backstory = Some("line one\nline two\r\nthree".into());
         assert!(validate_player(&ok).is_ok());
     }
 
@@ -1193,19 +1057,11 @@ mod tests {
     #[test]
     fn validate_rejects_empty_clothing_entry() {
         let mut bad = p("Alex");
-        bad.clothing = Some(vec!["cloak".into(), "   ".into()]);
+        bad.inventory = Some(PlayerInventory {
+            clothing: vec!["cloak".into(), "   ".into()],
+            ..Default::default()
+        });
         assert!(validate_player(&bad).is_err());
-    }
-
-    #[test]
-    fn validate_rejects_empty_gear_entry() {
-        // The shared chip-list rule applies to gear/tools/weapons too.
-        let mut bad = p("Alex");
-        bad.gear = Some(vec!["rope".into(), "".into()]);
-        assert!(validate_player(&bad).is_err());
-        let mut bad2 = p("Alex");
-        bad2.weapons = Some(vec!["   ".into()]);
-        assert!(validate_player(&bad2).is_err());
     }
 
     #[test]
@@ -1272,10 +1128,13 @@ mod tests {
         ok.breast_size = None; // conditional toggle was No → omitted
         ok.tail = Some("panther, prehensile".into());
         ok.horn = None; // human-leaning → no horns
-        ok.clothing = Some(vec!["travel cloak".into(), "leather boots".into()]);
+        ok.inventory = Some(PlayerInventory {
+            clothing: vec!["travel cloak".into(), "leather boots".into()],
+            stored: vec!["brass compass".into(), "charcoal".into()],
+            ..Default::default()
+        });
         ok.job = Some("cartographer".into());
         ok.weakness = Some("terrified of deep water".into());
-        ok.gear = Some(vec!["brass compass".into(), "charcoal".into()]);
         let mut tags = std::collections::BTreeMap::new();
         tags.insert("starting_currency".into(), "200 gold".into());
         ok.custom_tags = Some(tags);
@@ -1284,21 +1143,19 @@ mod tests {
 
     #[test]
     fn conditional_traits_omitted_from_json_when_none() {
-        // The skip_serializing_if contract: breast_size/ears/tail/horn/clothing
-        // + the new optional fields + custom_tags vanish from the serialized
-        // JSON when None (the Yes/No toggle was No / the field was skipped).
+        // The skip_serializing_if contract: breast_size/ears/tail/horn +
+        // job/custom_tags/inventory vanish from the serialized JSON when None
+        // (the Yes/No toggle was No / the field was skipped).
         let mut sp = p("Alex");
         sp.gender = Some("female".into());
-        // breast_size / ears / tail / horn / clothing / job / custom_tags left None
         let json = serde_json::to_string(&sp).unwrap();
         assert!(!json.contains("breast_size"));
         assert!(!json.contains("\"ears\""));
         assert!(!json.contains("\"tail\""));
         assert!(!json.contains("\"horn\""));
-        assert!(!json.contains("clothing"));
         assert!(!json.contains("\"job\""));
-        assert!(!json.contains("gear"));
         assert!(!json.contains("custom_tags"));
+        assert!(!json.contains("inventory"));
         assert!(json.contains("\"gender\":\"female\""));
     }
 
@@ -1306,7 +1163,10 @@ mod tests {
     fn conditional_traits_present_when_set() {
         let mut sp = p("Alex");
         sp.tail = Some("fox".into());
-        sp.clothing = Some(vec!["robe".into()]);
+        sp.inventory = Some(PlayerInventory {
+            clothing: vec!["robe".into()],
+            ..Default::default()
+        });
         let json = serde_json::to_string(&sp).unwrap();
         assert!(json.contains("\"tail\":\"fox\""));
         assert!(json.contains("\"clothing\":[\"robe\"]"));
@@ -1323,7 +1183,10 @@ mod tests {
         sp.hair_style = Some("braided".into());
         sp.eye_color = Some("green".into());
         sp.ears = Some("slightly pointed".into());
-        sp.clothing = Some(vec!["apron".into(), "ring mail".into()]);
+        sp.inventory = Some(PlayerInventory {
+            clothing: vec!["apron".into(), "ring mail".into()],
+            ..Default::default()
+        });
         let json = serde_json::to_string(&sp).unwrap();
         let back: SavedPlayer = serde_json::from_str(&json).unwrap();
         assert_eq!(back.gender.as_deref(), Some("female"));
@@ -1331,7 +1194,10 @@ mod tests {
         assert_eq!(back.hair_color.as_deref(), Some("auburn"));
         assert_eq!(back.hair_style.as_deref(), Some("braided"));
         assert_eq!(back.ears.as_deref(), Some("slightly pointed"));
-        assert_eq!(back.clothing.as_deref(), Some(&["apron".to_string(), "ring mail".to_string()][..]));
+        assert_eq!(
+            back.inventory.as_ref().unwrap().clothing,
+            ["apron".to_string(), "ring mail".to_string()]
+        );
     }
 
     #[test]
@@ -1503,6 +1369,31 @@ Clothing: White Cropped Tee, Gray Denim Shorts, White Knee-High Socks, White Sne
         assert!(!cache.contains("Personality"));
     }
 
+    /// (2026-08-24 multi-line round-trip) A multi-paragraph backstory whose
+    /// later lines carry colons survives the XML round-trip BYTE-faithful —
+    /// the old line-block parse truncated the value at the first
+    /// colon-bearing line (it parsed as a new label) and the next write
+    /// persisted the mangled version.
+    #[test]
+    fn player_xml_multiline_backstory_round_trips() {
+        let mut sp = p("Mira");
+        let prose = "Raised by cartographers.\n\nChapter 1: The Year of Salt.\nShe learned maps before words.";
+        sp.backstory = Some(prose.into());
+        let xml = render_player_xml(&sp);
+        // Continuation lines carry the '|' marker.
+        assert!(xml.contains("Backstory: Raised by cartographers.\n| \n| Chapter 1: The Year of Salt.\n| She learned maps before words.\n"));
+        let back = parse_player_xml(&xml).expect("parses");
+        assert_eq!(back.backstory.as_deref(), Some(prose));
+
+        // A hand-authored file using the markers parses identically.
+        let hand = "<player>\n  <metadata><id>mira</id></metadata>\n  <identity><![CDATA[\nName: Mira\n  ]]></identity>\n  <persona><![CDATA[\nBackstory: First line.\n| Continued: with a colon.\n  ]]></persona>\n</player>";
+        let hp = parse_player_xml(hand).expect("parses");
+        assert_eq!(
+            hp.backstory.as_deref(),
+            Some("First line.\nContinued: with a colon.")
+        );
+    }
+
     #[test]
     fn player_cache_block_excludes_inventory() {
         let sp = parse_player_xml(ALEX_XML).expect("parses");
@@ -1527,65 +1418,31 @@ Clothing: White Cropped Tee, Gray Denim Shorts, White Knee-High Socks, White Sne
         assert_eq!(back.horn.as_deref(), Some("small"));
         assert_eq!(back.breast_size.as_deref(), Some("modest"));
     }
-
-    #[test]
-    fn fold_legacy_lists_into_inventory() {
-        let mut sp = p("Legacy");
-        sp.clothing = Some(vec!["travel cloak".into(), "boots".into()]);
-        sp.gear = Some(vec!["rope".into()]);
-        sp.weapons = Some(vec!["shortsword".into()]);
-        sp.personality = Some("Old-school prose.".into());
-        let folded = fold_legacy_lists(&sp);
-        let inv = folded.inventory.expect("legacy lists folded");
-        assert_eq!(inv.clothing, vec!["travel cloak".to_string(), "boots".to_string()]);
-        assert!(inv.stored.contains(&"rope".to_string()));
-        assert!(inv.stored.contains(&"shortsword".to_string()));
-        assert_eq!(
-            folded.persona.as_ref().unwrap().personality.as_deref(),
-            Some("Old-school prose.")
-        );
-        // XML round-trip preserves the folded shape.
-        let back = parse_player_xml(&render_player_xml(&folded)).expect("parses");
-        assert_eq!(back.inventory.unwrap().clothing.len(), 2);
-    }
-
     #[test]
     fn player_xml_rejects_wrong_root() {
         assert!(parse_player_xml("<sim_card><id>x</id></sim_card>").is_err());
     }
 
     #[test]
-    fn player_xml_roundtrips_flavor_prose_stamp_and_accessories() {
-        // 2026-08-20 audit H2: job/weakness/marks/description/appearance were
-        // validated + parsed but never emitted — the first XML write silently
-        // destroyed them. They must now ride the file AND survive a round-trip
-        // (legacy accessories fold onto the v2 rack; the creation stamp
-        // persists instead of re-minting every write).
+    fn player_xml_roundtrips_flavor_lines_and_stamp() {
+        // 2026-08-20 audit H2: job/weakness/marks were validated + parsed
+        // but never emitted — the first XML write silently destroyed them.
+        // They must ride the file AND survive a round-trip (the creation
+        // stamp persists instead of re-minting every write).
         let mut sp = p("Alex");
         sp.job = Some("Blacksmith".into());
         sp.weakness = Some("prone to rage".into());
         sp.distinguishing_marks = Some("scar over left eye".into());
-        sp.description = Some("Tall.\nSecond paragraph.".into());
-        sp.appearance = Some("Weathered hands.".into());
-        sp.accessories = Some("Copper Ring, Silver Chain".into());
         sp.created_at_ms = 1724000000000;
-        let folded = fold_legacy_lists(&sp);
-        let back = parse_player_xml(&render_player_xml(&folded)).expect("round-trips");
+        let back = parse_player_xml(&render_player_xml(&sp)).expect("round-trips");
         assert_eq!(back.job.as_deref(), Some("Blacksmith"));
         assert_eq!(back.weakness.as_deref(), Some("prone to rage"));
         assert_eq!(back.distinguishing_marks.as_deref(), Some("scar over left eye"));
-        assert_eq!(back.description.as_deref(), Some("Tall.\nSecond paragraph."));
-        assert_eq!(back.appearance.as_deref(), Some("Weathered hands."));
-        assert_eq!(
-            back.inventory.as_ref().unwrap().accessories,
-            vec!["Copper Ring".to_string(), "Silver Chain".to_string()]
-        );
         assert_eq!(back.created_at_ms, 1724000000000);
         // The trait-capped flavor lines ride the narrator cache block too.
-        let block = render_player_cache_block(&folded);
+        let block = render_player_cache_block(&sp);
         assert!(block.contains("Job: Blacksmith\n"));
         assert!(block.contains("Distinguishing Marks: scar over left eye\n"));
-        assert!(block.contains("Description:\nTall.\nSecond paragraph.\n"));
     }
 
     #[test]

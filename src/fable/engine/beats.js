@@ -24,7 +24,7 @@
 //   channel events → see narrator.js
 // =============================================================
 
-import { variantCount, computeDrawerState, swipeNextAction, canEditMessage } from './drawer-logic.js';
+import { variantCount, computeDrawerState, swipeNextAction, canEditMessage, centeredPopupOpen, isTrailingAssistantBeat } from './drawer-logic.js';
 
 let feedEl = null;
 
@@ -233,6 +233,14 @@ function runEntranceScroll() {
     else cancelEntrance();
   };
   requestAnimationFrame(frame);
+}
+
+// True while the entrance/push-up scroll tween owns scrollTop. Read-only
+// probe for stage.js's jump-to-latest arrow, which suppresses itself over
+// the 1s sweep (it passes through "scrolled up" territory on its way to the
+// bottom — the arrow would flash mid-tween for a turn the reader follows).
+export function isEntranceScrolling() {
+  return entrance !== null;
 }
 
 export function clearFeed() {
@@ -610,10 +618,17 @@ function buildDrawerHTML(role) {
 // transiently-last beats keep an enabled › (they were stamped before the
 // later beats appended). A stale-enabled › on a mid-history beat used to
 // reroll the WRONG (trailing) turn.
+// (2026-08-24 swipe-lock tightening) TRAILING MESSAGE, not merely the last
+// assistant: the backend refuses swipes/edits on any beat with a later
+// message (`swipe_variant`: "index N is not the trailing beat"), so a feed
+// ending on a USER beat (the composer restore after api_lost, a rewind)
+// must retire the last assistant's ‹/› too. The pure decision lives in
+// drawer-logic (isTrailingAssistantBeat) where the tests pin it; the
+// trailing test runs over role-bearing beats only (system/error beats are
+// DOM-only, never backend messages).
 export function isTrailingAssistant(beat) {
   if (!beat || !feedEl) return false;
-  const asst = feedEl.querySelectorAll('.fable-mes.assistant');
-  return asst.length > 0 && asst[asst.length - 1] === beat;
+  return isTrailingAssistantBeat(beat, roleBeatsInDom());
 }
 
 export function refreshDrawer(beat) {
@@ -635,6 +650,16 @@ export function refreshDrawer(beat) {
   const { canPrev, canNext } = computeDrawerState({ role, count, active, isLastAssistant });
 
   drawer.classList.toggle('multi', count > 1);
+  // (2026-08-26 Chloe) ‹ is never VISIBLE on the first variant — at active 0
+  // the bar shows just "N / N ›" (the reserved grid slot keeps the layout
+  // stable; the button hides via .at-first's visibility rule in fable.css).
+  drawer.classList.toggle('at-first', active <= 0);
+  // (2026-08-26 Chloe) A beat whose variants are LOCKED (any assistant beat
+  // with a later message — the backend's trailing-beat swipe contract refuses
+  // it) renders NO variant affordance at all: grayed-out ‹ 1/2 › chevrons
+  // read as a broken UI ("it says 1/2 but nothing works"). The gold edit/
+  // delete pair stays — edit on user beats + delete anywhere remain live.
+  drawer.classList.toggle('is-locked', role === 'assistant' && !isLastAssistant);
 
   const countEl = drawer.querySelector('[data-drawer-count]');
   if (countEl) {
@@ -655,10 +680,11 @@ export function refreshDrawer(beat) {
   }
 }
 
-// Re-export the pure swipe-next decision + the pure disabled-state helper so
-// stage.js's delegated handler routes › through the same logic the unit
-// tests pin (one import path).
-export { swipeNextAction, computeDrawerState, canEditMessage };
+// Re-export the pure swipe-next decision + the pure disabled-state helper (+
+// the centered-popup gate the stage keyboard shortcuts consult, + the pure
+// trailing-beat predicate behind isTrailingAssistant) so stage.js routes ›
+// through the same logic the unit tests pin (one import path).
+export { swipeNextAction, computeDrawerState, canEditMessage, centeredPopupOpen, isTrailingAssistantBeat };
 
 function appendMes(root) {
   if (!feedEl) return null;
@@ -683,12 +709,19 @@ function appendMes(root) {
   // the tail yet — the live-turn reroll affordance was dead until the next
   // rebuild). Re-sync the new beat now that it IS the tail, + the assistant
   // that previously held the trailing › (its fold-into-reroll must retire
-  // to this beat). Non-assistant appends don't change which assistant is
-  // trailing — no sync needed.
+  // to this beat). A USER append instead retires the assistant it lands
+  // after (below) — it is no longer the trailing MESSAGE.
   if (root.classList.contains('assistant')) {
     refreshDrawer(root);
     const asst = feedEl.querySelectorAll('.fable-mes.assistant');
     if (asst.length >= 2) refreshDrawer(asst[asst.length - 2]);
+  } else if (root.dataset.role === 'user') {
+    // A user beat landing after an assistant RETIRES that assistant's
+    // stamped ‹/› (it is no longer the trailing MESSAGE — the backend
+    // refuses its swipes now). The click-time re-derive already no-ops;
+    // this keeps the visible chevrons honest too.
+    const asst = feedEl.querySelectorAll('.fable-mes.assistant');
+    if (asst.length) refreshDrawer(asst[asst.length - 1]);
   }
   // (2026-08-19) Entrance: the beat's own rise-from-the-input-row keyframes
   // (fable.css) + the 1s scrollTop tween that pushes the whole train up

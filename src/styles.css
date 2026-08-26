@@ -1723,12 +1723,8 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     border-bottom-right-radius: 4px;
     box-shadow: 0 4px 12px color-mix(in srgb, var(--ui-accent) 30%, transparent);
 }
-.msg.wupi.streaming::after {
-    content: '▍';
-    animation: blink 0.8s infinite;
-    color: color-mix(in srgb, var(--ui-accent) 80%, transparent);
-}
-@keyframes blink { 50% { opacity: 0; } }
+/* No streaming caret on the Wupi bubble: the blinking block cursor was
+   removed (2026-08-25); streamed text simply grows until `done` lands. */
 /* Tool-calling agent loop chips (Phase 5). Small monospace status badges
    that appear above the Wupi bubble while tools execute, then settle to a
    success/failure tint. Subtle by design: tool surface is invisible to the
@@ -1789,25 +1785,45 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
     padding: 12px 14px;
     background: rgba(0, 0, 0, 0.2);
 }
-.chat-input {
-    width: 100%;
-    box-sizing: border-box;
+/* Line-lock wrapper (2026-08-24, same law as the Fable composers): the box
+   owns the vertical inset + chrome so the textarea's scroll viewport is a
+   whole number of 21px lines — no fractional-line slivers at the bottom,
+   3-line max, one line per wheel click (wired in script.js via
+   engine/input-lines.js). */
+.chat-input-box {
+    padding: 10px 0;   /* the vertical inset — OUTSIDE the scroll viewport */
     background: rgba(0, 0, 0, 0.3);
     border: 1px solid rgba(255, 255, 255, 0.1);
     border-radius: 12px;
-    padding: 0.7em 0.85em;            /* em rides the clamped font; =9.8/12px at the 14px reference */
+    transition: border-color 0.15s, box-shadow 0.15s;
+}
+.chat-input {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    background: transparent;
+    border: none;
+    padding: 0 12px;
     color: #fff;
     font-family: inherit;
     font-size: clamp(12px, 3.18cqi, 16px);   /* mirrors .msg — unchanged on the 440px reference window */
+    line-height: 21px;   /* WHOLE-PX (line-lock law): the scroll grid is 21px multiples */
+    height: 21px;        /* 1 line at rest (the line-lock grower writes 21/42/63) */
+    max-height: 63px;    /* EXACTLY 3 lines — the whole-line viewport cap */
     outline: none;
     resize: none;
-    transition: border-color 0.15s, box-shadow 0.15s;
+    overflow: hidden;
 }
-.chat-input:focus {
+.chat-input-box:focus-within {
     border-color: color-mix(in srgb, var(--ui-accent) 60%, transparent);
     box-shadow: 0 0 0 3px color-mix(in srgb, var(--ui-accent) 12%, transparent);
 }
 .chat-input::placeholder { color: rgba(255, 255, 255, 0.3); }
+/* No scroll handle on the line-locked input (parity with the Fable
+   composers — scrolling is wheel/keyboard, one whole line per click). */
+.chat-input { scrollbar-width: none; }
+.chat-input::-webkit-scrollbar { width: 0; height: 0; }
+.chat-input::-webkit-scrollbar-thumb { background: transparent; }
 /* The send/stop buttons + .chat-send-row are GONE (2026-07-27): generation
    is Enter-driven (Enter to send, empty-Enter to stop, Shift+Enter newline).
    The input stays enabled during generation so the stop gesture works. */

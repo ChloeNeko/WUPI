@@ -124,6 +124,26 @@ let turnEpoch = 0;
 let sessionChangedUnlisten = null;
 // Generation counter for the async unlisten-handle race (see initNarrator).
 let sessionChangedGen = 0;
+// (2026-08-24) The DEFERRED WORLD TICK in-flight signal. The backend's
+// world-progression tick runs ~1-3s AFTER `done` (turn lock + lease must
+// drop first) — `generating` is already false in that window, so the Soul
+// Gem panel / raw editor's isGenerating() gate was green while the tick
+// still mutated the schema, and a schema install there overwrote the
+// tick's mutations with a pre-tick snapshot. The backend emits
+// `world-tick-begin` / `world-tick-end` around the whole tick; the flag
+// rides isGenerating() so every existing gate picks it up.
+let worldTickInFlight = false;
+let worldTickBeginUnlisten = null;
+let worldTickEndUnlisten = null;
+// (2026-08-25 failsafe) The backend's WorldTickFlightGuard is RAII on every
+// exit path, so a missing `world-tick-end` is near-impossible — but the cost
+// asymmetry is brutal: a stuck-true flag is a session-long Soul-Gem/raw-
+// editor lockout with no indicator. The watchdog converts that into a ≤120s
+// lockout: begin→end legitimately spans at most a turn-lock wait behind a
+// live tracker decode plus the tick's own decode (~tens of seconds), so 120s
+// clears it with several × headroom and can never cut a real tick short.
+const WORLD_TICK_WATCHDOG_MS = 120_000;
+let worldTickWatchdog = 0;
 // Optional hook fired when a chat-side `fable_schema_patch` tool mutates the
 // live schema (the HUD may refresh its Soul Gem panel immediately). Receives
 // the list of merged top-level field names.
@@ -191,6 +211,44 @@ export function initNarrator(hooks = {}) {
     try { sessionChangedUnlisten(); } catch (_) { /* already torn down */ }
     sessionChangedUnlisten = null;
   }
+  if (worldTickBeginUnlisten) {
+    try { worldTickBeginUnlisten(); } catch (_) { /* already torn down */ }
+    worldTickBeginUnlisten = null;
+  }
+  if (worldTickEndUnlisten) {
+    try { worldTickEndUnlisten(); } catch (_) { /* already torn down */ }
+    worldTickEndUnlisten = null;
+  }
+  // (2026-08-24) The deferred-tick busy signal — same async-unlisten race
+  // discipline as the session-changed listener above (superseded handles
+  // self-release against the generation).
+  listen('world-tick-begin', () => {
+    worldTickInFlight = true;
+    clearTimeout(worldTickWatchdog);
+    worldTickWatchdog = setTimeout(() => {
+      if (worldTickInFlight) {
+        console.warn('[narrator] world-tick-end was never received — watchdog releasing the busy flag');
+        worldTickInFlight = false;
+      }
+    }, WORLD_TICK_WATCHDOG_MS);
+  }).then((un) => {
+    if (mySessionGen !== sessionChangedGen) {
+      try { un(); } catch (_) {}
+      return;
+    }
+    worldTickBeginUnlisten = un;
+  }).catch(() => { /* listener setup failed; non-fatal */ });
+  listen('world-tick-end', () => {
+    worldTickInFlight = false;
+    clearTimeout(worldTickWatchdog);
+    worldTickWatchdog = 0;
+  }).then((un) => {
+    if (mySessionGen !== sessionChangedGen) {
+      try { un(); } catch (_) {}
+      return;
+    }
+    worldTickEndUnlisten = un;
+  }).catch(() => { /* listener setup failed; non-fatal */ });
   listen('fable-session-changed', async (e) => {
     const payload = e?.payload || {};
     if (payload.kind === 'messages' && Array.isArray(payload.messages)) {
@@ -322,6 +380,9 @@ export function initNarrator(hooks = {}) {
 export function resetNarrator() {
   activeBeat = null;
   generating = false;
+  worldTickInFlight = false;
+  clearTimeout(worldTickWatchdog);
+  worldTickWatchdog = 0;
   rerolling = false;
   rerollPrevText = null;
   uncommittedUserBeat = null;
@@ -651,7 +712,11 @@ function finishTurn() {
   uncommittedUserBeat = null;
 }
 
-export function isGenerating() { return generating; }
+// (2026-08-24) Includes the deferred world-tick window: the backend tick
+// runs 1-3s AFTER `done` cleared `generating`, and the schema-install gates
+// (Soul Gem panel, raw editor) must stay shut through it — see
+// worldTickInFlight above.
+export function isGenerating() { return generating || worldTickInFlight; }
 export function isRerolling() { return rerolling; }
 // True while a golden-pencil slice regen is streaming. The composer's stop
 // button reads this to route the cancel to `fable_slice_stop` (the slice
@@ -1064,10 +1129,10 @@ export async function stopSliceRegen() {
   try { await invoke('fable_slice_stop'); } catch (_) {}
 }
 
-// npc_id → display name. Cards declare start_npcs as ids; the model
-// emits the same ids in [CHARACTER_TURN:id]. We prettify: "the_stranger"
-// → "The Stranger". A passed-in npcPretty hook overrides (e.g. to map
-// card-declared display names).
+// npc_id → display name. The registry + tracker carry ids; the model emits
+// the same ids in [CHARACTER_TURN:id]. We prettify: "the_stranger"
+// → "The Stranger". (The optional npcPretty override hook currently has no
+// supplier — the default prettifier below is the single live path.)
 function prettySpeaker(npcId) {
   if (npcPretty) {
     const mapped = npcPretty(npcId);

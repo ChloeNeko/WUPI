@@ -34,7 +34,7 @@ use regex::Regex;
 /// rejected brackets from FINALIZED prose, so the live stream and the stored
 /// beat can't diverge). Body alternation is quote-aware, mirroring the
 /// parser's `find_bracket_close` (see `with_brackets` for the full rationale).
-const BRACKET_STRIP_PATTERN: &str = r#"(?i)\[(?:CHARACTER_TURN:(?:end|[^\]\s]+)|OBJECT\s*(?:[^"\]]+|"[^"]*"?)+|FX\s*(?:[^"\]]+|"[^"]*"?)+|TIME\s*(?:[^"\]]+|"[^"]*"?)+|DATE\s*(?:[^"\]]+|"[^"]*"?)+|WEATHER\s*(?:[^"\]]+|"[^"]*"?)+|TRAVEL\s*(?:[^"\]]+|"[^"]*"?)+|EFFECT\s*(?:[^"\]]+|"[^"]*"?)+|MILESTONE\s*(?:[^"\]]+|"[^"]*"?)+|TASK\s*(?:[^"\]]+|"[^"]*"?)+|RUMOR\s*(?:[^"\]]+|"[^"]*"?)+|PRESENCE\s*(?:[^"\]]+|"[^"]*"?)+|DISCOVER\s*(?:[^"\]]+|"[^"]*"?)+|NPC_REGISTER\s*(?:[^"\]]+|"[^"]*"?)+|NPC_ITEM\s*(?:[^"\]]+|"[^"]*"?)+|MOOD\s*(?:[^"\]]+|"[^"]*"?)+|INTENT\s*(?:[^"\]]+|"[^"]*"?)+|APPEARANCE\s*(?:[^"\]]+|"[^"]*"?)+|EQUIP\s*(?:[^"\]]+|"[^"]*"?)+|BELT\s*(?:[^"\]]+|"[^"]*"?)+|PACK\s*(?:[^"\]]+|"[^"]*"?)+|ROOM\s*(?:[^"\]]+|"[^"]*"?)+|ASSET\s*(?:[^"\]]+|"[^"]*"?)+|PROMISE\s*(?:[^"\]]+|"[^"]*"?)+|LEDGER\s*(?:[^"\]]+|"[^"]*"?)+)\]"#;
+const BRACKET_STRIP_PATTERN: &str = r#"(?i)\[(?:CHARACTER_TURN:(?:end|[^\]\s]+)|OBJECT\s*(?:[^"\]]+|"[^"]*"?)+|FX\s*(?:[^"\]]+|"[^"]*"?)+|TIME\s*(?:[^"\]]+|"[^"]*"?)+|DATE\s*(?:[^"\]]+|"[^"]*"?)+|WEATHER\s*(?:[^"\]]+|"[^"]*"?)+|TRAVEL\s*(?:[^"\]]+|"[^"]*"?)+|EFFECT\s*(?:[^"\]]+|"[^"]*"?)+|MILESTONE\s*(?:[^"\]]+|"[^"]*"?)+|TASK\s*(?:[^"\]]+|"[^"]*"?)+|RUMOR\s*(?:[^"\]]+|"[^"]*"?)+|PRESENCE\s*(?:[^"\]]+|"[^"]*"?)+|DISCOVER\s*(?:[^"\]]+|"[^"]*"?)+|NPC_REGISTER\s*(?:[^"\]]+|"[^"]*"?)+|NPC_ITEM\s*(?:[^"\]]+|"[^"]*"?)+|MOOD\s*(?:[^"\]]+|"[^"]*"?)+|INTENT\s*(?:[^"\]]+|"[^"]*"?)+|APPEARANCE\s*(?:[^"\]]+|"[^"]*"?)+|EQUIP\s*(?:[^"\]]+|"[^"]*"?)+|BELT\s*(?:[^"\]]+|"[^"]*"?)+|PACK\s*(?:[^"\]]+|"[^"]*"?)+|ROOM\s*(?:[^"\]]+|"[^"]*"?)+|ASSET\s*(?:[^"\]]+|"[^"]*"?)+|PROMISE\s*(?:[^"\]]+|"[^"]*"?)+|LEDGER\s*(?:[^"\]]+|"[^"]*"?)+|REST(?:\s(?:[^"\]]+|"[^"]*"?)+)?\s*|ARCANA\s*(?:[^"\]]+|"[^"]*"?)+|QUEST\s*(?:[^"\]]+|"[^"]*"?)+|EXPIRY\s*(?:[^"\]]+|"[^"]*"?)+|UNLOCK\s*(?:[^"\]]+|"[^"]*"?)+)\]"#;
 
 /// (2026-08-16 yellow B10) Whole-text strip of verb-shaped brackets. The
 /// streaming filter strips these live, but `bracket_parser::parse` only
@@ -52,6 +52,23 @@ pub fn strip_bracket_shaped(text: &str) -> String {
     static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| Regex::new(BRACKET_STRIP_PATTERN).expect("bracket regex always compiles"));
     re.replace_all(text, "").into_owned()
+}
+
+/// (2026-08-24 review fix) Quote-aware close scan, mirroring the parser's
+/// `find_bracket_close`: a `]` inside a double-quoted value is literal, not
+/// a bracket close. Used by feed's holdback check + flush's partial-bracket
+/// strip so a chunk boundary landing right after a quoted `]` can't be
+/// mistaken for a complete bracket. Pure; single pass.
+fn has_unquoted_bracket_close(s: &str) -> bool {
+    let mut in_quotes = false;
+    for c in s.chars() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            ']' if !in_quotes => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Configuration for a `StreamFilter`.
@@ -352,10 +369,17 @@ impl StreamFilter {
                 }
                 // If this '[' already formed a COMPLETE bracket (regex matches
                 // up to a ']'), it's not a partial — the regex will strip it,
-                // so don't hold it back. Only hold if there's no ']' after it
-                // in the slice (i.e. the bracket is still open/incomplete).
+                // so don't hold it back. Only hold if there's no UNQUOTED ']'
+                // after it in the slice (i.e. the bracket is still
+                // open/incomplete). Quote-aware (2026-08-24 review fix): a
+                // ']' inside a double-quoted value (`[EQUIP name="Studded
+                // [Fine]…`) is NOT a close — the old bare contains(']')
+                // released the slice there and the regex then terminated the
+                // match at the quoted ']' (the body's `"?` fallback),
+                // stripping a partial bracket whose remainder
+                // (` Armor" slot=chest]`) leaked as residue mid-stream.
                 let candidate = &self.buffer[from..safe_end];
-                if !candidate.contains(']') {
+                if !has_unquoted_bracket_close(candidate) {
                     effective_end = from;
                     break;
                 }
@@ -481,7 +505,9 @@ impl StreamFilter {
                 bracket_changed = false;
                 if let Some(bracket_pos) = remaining.rfind('[') {
                     let tail = &remaining[bracket_pos..];
-                    if !tail.contains(']') {
+                    // Quote-aware close check (same helper as feed's holdback):
+                    // a ']' inside an open double-quoted value is not a close.
+                    if !has_unquoted_bracket_close(tail) {
                         // Unterminated bracket: drop it so it doesn't leak.
                         remaining.truncate(bracket_pos);
                         bracket_changed = true;
@@ -1214,6 +1240,34 @@ mod tests {
         assert!(flushed.contains("Some prose."), "prose lost: {:?}", flushed);
         assert!(!flushed.contains("["), "partial bracket leaked in flush: {:?}", flushed);
         assert!(!flushed.contains("OBJE"), "partial bracket content leaked: {:?}", flushed);
+    }
+
+    #[test]
+    fn quoted_bracket_close_never_leaks_residue() {
+        // (2026-08-24 review fix) A `]` inside a quoted value is NOT a
+        // close. The old bare contains(']') holdback released the slice
+        // when the trailing window's cut landed between the quoted `]` and
+        // the real close — the regex then terminated the match at the
+        // quoted `]` and the remainder (` Armor" slot=chest]`) streamed as
+        // residue. Drive the feed BYTE-BY-BYTE so every safe_end boundary
+        // position is exercised (the lethal window is only ~15 bytes wide).
+        let full = format!(
+            "{}{}{}",
+            "A".repeat(120),
+            "[EQUIP name=\"Studded [Fine] Armor\" slot=chest]",
+            "The fire crackles. ".repeat(10)
+        );
+        let mut f = StreamFilter::new(&["<|turn>"]).with_brackets();
+        let mut seen = String::new();
+        for b in full.bytes() {
+            seen.push_str(&f.feed(&(b as char).to_string()));
+        }
+        seen.push_str(&f.flush());
+        assert!(seen.contains("The fire crackles."), "tail prose lost: {seen:?}");
+        assert!(
+            !seen.contains("EQUIP") && !seen.contains("Studded") && !seen.contains("slot=chest"),
+            "quoted-] residue leaked: {seen:?}"
+        );
     }
 
     #[test]
@@ -2018,5 +2072,80 @@ mod tests {
         assert!(!stripped.contains("[LEDGER"), "LEDGER leaked: {stripped:?}");
         assert!(stripped.contains("She enters."), "prose survives");
         assert!(stripped.contains("Rejected residue:"), "prose survives");
+    }
+
+    /// (2026-08-24 review P1) The five new verbs — REST / ARCANA / QUEST /
+    /// EXPIRY / UNLOCK — must strip from finalized prose. REST is the sharp
+    /// edge: the parser (bracket_parser) accepts the BARE form only and
+    /// deliberately declines any payload to prose, so a model emission like
+    /// `[REST 8h]` (plausible — every other verb carries a payload) was
+    /// rejected by the parser AND unmatched by the old bare `|REST|` strip
+    /// arm, surviving both layers into the stored beat, the autosave, and
+    /// memory archival. The strip arm now carries the whitespace-gated body
+    /// alternation so `[REST 8h]` strips while `[RESTORE the door]` prose
+    /// (no whitespace directly after REST) survives.
+    #[test]
+    fn strip_bracket_shaped_covers_rest_arcana_quest_expiry_unlock() {
+        let text = "Night falls. [REST 8h] Dawn breaks. [rest until dawn] \
+                    Arcana stirs. [ARCANA biotics] A vow is sworn. \
+                    [QUEST main slay the marsh dragon | 1 3] \
+                    Time runs out. [EXPIRY mara return the horse] \
+                    A seal breaks. [UNLOCK iron-forge cellar]";
+        let stripped = strip_bracket_shaped(text);
+        assert!(!stripped.contains("[REST"), "REST payload form leaked: {stripped:?}");
+        assert!(!stripped.contains("[rest"), "lowercase rest leaked: {stripped:?}");
+        assert!(!stripped.contains("[ARCANA"), "ARCANA leaked: {stripped:?}");
+        assert!(!stripped.contains("[QUEST"), "QUEST leaked: {stripped:?}");
+        assert!(!stripped.contains("[EXPIRY"), "EXPIRY leaked: {stripped:?}");
+        assert!(!stripped.contains("[UNLOCK"), "UNLOCK leaked: {stripped:?}");
+        assert!(stripped.contains("Night falls."), "prose survives");
+        assert!(stripped.contains("Dawn breaks."), "prose survives");
+        assert!(stripped.contains("Arcana stirs."), "prose survives");
+
+        // The bare form strips too (the parser ACCEPTS it, so this is pure
+        // display-side parity with every other verb).
+        let bare = strip_bracket_shaped("He sleeps. [REST] Morning.");
+        assert!(!bare.contains("["), "bare REST leaked: {bare:?}");
+        assert!(bare.contains("He sleeps."), "prose survives");
+    }
+
+    /// (2026-08-24 review P1) The whitespace gate: bracket-shaped PROSE that
+    /// merely starts with the letters REST must survive both the finalized
+    /// strip and the live streaming filter. `[RESTORE the door]` is the
+    /// parser's own documented non-misparse case — the strip layer must not
+    /// be the layer that breaks it.
+    #[test]
+    fn restore_shaped_prose_survives_the_rest_arm() {
+        let kept = strip_bracket_shaped("She [RESTORE the door] with a prayer.");
+        assert!(
+            kept.contains("[RESTORE the door]"),
+            "RESTORE prose wrongly stripped: {kept:?}"
+        );
+        // Streaming surface: the same bracket must not vanish mid-stream.
+        let mut f = StreamFilter::new(&["<|turn>"]).with_brackets();
+        let out = f.feed("She [RESTORE the door] with a prayer.");
+        let flushed = f.flush();
+        let combined = format!("{out}{flushed}");
+        assert!(
+            combined.contains("[RESTORE the door]"),
+            "RESTORE prose stripped live: {combined:?}"
+        );
+    }
+
+    /// (2026-08-24 review P1) Live-stream parity for the payload form: the
+    /// emission the player watches disappear during generation must not
+    /// re-appear in the finalized beat.
+    #[test]
+    fn rest_with_payload_stripped_live_and_split_across_chunks() {
+        let mut f = StreamFilter::new(&["<|turn>"]).with_brackets();
+        let out = f.feed("Camp is set.[RE");
+        assert!(!out.contains("[RE"), "partial bracket leaked: {out:?}");
+        let out2 = f.feed("ST 8h]Watch is kept.");
+        let flushed = f.flush();
+        let combined = format!("{out}{out2}{flushed}");
+        assert!(combined.contains("Camp is set."), "lead-in lost: {combined:?}");
+        assert!(combined.contains("Watch is kept."), "trailing lost: {combined:?}");
+        assert!(!combined.contains("ST 8h]"), "split REST body leaked: {combined:?}");
+        assert!(!combined.contains("8h"), "REST payload leaked: {combined:?}");
     }
 }

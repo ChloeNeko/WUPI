@@ -254,6 +254,16 @@ pub struct Node {
     #[serde(default)]
     pub last_evolved_minutes: i64,
 
+    /// (2026-08-23 starvation fix) The clock minute something MATERIAL last
+    /// happened here — a seed actually planted by the tick. The designation
+    /// watermark above rotates on every offer; this one only moves on change,
+    /// so the designated-site line can show BOTH ("last touched 1d ago, last
+    /// material change 30d ago") — the model no longer reads a fresh
+    /// designation stamp as "nothing has had time to happen." 0 = never
+    /// materialized. Rust-owned: only the tick's seed-plant stamp writes it.
+    #[serde(default)]
+    pub last_material_minutes: i64,
+
     /// (2026-08-20 Economy) The node's prosperity percent (25–200, 100 =
     /// normal). Single-source on the Node: property revenue scales ∝ it,
     /// the lifestyle cost curve is its inverse. Rust-owned — only the
@@ -262,6 +272,30 @@ pub struct Node {
     /// zero old saves, hence the `default_prosperity` fn.
     #[serde(default = "default_prosperity")]
     pub prosperity: u8,
+
+    /// (2026-08-22 multihog WS3) Pending site pressure — accumulated
+    /// directional intent for this site's next consuming pass. The
+    /// world-progression tick EMITS it (`site_pressure` on the delta); the
+    /// architect's germination, an applied evolution op, or a planted seed
+    /// CONSUMES it; a no-op pass RETAINS it (the anti-starvation rule:
+    /// frequent short ticks accumulate intent instead of resetting it).
+    /// Cap 3 FIFO, ≤140 chars/line (the seed-hook discipline). Dormant
+    /// when empty (byte-identical pre-WS3 saves).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_pressure: Vec<String>,
+
+    /// (2026-08-24 stall fix) Full architect ROUND failures at this node
+    /// (initial decode + both repair passes exhausted). The v0.30.0 live-test
+    /// shape: a map the model can't fit makes the write-once idempotence
+    /// gate re-run the whole 3-decode cycle EVERY turn. At
+    /// `site_map::ARCHITECT_FAIL_STANDDOWN` both architects stand down — the
+    /// node stays deliberately map-less. ONE counter per node guards BOTH
+    /// architects for that settlement (the hosted interior shares its parent
+    /// node's counter; documented tradeoff). Never reset in play — a
+    /// stood-down node is a stable state, not a retry loop. Rust-owned: only
+    /// the two architects' decode-failure paths write here. 0 = never failed.
+    #[serde(default)]
+    pub architect_fail_rounds: u8,
 }
 
 /// The serde default for [`Node::prosperity`] — see that field (a plain
@@ -283,7 +317,10 @@ impl Default for Node {
             setting: String::default(),
             seeds: Vec::default(),
             last_evolved_minutes: 0,
+            last_material_minutes: 0,
             prosperity: crate::economy::PROSPERITY_DEFAULT,
+            pending_pressure: Vec::default(),
+            architect_fail_rounds: 0,
         }
     }
 }
@@ -348,6 +385,76 @@ pub(crate) fn slugify(s: &str) -> String {
         }
     }
     out.trim_end_matches('_').to_string()
+}
+
+/// (2026-08-24 fix) Reject garbage identifiers at the id chokepoints —
+/// tokens that must NEVER become node/NPC ids. The v0.30.0 live test
+/// caught JS-leakage sentinels (`undefined`) + bare numerals (`"1"`)
+/// minting as real world entities. Garbage is:
+/// - trimmed-empty;
+/// - containing NO alphabetic characters at all (subsumes pure digits
+///   like `"1"`/`"42"` and punctuation soup like `"!!!"` — ids are names);
+/// - the JS/JSON null-family sentinels, case-insensitive:
+///   `undefined` / `null` / `none` / `nan` / `true` / `false`.
+/// Alphabetic uses `char::is_alphabetic` (Unicode-aware — CJK + accented
+/// names are real names, not garbage). Pure fn; unit-tested. Wired at the
+/// five id chokepoints (`resolve_or_mint_node`, `[DISCOVER]` node id +
+/// neighbors, `[NPC_REGISTER]` id, `auto_register_presence_stub`).
+pub fn is_garbage_identifier(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if !t.chars().any(|c| c.is_alphabetic()) {
+        return true;
+    }
+    matches!(
+        t.to_ascii_lowercase().as_str(),
+        "undefined" | "null" | "none" | "nan" | "true" | "false"
+    )
+}
+
+/// (2026-08-26 Chloe ruling) Location display names NEVER carry parentheses
+/// or authored meta-qualifiers — "Earth (variable by scene)" is draft-prompt
+/// prose a wizard/ST-import dragged into the `<location>` sibling, not a
+/// place. Pure fn: strips every parenthetical run (balanced pairs, nested
+/// runs, and a dangling opener/closer a hand-edit could leave), collapses
+/// whitespace runs, trims. A name that cleans to nothing returns "" and the
+/// CALLER keeps the original (a label must never blank out).
+///
+/// Applied at every site a location NAME is born — the `<location>` seed at
+/// game start, the `[TRAVEL]` mint, the intro-bootstrap anchor — plus a
+/// one-time normalize over stored node names in `load_split` so legacy
+/// saves heal on their next load. Node IDS are never touched (the graph's
+/// keys + edges stay stable; only the diegetic label cleans), and the
+/// stored-name normalize re-runs harmlessly (already-clean names are
+/// byte-identical after the pass).
+pub fn clean_location_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut depth: usize = 0;
+    for ch in s.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    // A closed run (or a stray closer) reads as a word break
+                    // so "Earth (x) Village" → "Earth Village", not
+                    // "EarthVillage".
+                    out.push(' ');
+                }
+            }
+            _ if depth > 0 => {}
+            _ => {
+                if ch.is_whitespace() {
+                    out.push(' ');
+                } else {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 impl TravelGraph {
@@ -680,11 +787,21 @@ impl TravelGraph {
     /// Village") so the node carries a real diegetic name + a matching id.
     /// Pure graph mechanics — no undo snapshot here (the caller
     /// owns snapshotting discipline).
-    pub fn resolve_or_mint_node(&mut self, raw: &str, narrative: &[&str]) -> Option<String> {
-        let raw_trimmed = raw.trim();
-        if raw_trimmed.is_empty() {
-            return None;
-        }
+pub fn resolve_or_mint_node(&mut self, raw: &str, narrative: &[&str]) -> Option<String> {
+    let raw_trimmed = raw.trim();
+    if raw_trimmed.is_empty() {
+        return None;
+    }
+    // (2026-08-24 fix) Garbage destinations never mint — the caller's
+    // reject arm teaches ("not possible" + known locations). Catches
+    // `undefined`/`null` sentinels + bare numerals before any resolution.
+    if is_garbage_identifier(raw_trimmed) {
+        tracing::warn!(
+            raw = %raw_trimmed,
+            "[TRAVEL] destination rejected as a garbage identifier (sentinel/numeric/no-letter token)"
+        );
+        return None;
+    }
         let slug = slugify(raw_trimmed);
         if slug.is_empty() {
             return None;
@@ -716,7 +833,14 @@ impl TravelGraph {
         // window → id "greywater_village"); the model's bare shorthand still
         // re-finds the node later via the fragment-alias arm above.
         let phrase = proper_noun_phrase_for(&slug, narrative);
-        let name_src = phrase.unwrap_or_else(|| raw_trimmed.to_string());
+        let mut name_src = phrase.unwrap_or_else(|| raw_trimmed.to_string());
+        // (2026-08-26) Location names never carry parenthetical qualifiers —
+        // clean BEFORE the id derivation so a narrative phrase like "the
+        // warehouse (docks)" mints id `warehouse`, not `warehouse_docks`.
+        let cleaned_src = clean_location_label(&name_src);
+        if !cleaned_src.is_empty() {
+            name_src = cleaned_src;
+        }
         let id = slugify(&name_src);
         if id.is_empty() {
             return None;
@@ -752,6 +876,17 @@ fn similarity(a: &str, b: &str) -> f32 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
+    let dist = levenshtein_chars(&a, &b) as f32;
+    1.0 - dist / a.len().max(b.len()) as f32
+}
+
+/// Raw char-based Levenshtein distance (the DP core `similarity` normalizes
+/// over). Chars, never bytes (anti-pattern #6). Shared by the location
+/// similarity pass + the 2026-08-23 near-name resolver.
+fn levenshtein_chars(a: &[char], b: &[char]) -> u32 {
+    if a.is_empty() || b.is_empty() {
+        return (a.len() + b.len()) as u32;
+    }
     let mut prev: Vec<u32> = (0..=b.len() as u32).collect();
     let mut cur: Vec<u32> = vec![0; b.len() + 1];
     for (i, ca) in a.iter().enumerate() {
@@ -762,8 +897,98 @@ fn similarity(a: &str, b: &str) -> f32 {
         }
         std::mem::swap(&mut prev, &mut cur);
     }
-    let dist = prev[b.len()] as f32;
-    1.0 - dist / a.len().max(b.len()) as f32
+    prev[b.len()]
+}
+
+// ===========================================================================
+// (2026-08-23 Playground + [NPC_REGISTER] guard) Near-name resolution — the
+// Kira/Kyra/Kiera ghost-twin protection. One shared resolver, used twice:
+// the Playground's Registry Management tool (ranked candidates for manual
+// merges) AND the live `[NPC_REGISTER]` applier's refusal guard (a new
+// registration whose name is a near-miss of a registered NPC is refused
+// with a one-line directive instead of minting a duplicate cast member).
+// ===========================================================================
+
+/// Collision threshold for names where at least one side is ≥5 normalized
+/// chars (Kira ↔ Kiera distance 2 must collide).
+pub const NEAR_NAME_DISTANCE_LONG: u32 = 2;
+/// Collision threshold when BOTH sides are short (<5 chars) — a single edit
+/// on a short name is already suspicious (Kira ↔ Kyra distance 1), two is
+/// a different word (Jo ↔ Bran).
+pub const NEAR_NAME_DISTANCE_SHORT: u32 = 1;
+/// The normalized-char count at which the long threshold applies.
+pub const NEAR_NAME_LONG_MIN_CHARS: usize = 5;
+
+/// Normalize a surface for near-name comparison: lowercase, keep only
+/// alphanumeric CHARS (punctuation/accents on the same base letter stay —
+/// they're part of the name's identity, not noise).
+fn normalize_near_name(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase()
+}
+
+/// Rank every registered NPC whose name / id / alias is a near-name of
+/// `query` — normalized Levenshtein distance ≤
+/// [`NEAR_NAME_DISTANCE_LONG`] when either side is ≥
+/// [`NEAR_NAME_LONG_MIN_CHARS`] normalized chars, ≤
+/// [`NEAR_NAME_DISTANCE_SHORT`] when both are shorter; an exact-normalized
+/// match (distance 0) is ALWAYS a candidate. Sorted by distance, then id.
+/// Each entry appears once, at its best (smallest) distance. Pure.
+pub fn near_name_candidates(query: &str, registry: &NpcRegistry) -> Vec<(String, String, u32)> {
+    let q = normalize_near_name(query);
+    let qc: Vec<char> = q.chars().collect();
+    if qc.is_empty() {
+        return Vec::new();
+    }
+    let mut out: Vec<(String, String, u32)> = Vec::new();
+    for e in &registry.entries {
+        let mut best: Option<u32> = None;
+        let surfaces = std::iter::once(e.name.as_str())
+            .chain(std::iter::once(e.id.as_str()))
+            .chain(e.aliases.iter().map(String::as_str));
+        for surface in surfaces {
+            let n = normalize_near_name(surface);
+            let nc: Vec<char> = n.chars().collect();
+            if nc.is_empty() {
+                continue;
+            }
+            let d = levenshtein_chars(&qc, &nc);
+            let long = qc.len() >= NEAR_NAME_LONG_MIN_CHARS || nc.len() >= NEAR_NAME_LONG_MIN_CHARS;
+            let allowed = if long {
+                NEAR_NAME_DISTANCE_LONG
+            } else {
+                NEAR_NAME_DISTANCE_SHORT
+            };
+            // Exact-normalized always collides; otherwise the threshold.
+            if d == 0 || d <= allowed {
+                best = Some(best.map_or(d, |b: u32| b.min(d)));
+            }
+        }
+        if let Some(d) = best {
+            let label = if e.name.is_empty() {
+                e.id.clone()
+            } else {
+                e.name.clone()
+            };
+            out.push((e.id.clone(), label, d));
+        }
+    }
+    out.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
+/// The live `[NPC_REGISTER]` guard's decision core: the single closest
+/// near-name collision for a NEW registration, EXCLUDING the incoming entry
+/// itself (a re-registration of the same id never self-collides; the
+/// applier's dup path already handles that no-op). `None` = a genuinely
+/// new name — registration proceeds untouched.
+pub fn near_name_collision(
+    query: &str,
+    registry: &NpcRegistry,
+    incoming_id: &str,
+) -> Option<(String, String, u32)> {
+    near_name_candidates(query, registry)
+        .into_iter()
+        .find(|(id, _, _)| id != incoming_id)
 }
 
 /// (2026-08-17 recommendation 2) Scan the narrative window for a capitalized
@@ -1047,6 +1272,13 @@ impl NpcRegistry {
     /// Find a registry entry by id (exact match). O(n); small casts.
     pub fn find(&self, id: &str) -> Option<&NpcEntry> {
         self.entries.iter().find(|e| e.id == id)
+    }
+
+    /// Mutable `find` — the registry-editing callers (the Playground god
+    /// tools) already resolved the canonical id via `resolve_npc_surface`
+    /// on the shared borrow and re-find it under `&mut`.
+    pub fn find_mut(&mut self, id: &str) -> Option<&mut NpcEntry> {
+        self.entries.iter_mut().find(|e| e.id == id)
     }
 
     /// Resolve a surface form (id OR alias) to the canonical `NpcEntry`.
@@ -1390,6 +1622,20 @@ pub const MAX_NPC_REGISTRY: usize = 128;
 /// long campaign can't accumulate an unbounded obligations list on the
 /// npc.json slice + the `owed:` render.
 pub const MAX_PROMISES: usize = 8;
+/// (2026-08-22 living-world) Open `[QUEST]` cap — FIFO like the promises;
+/// `done`/`fail` remove immediately so 8 concurrent threads is a busy
+/// campaign. The `quests:` render caps at 5 shown + `(+N more)` (the
+/// worst-case tracker budget is the binding constraint, not storage).
+pub const MAX_QUESTS: usize = 8;
+/// (2026-08-22 living-world) Objectives per quest — the bracket applier
+/// refuses beyond this (a quest with more parts is two quests).
+pub const MAX_QUEST_OBJECTIVES: usize = 6;
+
+/// The serde skip-helper for [`WorldSchema::last_rest_minutes`] (0 = the
+/// dormant anchor — keeps pre-living-world saves byte-identical).
+fn is_zero(v: &i64) -> bool {
+    *v == 0
+}
 
 /// The scene pacing mode (Fable Seam #4 expansion, 2026-07-27): a
 /// Rust-computed per-turn classification of the scene's rhythm. Drives:
@@ -1433,8 +1679,8 @@ impl SceneMode {
     pub fn prose_guidance(self) -> &'static str {
         match self {
             SceneMode::Combat => "Pace your prose for combat: short sentences, present-tense verbs, no interiority during the exchange — save reflection for after the dust settles. Each turn covers seconds, not minutes.",
-            SceneMode::Exploration => "Pace your prose for exploration: balanced beats, a mix of action and atmosphere. Each turn covers roughly a minute of in-world time.",
-            SceneMode::Downtime => "Pace your prose for downtime: linger on sensory detail, ambient sound, the texture of the place. Each turn can cover an hour or more — let time breathe.",
+            SceneMode::Exploration => "Pace your prose for exploration: balanced past-tense beats, a mix of action and atmosphere. Each turn covers roughly a minute of in-world time.",
+            SceneMode::Downtime => "Pace your prose for downtime: linger in past tense on sensory detail, ambient sound, the texture of the place. Each turn can cover an hour or more — let time breathe.",
         }
     }
 
@@ -1598,6 +1844,141 @@ pub struct Promise {
     /// point; 0 = an un-stamped legacy row).
     #[serde(default)]
     pub accepted_at_minutes: i64,
+    /// (2026-08-25 quest anchors) OPTIONAL site-map AREA id the obligation
+    /// targets ("meet me at the well" → the courtyard area) — emits as
+    /// `area=<area_id>` on the bracket. Drives the location-card map's
+    /// scroll marker over the anchored area (knowledge-gated at slice
+    /// time). Empty = unanchored; an anchor is a hard tracker-vouched
+    /// fact, NEVER inferred from the description text.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub area_anchor: String,
+}
+
+/// (2026-08-22 living-world) One countable objective inside a quest. The
+/// `[cur/total]` counter pair is OPTIONAL (0/0 = a plain done-flag
+/// objective); when set, `cur` ≤ `total` and reaching them is completion
+/// the tracker can SEE — the Anti-Difficulty Mandate lives here: objectives
+/// are concrete and countable, difficulty itself is world context, never a
+/// stored number (no difficulty/rank/level field exists on any quest
+/// shape).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct QuestObjective {
+    /// The objective text, ≤160 chars (the `clean_free_text` discipline at
+    /// the parse). The upsert match key under normalization.
+    #[serde(default)]
+    pub text: String,
+    /// Completed flag (`[QUEST update <id> done <text>]`).
+    #[serde(default)]
+    pub done: bool,
+    /// Counter numerator (`3` of "3/6 wolves culled"). 0 = no counter.
+    #[serde(default)]
+    pub cur: u32,
+    /// Counter denominator. 0 = no counter.
+    #[serde(default)]
+    pub total: u32,
+}
+
+/// (2026-08-22 living-world) One open quest. The structural twin of
+/// [`Promise`] — what NPCs want FROM you — filling the void for what the
+/// PLAYER is trying to accomplish. Giver `"player"` marks a self-imposed
+/// emergent goal (exempt from the deadline patience curve — the system
+/// never penalizes the player for delaying a personal side goal).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct Quest {
+    /// Kebab id, unique among open quests (the bracket's match key).
+    #[serde(default)]
+    pub id: String,
+    /// The giver's canonical registry id, or the literal `"player"` for a
+    /// self-imposed goal (resolved at the bracket apply through
+    /// `resolve_npc_surface`).
+    #[serde(default)]
+    pub giver: String,
+    /// Diegetic title, ≤120 chars.
+    #[serde(default)]
+    pub title: String,
+    /// Countable objectives, ≤[`MAX_QUEST_OBJECTIVES`].
+    #[serde(default)]
+    pub objectives: Vec<QuestObjective>,
+    /// Optional promised reward (free text, ≤160).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reward: String,
+    /// The in-world minute the quest falls due (0 = no deadline). Drives
+    /// the auto-fail patience curve on the tick for non-player givers.
+    #[serde(default)]
+    pub deadline_minutes: i64,
+    /// The in-world minute the quest was accepted (the curve's zero point).
+    #[serde(default)]
+    pub accepted_at_minutes: i64,
+    /// (2026-08-25 quest anchors) OPTIONAL site-map AREA id the objective
+    /// targets ("investigate the cutpurse" → the market-ward area) — emits
+    /// as `area=<area_id>` on the new/update brackets. Drives the
+    /// location-card map's scroll marker over the anchored area
+    /// (knowledge-gated at slice time; `done`/`fail` remove the quest and
+    /// the anchor with it). Empty = unanchored; an anchor is a hard
+    /// tracker-vouched fact, NEVER inferred from the title text.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub area_anchor: String,
+}
+
+/// (2026-08-22 living-world) The giver-patience score for an open quest's
+/// deadline — the SAME volatility-scaled curve promises use
+/// (`offscreen_task::promise_frustration`), so deadlines are enforced by
+/// deterministic Rust clock math, never fuzzy LLM guessing. Returns
+/// `f64::NEG_INFINITY` for exempt quests (no deadline, or giver =
+/// `"player"` — self-imposed goals are never penalized), so any positive
+/// threshold comparison is naturally false for them.
+pub fn quest_deadline_frustration(
+    quest: &Quest,
+    volatility: Option<f64>,
+    now_minutes: i64,
+) -> f64 {
+    if quest.deadline_minutes <= 0 || quest.giver == "player" {
+        return f64::NEG_INFINITY;
+    }
+    crate::offscreen_task::promise_frustration(
+        quest.accepted_at_minutes,
+        quest.deadline_minutes,
+        now_minutes,
+        volatility,
+    )
+}
+
+/// (2026-08-22 living-world) Stamina/mana recovery steps granted by a rest
+/// of `hours` — the deterministic curve that makes rest LENGTH matter:
+/// under an hour recovers nothing (a breather is the Recovery Referee's
+/// one-step domain), 1-4h one step, 4-8h two, a full night's 8h+ everything
+/// (4 steps = `Fresh`/`Surging` from the floor).
+pub fn rest_recovery_steps(hours: i64) -> usize {
+    if hours >= 8 {
+        4
+    } else if hours >= 4 {
+        2
+    } else if hours >= 1 {
+        1
+    } else {
+        0
+    }
+}
+
+/// (2026-08-22 living-world) The fatigue band for a since-last-rest delta.
+/// `None` = healthy (no clamp, no band on the `rested:` line); `"weary"`
+/// past 16h on your feet; `"exhausted"` past 24h. Pure — the caller owns
+/// the clock reads + the mechanical clamp.
+pub fn rested_band(delta_minutes: i64) -> Option<&'static str> {
+    if delta_minutes <= 16 * 60 {
+        None
+    } else if delta_minutes <= 24 * 60 {
+        Some("weary")
+    } else {
+        Some("exhausted")
+    }
+}
+
+/// Normalize objective text into the upsert match key: lowercase +
+/// whitespace collapsed (a re-emission with different spacing or casing is
+/// the SAME objective, never a twin).
+pub(crate) fn normalize_quest_objective_key(text: &str) -> String {
+    text.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The persistent world-state schema. The single source of truth for the
@@ -1685,6 +2066,19 @@ pub struct WorldSchema {
     #[serde(default)]
     pub world_clock: WorldClock,
 
+    /// (2026-08-22 living-world) The rested anchor — the in-world minute
+    /// of the player's last genuine sleep/recuperation (`[REST]` bracket
+    /// or the Recovery Referee's backstop flag; stamped POST-`[TIME]` so a
+    /// night's sleep anchors on the morning after). 0 = dormant: legacy
+    /// saves + fresh games render no `rested:` line and clamp nothing
+    /// until the first rest establishes the anchor (the first-`[TIME]`
+    /// baseline stamps it — fresh campaigns start rested, the economy-
+    /// stamp precedent). Rust-owned: no `apply_delta` field, no
+    /// `merge_patch` arm. Rides world.json (the save split is
+    /// remove-based).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub last_rest_minutes: i64,
+
     /// Global weather state (Fable Phase 4 Component 2, 2026-07-28): the
     /// current atmospheric condition + the in-world minute it started (for the
     /// tick drift's persistence curve). Rust is the SOLE authority —
@@ -1711,9 +2105,9 @@ pub struct WorldSchema {
     /// just "Day N". Seeded from the card's `<start><date>` + advanced in play
     /// by the `[DATE]` bracket (the tracker rewrites the label — no Rust
     /// calendar arithmetic). When set, `render_for_prompt` emits `date:` +
-    /// renders the clock as time-of-day only (suppressing "Day N"). When unset
-    /// (None — legacy cards / pre-2026-08-13 saves), the legacy
-    /// `clock: Day N, HH:MM` render is preserved. `#[serde(default)]` keeps old
+    /// renders the clock as time-of-day only (suppressing "Day N"). When
+    /// unset (None — pre-2026-08-13 saves), the `clock: Day N, HH:MM`
+    /// render is preserved. `#[serde(default)]` keeps old
     /// saves loadable as dormant (None → no `date:` line).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calendar: Option<String>,
@@ -1732,11 +2126,10 @@ pub struct WorldSchema {
     pub calendar_synced_minutes: Option<i64>,
 
     /// The simulation's tone (2026-08-19 Chloe ruling): seeded from the
-    /// card's `<world>` sibling (or legacy card-level `<tone>`), rendered
-    /// per-turn as the `tone:` line right after `weather:` — tone is LIVE
-    /// world state owned by the tracker, never static prompt text (the card
-    /// cache block carries identity only). `None` = dormant (no line; legacy
-    /// saves + cards without a tone).
+    /// card's `<world>` sibling, rendered per-turn as the `tone:` line right
+    /// after `weather:` — tone is LIVE world state owned by the tracker,
+    /// never static prompt text (the card cache block carries identity
+    /// only). `None` = dormant (no line; saves + cards without a tone).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tone: Option<String>,
 
@@ -1904,6 +2297,32 @@ pub struct WorldSchema {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub promises: Vec<Promise>,
 
+    /// (2026-08-22 living-world) Open quests (`[QUEST new/update/done/
+    /// fail]`) — what the PLAYER is trying to accomplish, the structural
+    /// complement to `promises`. Dormant when empty (zero tokens for fresh
+    /// games — the economy precedent). `done`/`fail` REMOVE (v1 keeps no
+    /// history, the PROMISE precedent); overdue non-player-giver quests
+    /// auto-fail on the tick via the promise frustration curve
+    /// (`quest_deadline_frustration`). Rust-owned: no `apply_delta` field,
+    /// no `merge_patch` arm; capped at `MAX_QUESTS` (FIFO) in
+    /// `enforce_typed_caps`. Rides world.json (the save split is
+    /// remove-based — quests are player+world facing, not giver-keyed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quests: Vec<Quest>,
+
+    /// (2026-08-22 multihog WS1) Timed entity expiry — entity key → the
+    /// in-world minute its truth lapses. Armed by the `[EXPIRY]` bracket;
+    /// swept deterministically on every clock advance by
+    /// [`Self::sweep_entity_expiry`] (pre-tick-gate, the economy-settle
+    /// precedent: cheap clock math never waits for the LLM gate). Immutable
+    /// + `player.*` identity keys refuse deletion at the sweep (the lock
+    /// outranks time); a lapsed slot is removed either way so the
+    /// observation never re-fires. Rust-owned: no `apply_delta` field, no
+    /// `merge_patch` arm. Dormant when empty (zero tokens, byte-identical
+    /// pre-WS1 saves).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub entity_expiry: BTreeMap<String, i64>,
+
     /// Propagation-based rumor state (Fable Phase 4 Component 4, 2026-07-28):
     /// free-form diegetic phrases that spread between connected nodes on the
     /// World Progression tick. Each [`rumor::Rumor`] owns its `known_nodes`
@@ -1983,25 +2402,71 @@ pub struct WorldSchema {
 }
 
 impl WorldSchema {
+    /// (2026-08-22 multihog WS1) Deterministic timestamp expiry sweep: every
+    /// entity whose armed deadline has passed is DELETED, and one
+    /// narrator-facing directive is returned per expiry (positive form —
+    /// the lapse is settled world fact, never something to re-litigate).
+    /// Immutable + `player.*` identity keys refuse deletion (the expiry
+    /// slot still drops, so the refusal is observed once, never re-fired
+    /// every clock advance). Pure: `now_minutes` passed in. Returns
+    /// `(directives, mutation_count)` so the caller's pre-mutation
+    /// snapshot discipline only fires when something actually moved.
+    pub fn sweep_entity_expiry(&mut self, now_minutes: i64) -> (Vec<String>, usize) {
+        if now_minutes <= 0 || self.entity_expiry.is_empty() {
+            return (Vec::new(), 0);
+        }
+        let day = now_minutes / 1440 + 1;
+        let rem = now_minutes % 1440;
+        let (h12, meridiem) = to_12h(rem / 60);
+        let clock = format!("Day {day}, {h12:02}:{:02} {meridiem}", rem % 60);
+        let due: Vec<String> = self
+            .entity_expiry
+            .iter()
+            .filter(|(_, at)| **at <= now_minutes)
+            .map(|(k, _)| k.clone())
+            .collect();
+        let mut directives = Vec::new();
+        let mut mutated = 0usize;
+        for key in due {
+            self.entity_expiry.remove(&key);
+            mutated += 1;
+            if self.immutable_keys.contains(&key) || key.starts_with("player.") {
+                tracing::warn!(%key, "entity expiry refused: locked identity key survives the sweep");
+                continue;
+            }
+            if self.remove_entity_with_slot(&key) {
+                directives.push(format!(
+                    "Expired: {key} — the state lapsed as of {clock}. Narrate the world \
+                     having moved on; treat the lapse as settled fact."
+                ));
+            }
+        }
+        (directives, mutated)
+    }
+
     /// (2026-08-22 re-track hardening) Keep the Rust-owned ANCHORS — the
-    /// world clock + the calendar label family — when a re-track path
-    /// reverts the live schema to a stored base. `world_clock` and
-    /// `calendar` are Rust-authoritative state the `[TIME]`/`[DATE]`
+    /// world clock + the calendar label family + the rest anchor — when a
+    /// re-track path reverts the live schema to a stored base. `world_clock`
+    /// and `calendar` are Rust-authoritative state the `[TIME]`/`[DATE]`
     /// brackets advanced for a turn that STILL HAPPENED (an edit/reroll
     /// changes the prose, not the fact that time flowed); the 2026-08-22
     /// playtest caught the base revert rolling the clock back whenever the
     /// re-track's re-emission hit its token wall and dropped the `[TIME]`
     /// bracket — turn 2 then re-applied `09:05` against `prev=540` a
-    /// second time. Both brackets are ABSOLUTE-set (idempotent), so a
-    /// faithful re-emission over preserved anchors is a no-op — only the
-    /// dropped-bracket rollback is killed. Called on the EDIT re-track +
-    /// the successful-REROLL revert ONLY; the cancel/api_lost full-revert
-    /// paths restore the whole pre-turn world by design (there the turn
-    /// never happened).
+    /// second time. `last_rest_minutes` is the same class of fact (the
+    /// Recovery Referee's `[REST]` stamp): reverting it beside a preserved
+    /// post-sleep clock would re-render a phantom weary/exhausted band and
+    /// clamp stamina/mana back down on the next `[TIME]`. All brackets are
+    /// ABSOLUTE-set (idempotent), so a faithful re-emission over preserved
+    /// anchors is a no-op — only the dropped-bracket rollback is killed.
+    /// Called on the EDIT re-track + the successful-REROLL revert ONLY; the
+    /// cancel/api_lost full-revert paths restore the whole pre-turn world
+    /// by design (there the turn never happened).
     pub fn retain_revert_safe_anchors(&mut self, live: &WorldSchema) {
         self.world_clock = live.world_clock.clone();
         self.calendar = live.calendar.clone();
         self.calendar_synced_minutes = live.calendar_synced_minutes;
+        self.last_rest_minutes = live.last_rest_minutes;
     }
 
     /// (2026-08-15 audit fix) The ONE capped entry point for direct
@@ -2053,11 +2518,9 @@ impl WorldSchema {
             let mut grew = false;
             for (key, value) in ents {
                 // (2026-08-15 audit fix) Legacy freeform inventory keys are
-                // refused here, not just swept at load: the load-time
-                // `migrate_legacy_items` converts any `item_*`/`inv_*`
-                // entity into a typed pack item, so a model delta re-creating
-                // one alongside a real [PACK] bracket silently duplicated the
-                // item on the next boot. Strip + warn (same discipline as the
+                // refused here: the typed inventory owns items, and a model
+                // delta re-creating an `item_*`/`inv_*` key alongside a real
+                // [PACK] bracket would duplicate the item. Strip + warn (the
                 // referee-owned field strip in fable_schema_patch).
                 if key.starts_with("item_") || key.starts_with("inv_") {
                     tracing::warn!(%key, "apply_delta: legacy inventory entity key refused (typed inventory owns items)");
@@ -2072,7 +2535,7 @@ impl WorldSchema {
                         self.entities.insert(key, v);
                     }
                     None => {
-                        self.entities.remove(&key);
+                        self.remove_entity_with_slot(&key);
                     }
                 }
             }
@@ -2080,6 +2543,20 @@ impl WorldSchema {
                 self.enforce_entity_cap();
             }
         }
+    }
+
+    /// (2026-08-24 review fix) Delete an entity AND its `entity_order` slot
+    /// together. A deleted key used to leave its stale slot behind: the
+    /// deque grew unboundedly with insert/delete churn (the cap sweep only
+    /// pruned slots once OVER the cap), and re-inserting the same key later
+    /// minted a SECOND slot while the stale one made the key look older than
+    /// it was — premature FIFO eviction against the true first-insert order.
+    fn remove_entity_with_slot(&mut self, key: &str) -> bool {
+        let removed = self.entities.remove(key).is_some();
+        if removed {
+            self.entity_order.retain(|o| o.as_str() != key);
+        }
+        removed
     }
 
     /// (2026-08-16 audit fix #14) Total-entity cap with FIFO eviction — see
@@ -2231,16 +2708,13 @@ impl WorldSchema {
                     let mut grew = false;
                     for (ek, ev) in map {
                         // (2026-08-15 audit fix) Same legacy-key refusal as
-                        // apply_delta — the typed inventory owns items; a
-                        // model patch re-creating item_*/inv_* keys would be
-                        // converted into duplicate pack items by the next
-                        // boot's migrate_legacy_items sweep.
+                        // apply_delta — the typed inventory owns items.
                         if ek.starts_with("item_") || ek.starts_with("inv_") {
                             tracing::warn!(%ek, "merge_patch: legacy inventory entity key refused (typed inventory owns items)");
                             continue;
                         }
                         if ev.is_null() {
-                            self.entities.remove(ek);
+                            self.remove_entity_with_slot(ek);
                         } else {
                             if !self.entities.contains_key(ek) {
                                 self.entity_order.push_back(ek.clone());
@@ -2405,11 +2879,17 @@ impl WorldSchema {
             && self.player_state.is_default()
             && !self.world_clock.is_set()
             && !self.weather.is_set()
+            // (2026-08-23 audit fix) `tone` renders + `currency_label` wakes
+            // the economy anchor — a schema whose ONLY live field is either
+            // used to early-return empty here, suppressing both.
+            && !self.tone.as_deref().is_some_and(|s| !s.trim().is_empty())
+            && self.currency_label.trim().is_empty()
             && !self.travel_graph.is_set()
             && self.rumors.is_empty()
             && !self.npc_registry.is_set()
             && self.presences.is_empty()
             && self.properties.is_empty()
+            && self.quests.is_empty()
             && self.calendar.as_deref().filter(|s| !s.is_empty()).is_none()
             && self.custom_tags.is_empty();
         if empty {
@@ -2429,7 +2909,10 @@ impl WorldSchema {
         // unset (legacy cards), the "clock: Day N, HH:MM" render stands.
         if let Some(cal) = self.calendar.as_deref().filter(|s| !s.is_empty()) {
             out.push_str("date: ");
-            out.push_str(cal);
+            // (2026-08-24 review P2) flatten_inline — the calendar label is
+            // free text from `[DATE]`/hand-edited saves; a raw render could
+            // forge prompt lines.
+            out.push_str(&Self::flatten_inline(cal));
             // (P1d, 2026-08-17 E4B shakedown) Staleness fallback: if the label
             // wasn't refreshed via [DATE] in >48h of clock time, append the
             // true day counter so the prompt never asserts a date the clock
@@ -2471,7 +2954,9 @@ impl WorldSchema {
         if !self.travel_graph.current_is_indoor() {
             if let Some(weather_line) = self.weather.render_line() {
                 out.push_str("weather: ");
-                out.push_str(&weather_line);
+                // (2026-08-24 review P2) flatten_inline — condition is
+                // free text; same newline-injection gate as date/tone.
+                out.push_str(&Self::flatten_inline(&weather_line));
                 out.push('\n');
             }
         }
@@ -2481,8 +2966,31 @@ impl WorldSchema {
         // carries identity only). None → no line (dormant).
         if let Some(tone) = self.tone.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             out.push_str("tone: ");
-            out.push_str(&tone.chars().take(120).collect::<String>());
+            // (2026-08-24 review P2) flatten_inline — same gate as the other
+            // anchor lines (hand-edited saves).
+            out.push_str(&Self::flatten_inline(&tone.chars().take(120).collect::<String>()));
             out.push('\n');
+        }
+        // (2026-08-22 living-world) The rested anchor's read — how long the
+        // player has gone without genuine rest, + the fatigue band once it
+        // bites. Clock-family placement (with weather/tone, before location):
+        // it's a when-anchor the narrator colors prose with and Rust clamps
+        // stamina/mana against. Dormant while the anchor is unset (legacy
+        // saves / fresh games — zero tokens).
+        if self.world_clock.is_set() && self.last_rest_minutes > 0 {
+            let delta = self
+                .world_clock
+                .current_minutes
+                .saturating_sub(self.last_rest_minutes);
+            if delta > 0 {
+                let hours = delta / 60;
+                match rested_band(delta) {
+                    Some(band) => {
+                        out.push_str(&format!("rested: {hours}h since last rest — {band}\n"))
+                    }
+                    None => out.push_str(&format!("rested: {hours}h since last rest\n")),
+                }
+            }
         }
         // Location renders alongside clock + weather (Component 3, 2026-07-28):
         // the third top-of-mind anchor. The narrator needs the current location
@@ -2521,13 +3029,38 @@ impl WorldSchema {
         // tokens). Multi-line indented block; every line flattened (a
         // hand-edited save can't forge a render line) — the tracker's lean
         // render flattens + caps it further.
+        // (2026-08-23 hosted interiors) THE RESOLVER LAW: the block renders
+        // the ACTIVE map — the building's interior while the player stands
+        // in one, led by a single parent breadcrumb line. The district map
+        // itself stays out (bounded prompting; the exit transition is the
+        // way back).
         if let Some(cur_id) = self.travel_graph.current_node.as_deref() {
-            if let Some(site_block) = self
-                .site_maps
-                .get(cur_id)
-                .and_then(crate::site_map::render_narrator_slice)
+            let active_key =
+                crate::site_map::active_site_map_key(&self.site_maps, Some(cur_id));
+            let (map_key, breadcrumb): (Option<String>, Option<String>) = match &active_key {
+                Some(k) if k.as_str() != cur_id => (
+                    Some(k.clone()),
+                    crate::site_map::hosted_breadcrumb(
+                        &self.site_maps,
+                        &self.travel_graph,
+                        k,
+                    ),
+                ),
+                other => (other.clone(), None),
+            };
+            if let Some(site_block) = map_key
+                .as_deref()
+                .and_then(|k| self.site_maps.get(k))
+                // (2026-08-22 living-world) `now` rides in — the re-entry
+                // digest + the remnants collapse are clock-driven.
+                .and_then(|m| crate::site_map::render_narrator_slice(m, self.world_clock.current_minutes))
             {
                 out.push_str("site:\n");
+                if let Some(bc) = breadcrumb {
+                    out.push_str("  in ");
+                    out.push_str(&Self::flatten_inline(&bc));
+                    out.push('\n');
+                }
                 for line in site_block.lines() {
                     out.push_str("  ");
                     out.push_str(&Self::flatten_inline(line));
@@ -2568,7 +3101,9 @@ impl WorldSchema {
                 parts.push(format!("(+{hidden} more)"));
             }
             out.push_str("present: ");
-            out.push_str(&parts.join(", "));
+            // (2026-08-24 review P2) flatten_inline — names + stances are
+            // free text; same newline-injection gate as minds:/wearing:.
+            out.push_str(&Self::flatten_inline(&parts.join(", ")));
             out.push('\n');
         }
         // (2026-08-18 Dedicated-NPC interior state) The `minds:` line —
@@ -2795,6 +3330,86 @@ impl WorldSchema {
                 out.push('\n');
             }
         }
+        // (2026-08-22 living-world) The `quests:` line — the player's open
+        // threads, ALL givers (the owed: complement). Single flattened line
+        // (the lean surgery caps it); render cap 5 + `(+N more)` — the
+        // worst-case tracker budget is the binding constraint, storage is
+        // MAX_QUESTS. Each entry: `<title> (<giver>, <patience band when
+        // overdue>) — <objectives: cur/total text, ✓ text>`; the reward
+        // rides when authored. Dormant when empty (zero-token invariant for
+        // fresh games — the economy precedent).
+        if !self.quests.is_empty() {
+            const QUESTS_PROMPT_CAP: usize = 5;
+            const QUEST_OBJECTIVES_SHOWN: usize = 3;
+            const QUEST_OBJ_TEXT_CHARS: usize = 40;
+            // (2026-08-24 review P2) The TITLE rides the same char cap as
+            // objective text — storage allows 120-char titles, and 5 × 120
+            // unbounded chars is 600 the STAGE0 budget pin never priced in
+            // (its fixture titles are ~43 chars).
+            const QUEST_TITLE_CHARS: usize = 40;
+            let mut parts: Vec<String> = Vec::new();
+            for q in self.quests.iter().take(QUESTS_PROMPT_CAP) {
+                let giver = if q.giver == "player" {
+                    "self".to_string()
+                } else {
+                    self.npc_registry
+                        .resolve(&q.giver)
+                        .map(|e| e.name.clone())
+                        .unwrap_or_else(|| q.giver.clone())
+                };
+                let band = crate::offscreen_task::frustration_band(
+                    quest_deadline_frustration(
+                        q,
+                        self.relationships.get(&q.giver).map(|r| r.volatility),
+                        self.world_clock.current_minutes,
+                    ),
+                );
+                // NEG_INFINITY bands to "Very Pleased" — hide the band for
+                // exempt quests (no deadline / self-given) + comfortable
+                // ones (Neutral or better reads as noise).
+                let giver_note = if q.deadline_minutes > 0
+                    && q.giver != "player"
+                    && self.world_clock.current_minutes > q.deadline_minutes
+                {
+                    format!("{giver}, {band}")
+                } else {
+                    giver
+                };
+                let mut objectives: Vec<String> = Vec::new();
+                for o in q.objectives.iter().take(QUEST_OBJECTIVES_SHOWN) {
+                    let text: String =
+                        o.text.chars().take(QUEST_OBJ_TEXT_CHARS).collect::<String>();
+                    if o.total > 0 {
+                        objectives.push(format!("{}/{} {}", o.cur, o.total, text));
+                    } else if o.done {
+                        objectives.push(format!("✓ {text}"));
+                    } else {
+                        objectives.push(text);
+                    }
+                }
+                if q.objectives.len() > QUEST_OBJECTIVES_SHOWN {
+                    objectives
+                        .push(format!("(+{} more)", q.objectives.len() - QUEST_OBJECTIVES_SHOWN));
+                }
+                let title: String = q.title.chars().take(QUEST_TITLE_CHARS).collect();
+                let mut entry = format!("{} ({})", title, giver_note);
+                if !objectives.is_empty() {
+                    entry.push_str(&format!(" — {}", objectives.join(", ")));
+                }
+                if !q.reward.is_empty() {
+                    let reward: String = q.reward.chars().take(40).collect();
+                    entry.push_str(&format!(", reward: {reward}"));
+                }
+                parts.push(entry);
+            }
+            let hidden = self.quests.len().saturating_sub(QUESTS_PROMPT_CAP);
+            out.push_str("quests: ");
+            out.push_str(&Self::flatten_inline(&parts.join("; ")));
+            if hidden > 0 {
+                out.push_str(&format!(" (+{hidden} more)"));
+            }
+            out.push('\n');
+        }
         // (2026-08-19 Referee QoL) The `bonds:` line — PRESENT NPCs whose
         // relationship tier is LOUD (≥ Friendly on the affinity track or
         // ≤ Rival on the grudge track); the quiet middle
@@ -2877,7 +3492,9 @@ impl WorldSchema {
                     line.push_str(&format!("; (+{hidden} more)"));
                 }
                 out.push_str("rumors: ");
-                out.push_str(&line);
+                // (2026-08-24 review P2) flatten_inline — rumor labels are
+                // free text; same gate as the other roster lines.
+                out.push_str(&Self::flatten_inline(&line));
                 out.push('\n');
             }
         }
@@ -2912,15 +3529,18 @@ impl WorldSchema {
         // the 2026-08-10 playtest showed 6 brackets across 52 turns + a frozen
         // world.
         //
-        // This block is the LEAN carry-back: only the three pieces the tracker
-        // cannot infer from the 1-turn window + Rust anchors, each BOUNDED so
-        // it cannot re-grow the overflow:
+        // This block is the LEAN carry-back: only what the tracker cannot
+        // infer from the 1-turn window + Rust anchors, each BOUNDED so it
+        // cannot re-grow the overflow:
         //   - cast: the roster line (id list, no prose) — the [PRESENCE]
         //     whitelist source. Empty when no NPCs are registered.
         //   - belt: the 4-slot quick rack, names only (the [BELT] state).
         //     Empty when nothing's on the belt.
+        //   - pouch: the wallet (2026-08-23 pouch ruling) — currency, coins,
+        //     keys, ID, small valuables, names + qty, capped like the pack so
+        //     a hoarded gem collection can't re-grow the prompt.
         //   - pack: the unbounded deep store, names + qty ONLY, HARD-CAPPED at
-        //     the first 12 entries. Pack can grow large in long sessions; the
+        //     the first 16 entries. Pack can grow large in long sessions; the
         //     cap keeps the line bounded. (Older entries live in the persisted
         //     schema + the inventory panel UI — not the prompt.)
         // Item tags/stats are deliberately NOT rendered here (they're authoring
@@ -2929,14 +3549,22 @@ impl WorldSchema {
         // you carry + who's in the cast).
         if let Some(cast_line) = self.npc_registry.render_line() {
             out.push_str("cast: ");
-            out.push_str(&cast_line);
+            // (2026-08-24 review P2) flatten_inline — registry names are
+            // free text; same newline-injection gate as present:/rumors:.
+            out.push_str(&Self::flatten_inline(&cast_line));
             out.push('\n');
         }
         if !self.player_state.belt.is_empty() {
-            let names: Vec<String> = self
+            // (2026-08-24 review fix) The belt renders under the SAME cap
+            // discipline as pouch/pack — the quick rack is small in honest
+            // play, but hand-edited saves + a drifted apply path can grow
+            // it, and the `belt:` line was the one unbounded carry-back.
+            const BELT_PROMPT_CAP: usize = 16;
+            let shown: Vec<String> = self
                 .player_state
                 .belt
                 .iter()
+                .take(BELT_PROMPT_CAP)
                 .map(|i| {
                     if i.qty > 1 {
                         format!("{} ×{}", i.name, i.qty)
@@ -2945,8 +3573,43 @@ impl WorldSchema {
                     }
                 })
                 .collect();
+            let overflow = self.player_state.belt.len().saturating_sub(BELT_PROMPT_CAP);
             out.push_str("belt: ");
-            out.push_str(&names.join(", "));
+            // (2026-08-24 review P2) flatten_inline: item names from
+            // hand-edited saves can carry newlines — a raw render could
+            // inject fake `present:`/`clock:` lines into <world_state>.
+            out.push_str(&Self::flatten_inline(&shown.join(", ")));
+            if overflow > 0 {
+                out.push_str(&format!(" (+{overflow} more)"));
+            }
+            out.push('\n');
+        }
+        // (2026-08-23 pouch ruling) The wallet line — the same read-back
+        // discipline as the pack (the tracker must see current coin/keys/ID to
+        // restate or remove them), bounded by the same cap.
+        if !self.player_state.pouch.is_empty() {
+            const POUCH_PROMPT_CAP: usize = 16;
+            let shown: Vec<String> = self
+                .player_state
+                .pouch
+                .iter()
+                .take(POUCH_PROMPT_CAP)
+                .map(|i| {
+                    if i.qty > 1 {
+                        format!("{} ×{}", i.name, i.qty)
+                    } else {
+                        i.name.clone()
+                    }
+                })
+                .collect();
+            let overflow = self.player_state.pouch.len().saturating_sub(POUCH_PROMPT_CAP);
+            out.push_str("pouch: ");
+            // (2026-08-24 review P2) flatten_inline — same newline-injection
+            // gate as belt/pack/quests (hand-edited saves).
+            out.push_str(&Self::flatten_inline(&shown.join(", ")));
+            if overflow > 0 {
+                out.push_str(&format!(" (+{} more)", overflow));
+            }
             out.push('\n');
         }
         if !self.player_state.pack.is_empty() {
@@ -2967,7 +3630,8 @@ impl WorldSchema {
                 .collect();
             let overflow = self.player_state.pack.len().saturating_sub(PACK_PROMPT_CAP);
             out.push_str("pack: ");
-            out.push_str(&shown.join(", "));
+            // (2026-08-24 review P2) flatten_inline — the belt/pouch twin.
+            out.push_str(&Self::flatten_inline(&shown.join(", ")));
             if overflow > 0 {
                 out.push_str(&format!(" (+{} more)", overflow));
             }
@@ -2990,7 +3654,9 @@ impl WorldSchema {
                 .collect();
             let overflow = self.custom_tags.len().saturating_sub(CUSTOM_PROMPT_CAP);
             out.push_str("custom: ");
-            out.push_str(&shown.join("; "));
+            // (2026-08-24 review P2) flatten_inline — authored tag values are
+            // free text; same gate as the pack/pouch lines.
+            out.push_str(&Self::flatten_inline(&shown.join("; ")));
             if overflow > 0 {
                 out.push_str(&format!(" (+{} more)", overflow));
             }
@@ -3037,33 +3703,86 @@ impl WorldSchema {
     /// serialized form exceeds `ENTITY_VALUE_PROMPT_CHARS` collapses to a
     /// marker string so one giant blob can't eat the budget (the model may
     /// still overwrite or null-delete the key).
+    ///
+    /// (2026-08-24 bug fix) The char budget bounds the WHOLE document —
+    /// summary + events + entities TOGETHER. The old accounting spent the
+    /// entire budget on entities and let the envelope ride unaccounted: a
+    /// legal-max summary (4,000 chars) + 6 legal-max events (1,000 each)
+    /// added ~10k invisible chars on top, and the composed schema-engine
+    /// prompt re-blew the CTX_SCHEMA prompt ceiling (the middle-drop
+    /// failure the budget exists to kill). The envelope now renders FIRST
+    /// (flattened + prompt-capped, the `ENTITY_VALUE_PROMPT_CHARS`
+    /// discipline — the write-time gates stay authoritative), is measured
+    /// in its serialized form, and entities spend the REMAINDER — with a
+    /// floor so entities never fully starve on a fat envelope.
     pub fn to_json_prompt(&self) -> String {
         const EVENTS_PROMPT_CAP: usize = 6;
         const ENTITY_VALUE_PROMPT_CHARS: usize = 400;
-        // (2026-08-16 yellow S4) The per-field legal maxima (500 entities ×
-        // 400-char values + summary + events) compose to ~25× CTX_SCHEMA —
-        // an at-the-caps schema overflowed the 2048-token prompt and the
-        // middle-drop spliced a contiguous band out of the sorted JSON the
-        // model must diff against (re-minted keys → growth spiral). The
-        // renderer now enforces a TOTAL char budget: entities are included
-        // in priority order until the budget is spent, the rest counted in a
-        // visible `(+N trimmed)` marker. Priority = `player.*` identity keys
-        // first (the diff anchor, never many), then `entity_order` (FIFO =
-        // oldest first, the same recency assumption eviction uses), then any
-        // keys the order list never knew (sorted — deterministic fallback).
+        // Render-time caps for the envelope pieces (see the doc note above).
+        // Summary 1,200 + events 6×250 + framing ≈ 2.8k worst — the
+        // remaining ~1.2k goes to entities in the fattest legal envelope.
+        const SUMMARY_PROMPT_CHARS: usize = 1_200;
+        const EVENT_PROMPT_CHARS: usize = 250;
+        // Entities floor: however fat the (capped) envelope, entities keep
+        // at least this much so the diff target never empties. With the
+        // caps above the envelope maxes ~2.8k, so envelope_max + floor
+        // stays under the total budget — the floor is headroom for future
+        // cap changes, not a path past the budget.
+        const ENTITIES_FLOOR_CHARS: usize = 1_000;
         let budget = crate::settings::SCHEMA_JSON_PROMPT_BUDGET_CHARS;
-        let events: Vec<String> = if self.recent_events.len() > EVENTS_PROMPT_CAP {
-            self.recent_events[self.recent_events.len() - EVENTS_PROMPT_CAP..]
-                .iter()
-                .map(|e| Self::flatten_inline(e))
-                .collect()
+        // Envelope first — flattened (the yellow S7 forgery gate), then
+        // prompt-capped with the visible `[…]` marker when a legal-max or
+        // hand-edited value overflows its share.
+        let summary = Self::flatten_inline(&self.summary);
+        let summary = if summary.chars().count() > SUMMARY_PROMPT_CHARS {
+            let mut cut: String = summary.chars().take(SUMMARY_PROMPT_CHARS).collect();
+            cut.push_str(" […]");
+            cut
         } else {
-            self.recent_events
-                .iter()
-                .map(|e| Self::flatten_inline(e))
-                .collect()
+            summary
         };
-        // Deterministic inclusion order (see the budget note above).
+        let event_window: &[String] = if self.recent_events.len() > EVENTS_PROMPT_CAP {
+            &self.recent_events[self.recent_events.len() - EVENTS_PROMPT_CAP..]
+        } else {
+            &self.recent_events
+        };
+        let events: Vec<String> = event_window
+            .iter()
+            .map(|e| {
+                let flat = Self::flatten_inline(e);
+                if flat.chars().count() > EVENT_PROMPT_CHARS {
+                    let mut cut: String = flat.chars().take(EVENT_PROMPT_CHARS).collect();
+                    cut.push_str(" […]");
+                    cut
+                } else {
+                    flat
+                }
+            })
+            .collect();
+        // The envelope's serialized cost, measured the way serde will
+        // actually emit it (quotes + escapes included), plus the fixed
+        // `{"summary":…,"recent_events":[…],"entities":…}` framing.
+        let envelope_cost = serde_json::to_string(&summary)
+            .map(|s| s.chars().count())
+            .unwrap_or(2)
+            + events
+                .iter()
+                .map(|e| serde_json::to_string(e).map(|s| s.chars().count()).unwrap_or(2))
+                .sum::<usize>()
+            + events.len()
+            + 64;
+        let entities_budget = budget
+            .saturating_sub(envelope_cost)
+            // The floor can never push past the total budget: an escape-
+            // dense envelope (every quote doubled in the serde cost) can
+            // starve the remainder below ENTITIES_FLOOR_CHARS, and a bare
+            // .max(FLOOR) then OVERSHOT the budget it exists to protect.
+            .max(ENTITIES_FLOOR_CHARS.min(budget));
+        // Deterministic inclusion order (2026-08-16 yellow S4): priority =
+        // `player.*` identity keys first (the diff anchor, never many), then
+        // `entity_order` (FIFO = oldest first, the same recency assumption
+        // eviction uses), then any keys the order list never knew (sorted —
+        // deterministic fallback).
         let mut order: Vec<&String> = Vec::with_capacity(self.entities.len());
         let mut seen: std::collections::HashSet<&String> = std::collections::HashSet::new();
         for k in self.entities.keys() {
@@ -3096,7 +3815,7 @@ impl WorldSchema {
             let rendered = serde_json::to_string(&value).unwrap_or_default();
             // +2 covers the `"key":` + `,` framing serde adds per entry.
             let entry_cost = k.len() + rendered.chars().count() + 8;
-            if used + entry_cost > budget {
+            if used + entry_cost > entities_budget {
                 trimmed = self.entities.len() - entities.len();
                 break;
             }
@@ -3104,7 +3823,7 @@ impl WorldSchema {
             entities.insert(k.clone(), value);
         }
         let mut obj = serde_json::json!({
-            "summary": Self::flatten_inline(&self.summary),
+            "summary": summary,
             "recent_events": events,
             "entities": entities,
         });
@@ -3112,7 +3831,7 @@ impl WorldSchema {
             tracing::warn!(
                 total = self.entities.len(),
                 shown = self.entities.len() - trimmed,
-                budget_chars = budget,
+                entities_budget_chars = entities_budget,
                 "schema prompt JSON over budget; oldest entities trimmed (player.* identity keys kept)"
             );
             obj.as_object_mut()
@@ -3249,6 +3968,13 @@ impl WorldSchema {
         if self.promises.len() > MAX_PROMISES {
             let overflow = self.promises.len() - MAX_PROMISES;
             self.promises.drain(..overflow);
+        }
+        // (2026-08-22 living-world) Open-quest cap — FIFO like the promises
+        // (the bracket applier refuses at the same ceiling; this is the
+        // hand-edited-save backstop).
+        if self.quests.len() > MAX_QUESTS {
+            let overflow = self.quests.len() - MAX_QUESTS;
+            self.quests.drain(..overflow);
         }
         // (2026-08-20 Economy; 2026-08-20 audit rework) Property cap — TRUE
         // FIFO by `property_order` (first-insert), not BTreeMap key order
@@ -3430,12 +4156,26 @@ impl WorldSchema {
             interior.archived = Some(stub.clone());
             reaped += 1;
         }
+        if reaped > 0 {
+            tracing::info!(
+                reaped,
+                "reaper: stale named-NPC interiors archived (rich fields compressed to stubs)"
+            );
+        }
         if !held.is_empty() {
             const HELD_SHOWN: usize = 8;
             let mut list = held[..held.len().min(HELD_SHOWN)].join(", ");
             if held.len() > HELD_SHOWN {
                 list.push_str(&format!(" (+{} more)", held.len() - HELD_SHOWN));
             }
+            // (2026-08-24 review fix) The held-back set was computed and then
+            // dropped — the dead diagnostic this block replaces. This line is
+            // the playtest evidence that the protection bands (rel extremes /
+            // open tasks / held items) actually fire against past-TTL NPCs.
+            tracing::debug!(
+                held = %list,
+                "reaper: past-TTL named NPCs held back by live-world protection"
+            );
         }
         reaped
     }
@@ -3698,7 +4438,19 @@ fn type_name_of_value(v: &serde_json::Value) -> &'static str {
             let val: serde_json::Value = serde_json::from_str(&text)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             let Some(obj) = val.as_object() else {
-                continue; // a non-object file is ignored (defensive; shouldn't happen)
+                // Same refuse-don't-reset contract as the `entities` guard
+                // below: a parseable-but-non-object slice (hand-edit, corrupt
+                // write — e.g. `[]`) must NOT load as an all-defaults schema,
+                // because the next autosave would permanently overwrite the
+                // file with those defaults. Fail the load instead.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "{}: slice file is not an object (got {})",
+                        path.display(),
+                        Self::type_name_of_value(&val)
+                    ),
+                ));
             };
             let mut obj = obj.clone();
             if let Some(gen) = obj.remove("split_gen").and_then(|v| v.as_u64()) {
@@ -3744,23 +4496,6 @@ fn type_name_of_value(v: &serde_json::Value) -> &'static str {
             }
         }
 
-        // Clean-delete safety net (2026-08-07): the 22-part `BodyPart` set
-        // REPLACED the old 16-part set outright — `Torso`, `LeftBicep`,
-        // `LeftThigh`, `LeftAnkle` + mirrors no longer name a real variant.
-        // A pre-reorg `player.json` carrying those dead keys would ERROR on
-        // the deserialize below (serde rejects unknown enum variants). Filter
-        // the `player_state.body` object to ONLY the 22 known PascalCase wire
-        // keys before deserializing — dead-part injury data simply vanishes
-        // (the part no longer exists), no remap, no crash. Best-effort: if the
-        // shape isn't the expected nested object, leave it untouched + let the
-        // deserialize surface the real error.
-        if let Some(ps) = merged.get_mut("player_state").and_then(|v| v.as_object_mut()) {
-            if let Some(body) = ps.get_mut("body").and_then(|v| v.as_object_mut()) {
-                let known = crate::player_state::BodyPart::wire_keys();
-                body.retain(|key, _| known.contains(key.as_str()));
-            }
-        }
-
         // (deferred-3) Cross-file generation check. All PRESENT stamps must
         // agree (absent = legacy, accepted — a mix of stamped + legacy files
         // can only mean the very first stamped write crashed mid-rename,
@@ -3788,21 +4523,6 @@ fn type_name_of_value(v: &serde_json::Value) -> &'static str {
             schema.split_gen = *gen;
         }
 
-        // Legacy item migration (2026-08-07): absorb freeform `item_*`/`inv_*`
-        // entity keys (the deleted `panels/inventory.js` convention) into the
-        // typed equipment/belt/pack model. Idempotent — a second load finds no
-        // legacy keys → no-op. Runs AFTER deserialize so the typed migration
-        // helper (`equipment::migrate_legacy_items`) works against real Rust
-        // types rather than JSON values. The entities map shrinks as items
-        // leave it; the typed model grows by the same amount.
-        if !schema.entities.is_empty() {
-            crate::equipment::migrate_legacy_items(
-                &mut schema.entities,
-                &mut schema.player_state.equipment,
-                &mut schema.player_state.pack,
-            );
-        }
-        schema.migrate_legacy_outfit();
         // (2026-08-20 Economy) Clamp every node's prosperity into the legal
         // [25, 200] band — old saves deserialize missing values at the 100
         // serde default, but a hand-edited 0/255 must not reach the
@@ -3812,37 +4532,28 @@ fn type_name_of_value(v: &serde_json::Value) -> &'static str {
                 node.prosperity.clamp(crate::economy::PROSPERITY_MIN, crate::economy::PROSPERITY_MAX);
         }
 
+        // (2026-08-26 location-hygiene ruling) Normalize stored node NAMES:
+        // parentheses never appear in a location. A card drafted before the
+        // seed-side purifier seeded labels like "Earth (variable by scene)";
+        // this pass heals them on the save's next load (ids untouched — the
+        // graph's keys/edges stay stable; the cleaned name persists with the
+        // session's next autosave).
+        for node in &mut schema.travel_graph.nodes {
+            let cleaned = clean_location_label(&node.name);
+            if !cleaned.is_empty() && cleaned != node.name {
+                tracing::info!(
+                    node_id = %node.id,
+                    before = %node.name,
+                    after = %cleaned,
+                    "load_split: stripped parenthetical qualifier from a node name"
+                );
+                node.name = cleaned;
+            }
+        }
+
         Ok(schema)
     }
 
-    /// (2026-08-18 clothing-as-inventory ruling) Legacy `outfit` appearance
-    /// delta → typed inventory items, one-shot. Pre-ruling saves (and every
-    /// prior SavedPlayer attach) stored the authored clothing chip list as ONE
-    /// comma-joined `current_appearance_deltas["outfit"]` line; that key is
-    /// retired — the chips become real items via the same seed a fresh attach
-    /// uses (garments route to body slots, deduped against items the campaign
-    /// already tracks). The delta is removed either way, so a second run is a
-    /// no-op and the next persist writes the migrated inventory.
-    ///
-    /// Called at BOTH schema install seams: `load_split` (the resume path)
-    /// AND `fable_load_save` (a save slot installs its schema directly,
-    /// bypassing load_split).
-    pub fn migrate_legacy_outfit(&mut self) {
-        if let Some(line) = self
-            .player_state
-            .current_appearance_deltas
-            .remove("outfit")
-            .filter(|s| !s.trim().is_empty())
-        {
-            let chips = crate::equipment::split_outfit_line(&line);
-            let seeded = crate::equipment::seed_clothing_items(
-                &chips,
-                &mut self.player_state.equipment,
-                &mut self.player_state.pack,
-            );
-            tracing::info!(seeded, "legacy outfit delta migrated into typed inventory");
-        }
-    }
 }
 
 /// Atomic write of arbitrary text (temp + fsync + rename). Shared by the
@@ -3892,6 +4603,39 @@ pub struct SchemaDelta {
     /// node seeds (site maps + the roulette are Rust-authoritative).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub site_seeds: Option<HashMap<String, String>>,
+    /// (2026-08-22 living-world) Site-evolution ops the WORLD-PROGRESSION
+    /// pass may emit for its designated DEPARTED mapped sites
+    /// (`{node_id: [SiteEvolutionOp…]}` — the constrained set_asset/
+    /// move_asset/remove_asset mutation pass). Consumed + stripped by
+    /// `fire_world_progression_tick` step 7c BEFORE `apply_delta` (the
+    /// play-canon-locked applier owns validation) — `apply_delta` itself
+    /// NEVER touches site maps (Rust-authoritative, the `site_seeds`
+    /// pattern). Deliberately NOT counted in `has_changes()`: an
+    /// ops-only delta still evolves (mirrors seeds-only deltas planting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_ops: Option<HashMap<String, Vec<crate::site_map::SiteEvolutionOp>>>,
+    /// (2026-08-22 multihog WS3) Site pressure the WORLD-PROGRESSION pass
+    /// emits for any KNOWN site it mentions (`{node_id: "one ≤140-char
+    /// directional line"}` — not just the designated). Consumed +
+    /// stripped by `fire_world_progression_tick` BEFORE `apply_delta`
+    /// (validated against the graph + `clean_free_text`-capped, pushed
+    /// into `Node.pending_pressure`) — `apply_delta` itself NEVER touches
+    /// node pressure (Rust-authoritative, the `site_seeds` pattern).
+    /// Deliberately NOT counted in `has_changes()`: a pressure-only delta
+    /// still accumulates intent (mirrors seeds-only deltas planting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub site_pressure: Option<HashMap<String, String>>,
+    /// (2026-08-24 Part II A6) ONE regional pattern beyond per-entity deltas
+    /// the WORLD-PROGRESSION pass may emit (`"<=160 chars, one regional
+    /// pattern"` — a war's front shifts, a trade route collapses). Consumed +
+    /// stripped by `fire_world_progression_tick` BEFORE `apply_delta`
+    /// (`clean_free_text`-capped, then pushed as ONE bounded
+    /// `pending_tick_directives` line the next narrator turn renders).
+    /// Deliberately NOT counted in `has_changes()`: a currents-only delta
+    /// still lands its line (mirrors seeds-only deltas planting).
+    /// Rumor-seeding from the line is deferred.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wider_currents: Option<String>,
 }
 
 impl SchemaDelta {
@@ -3943,13 +4687,11 @@ impl SchemaDelta {
 }
 
 /// The starting world-state anchors derived from a card's `.intro` by the
-/// launch-time bootstrap pass (2026-08-10). A sibling of `CardStart`
-/// (sim_card.rs) — both seed the dormant clock/weather/location at
-/// `enter_fable_session`, but `CardStart` is *authored* (the card's `<start>`
-/// block) while `BootstrapAnchors` is *derived* (one schema-engine pass reads
-/// the intro + extracts the implied time/weather/location). The bootstrap runs
-/// only when the `<start>` block left an anchor dormant (no `<start>` block, or
-/// it seeded only one of clock/weather). Mirrors the cold-start seed discipline:
+/// launch-time bootstrap pass (2026-08-10). Where the card's authored
+/// `<world>` sibling is the *authored* anchor set, `BootstrapAnchors` is
+/// *derived*: one schema-engine pass reads the intro + extracts the implied
+/// time/weather/location. The bootstrap runs only when the `<world>` seed
+/// left an anchor dormant. Mirrors the cold-start seed discipline:
 /// writes `world_clock` + `weather` + an opening travel-graph node directly
 /// (NOT through `apply_delta`, which is test-pinned to never touch them).
 ///
@@ -3972,6 +4714,11 @@ pub struct BootstrapAnchors {
     /// node + sets `current_node` (only when the graph is still empty — a
     /// resumed save with an existing graph is preserved).
     pub location: Option<(String, String)>,
+    /// (2026-08-22 living-world, the Auto-Harvest Dormancy ruling) The
+    /// arcane resource the opening names ("mana", "biotics", "rage"),
+    /// ≤24 chars. `None` when the fiction has none — the pool stays
+    /// dormant (zero tokens, zero mechanics forever).
+    pub arcana_label: Option<String>,
 }
 
 impl BootstrapAnchors {
@@ -4001,6 +4748,11 @@ impl BootstrapAnchors {
             location_id: Option<String>,
             #[serde(default, rename = "location_name")]
             location_name: Option<String>,
+            /// (2026-08-22 living-world) The arcane resource the opening
+            /// names ("mana", "biotics", "rage") — the Auto-Harvest
+            /// Dormancy activation seed. Absent when the fiction has none.
+            #[serde(default)]
+            arcana: Option<String>,
         }
         let parsed: Raw = serde_json::from_str(&repaired)?;
         // (2026-08-16 audit M2) Free-text anchor strings render verbatim into
@@ -4043,19 +4795,29 @@ impl BootstrapAnchors {
         const ANCHOR_TEXT_MAX: usize = 80;
         let weather = parsed.weather.and_then(|w| clean_anchor(w, WEATHER_ANCHOR_MAX));
         // location: require BOTH id + name (a partial pair is useless).
+        // (2026-08-26) The name runs through clean_location_label — a
+        // model-emitted "Somewhere (near the docks)" never seeds a
+        // parenthesized node label. A name that cleans to nothing keeps the
+        // anchor-cleaned original.
         let location = match (parsed.location_id, parsed.location_name) {
             (Some(id), Some(name)) => {
                 match (
                     clean_anchor(id, ANCHOR_TEXT_MAX),
                     clean_anchor(name, ANCHOR_TEXT_MAX),
                 ) {
-                    (Some(id), Some(name)) => Some((id, name)),
+                    (Some(id), Some(name)) => {
+                        let cleaned = clean_location_label(&name);
+                        Some((id, if cleaned.is_empty() { name } else { cleaned }))
+                    }
                     _ => None,
                 }
             }
             _ => None,
         };
-        Ok(Self { time_minutes, weather, location })
+        // (2026-08-22 living-world) The arcane label — the [ARCANA] bracket's
+        // 24-char cap discipline (a resource NAME, not a sentence).
+        let arcana_label = parsed.arcana.and_then(|a| clean_anchor(a, 24));
+        Ok(Self { time_minutes, weather, location, arcana_label })
     }
 }
 
@@ -4132,9 +4894,9 @@ mod tests {
     use super::*;
 
     /// (2026-08-22 re-track hardening) A base-schema revert KEEPS the
-    /// Rust-owned anchors (clock + calendar family) from the live world —
-    /// the moment still happened; only its prose is re-derived. Everything
-    /// else on the base wins.
+    /// Rust-owned anchors (clock + calendar family + the rest anchor) from
+    /// the live world — the moment still happened; only its prose is
+    /// re-derived. Everything else on the base wins.
     #[test]
     fn retain_revert_safe_anchors_keeps_clock_and_calendar() {
         let mut base = WorldSchema::default();
@@ -4142,12 +4904,14 @@ mod tests {
         base.world_clock.last_tick_minutes = 540;
         base.calendar = Some("1st of Harvest, Year 1247".into());
         base.calendar_synced_minutes = Some(540);
+        base.last_rest_minutes = 300; // stale pre-rest anchor on the base
         base.summary = "the base summary".into();
 
         let mut live = base.clone();
         live.world_clock.current_minutes = 545; // the turn's [TIME] applied
         live.calendar = Some("2nd of Harvest, Year 1247".into());
         live.calendar_synced_minutes = Some(545);
+        live.last_rest_minutes = 545; // the turn's [REST] stamped post-sleep
         live.summary = "the live summary".into();
 
         let mut restored = base.clone();
@@ -4155,6 +4919,7 @@ mod tests {
         assert_eq!(restored.world_clock.current_minutes, 545, "clock survives the revert");
         assert_eq!(restored.calendar.as_deref(), Some("2nd of Harvest, Year 1247"));
         assert_eq!(restored.calendar_synced_minutes, Some(545));
+        assert_eq!(restored.last_rest_minutes, 545, "rest anchor survives (no phantom weary band)");
         assert_eq!(restored.summary, "the base summary", "everything else reverts");
     }
 
@@ -4413,6 +5178,147 @@ mod tests {
             .expect("at-cap registry installs");
     }
 
+    /// (2026-08-22 multihog WS1) The deterministic entity-expiry sweep:
+    /// past deadlines delete + direct; future deadlines stand; immutable +
+    /// player identity keys refuse deletion (their slots still drop so the
+    /// observation fires once); a slot for a missing entity is dropped
+    /// silently.
+    #[test]
+    fn sweep_entity_expiry_past_future_immutable() {
+        let mut schema = WorldSchema::default();
+        schema.entities.insert(
+            "bridge-out".to_string(),
+            serde_json::Value::String("the crossing is torn".into()),
+        );
+        schema.entities.insert(
+            "ward-vault".to_string(),
+            serde_json::Value::String("sealed".into()),
+        );
+        schema.entities.insert(
+            "npc.marcus.core".to_string(),
+            serde_json::Value::String("canon".into()),
+        );
+        schema.entities.insert(
+            "player.name".to_string(),
+            serde_json::Value::String("hero".into()),
+        );
+        schema
+            .entity_expiry
+            .insert("bridge-out".to_string(), 1_000);
+        schema.entity_expiry.insert("ward-vault".to_string(), 5_000);
+        schema
+            .entity_expiry
+            .insert("npc.marcus.core".to_string(), 1_000);
+        schema
+            .entity_expiry
+            .insert("player.name".to_string(), 1_000);
+        schema.entity_expiry.insert("ghost-key".to_string(), 900);
+
+        let (directives, mutated) = schema.sweep_entity_expiry(2_000);
+        assert_eq!(mutated, 4, "three due slots + the ghost slot all drop");
+        assert!(!schema.entities.contains_key("bridge-out"), "past deadline deletes");
+        assert!(
+            schema.entities.contains_key("ward-vault"),
+            "future deadline stands"
+        );
+        assert!(
+            schema.entities.contains_key("npc.marcus.core"),
+            "immutable key survives the sweep"
+        );
+        assert!(
+            schema.entities.contains_key("player.name"),
+            "player identity key survives the sweep"
+        );
+        assert!(!schema.entity_expiry.contains_key("npc.marcus.core"));
+        assert!(!schema.entity_expiry.contains_key("ghost-key"), "dead slot drops");
+        assert_eq!(directives.len(), 1, "only the real expiry directs");
+        assert!(
+            directives[0].starts_with("Expired: bridge-out"),
+            "directive names the key: {}",
+            directives[0]
+        );
+        assert!(directives[0].contains("Day 2"), "directive carries the clock: {}", directives[0]);
+
+        // A second sweep at the same now is a no-op (slots already dropped).
+        let (dirs2, n2) = schema.sweep_entity_expiry(2_000);
+        assert_eq!((dirs2.len(), n2), (0, 0));
+        // Dormant clock → never fires.
+        let mut fresh = WorldSchema::default();
+        fresh.entity_expiry.insert("k".to_string(), 1);
+        assert_eq!(fresh.sweep_entity_expiry(0).0.len(), 0);
+    }
+
+    /// (2026-08-22 multihog WS1) Serde dormancy: a pre-WS1 save (no
+    /// `entity_expiry` key) loads with the field empty; an empty field
+    /// serializes back without the key (byte-identical saves).
+    #[test]
+    fn entity_expiry_serde_dormant_roundtrip() {
+        let legacy = r#"{"summary":"old","recent_events":[],"entities":{}}"#;
+        let loaded: WorldSchema = serde_json::from_str(legacy).expect("legacy loads");
+        assert!(loaded.entity_expiry.is_empty());
+        let back = serde_json::to_value(&loaded).expect("serialize");
+        assert!(
+            back.get("entity_expiry").is_none(),
+            "empty field must not serialize: {back}"
+        );
+        let armed = r#"{"entity_expiry":{"bridge-out":1440}}"#;
+        let loaded: WorldSchema = serde_json::from_str(armed).expect("armed loads");
+        assert_eq!(loaded.entity_expiry.get("bridge-out"), Some(&1440));
+    }
+
+    /// (2026-08-23 starvation fix) `last_material_minutes` serde dormancy: a
+    /// pre-fix node JSON (no field) loads with 0 (= never materialized), and
+    /// a set value round-trips — the designation watermark's exact pattern.
+    #[test]
+    fn node_last_material_minutes_serde_dormant() {
+        let legacy = r#"{"id":"warren","name":"Warren","neighbors":[],"setting":""}"#;
+        let node: Node = serde_json::from_str(legacy).expect("legacy node loads");
+        assert_eq!(node.last_material_minutes, 0, "absent field = never materialized");
+        let mut stamped = Node::default();
+        stamped.id = "warren".into();
+        stamped.last_material_minutes = 43_200;
+        let back: Node =
+            serde_json::from_str(&serde_json::to_string(&stamped).unwrap()).unwrap();
+        assert_eq!(back.last_material_minutes, 43_200, "set value round-trips");
+    }
+
+    /// (2026-08-22 multihog WS3) `site_pressure` is a Rust-consumed field:
+    /// a pressure-only delta has NO has_changes (the seeds-only precedent)
+    /// and `apply_delta` never touches node state — the apply lives in
+    /// `fire_world_progression_tick`'s take-and-strip step.
+    #[test]
+    fn site_pressure_delta_is_rust_consumed_not_applied() {
+        let mut delta = SchemaDelta::default();
+        delta.site_pressure = Some(HashMap::from([(
+            "warren".to_string(),
+            "the debt comes due".to_string(),
+        )]));
+        assert!(!delta.has_changes(), "pressure-only deltas are not changes");
+        let mut schema = WorldSchema::default();
+        schema.travel_graph.nodes = vec![Node::default()];
+        schema.travel_graph.nodes[0].id = "warren".into();
+        schema.apply_delta(delta);
+        assert!(
+            schema.travel_graph.nodes[0].pending_pressure.is_empty(),
+            "apply_delta never plants pressure"
+        );
+        // Dormant serde: absent field loads empty; empty serializes absent.
+        let loaded: WorldSchema =
+            serde_json::from_str(r#"{"summary":"x"}"#).expect("loads");
+        assert!(loaded.travel_graph.nodes.is_empty());
+        let back = serde_json::to_value(&WorldSchema::default()).unwrap();
+        assert!(back.get("site_pressure").is_none());
+        // The DELTA's field round-trips (model output shape).
+        let d: SchemaDelta = serde_json::from_str(
+            r#"{"site_pressure":{"warren":"the debt comes due"}}"#,
+        )
+        .expect("delta parses");
+        assert_eq!(
+            d.site_pressure.as_ref().and_then(|m| m.get("warren")),
+            Some(&"the debt comes due".to_string())
+        );
+    }
+
     /// (2026-08-16 yellow S5) Immutable keys are exempt from FIFO entity
     /// eviction — they seed oldest, so the sweep used to eat them before the
     /// lock could ever matter.
@@ -4469,6 +5375,72 @@ mod tests {
         assert!(!json.contains("\\nlocation: nowhere"), "prompt JSON flattened: {json}");
     }
 
+    /// (2026-08-24 review P2) flatten_inline gap sweep: the date/weather/
+    /// tone/present/rumors/cast/custom render lines — a hand-edited save's
+    /// newline-laden values must never forge a second `<world_state>` line
+    /// (a raw "rain\nclock: Day 99" weather condition used to mint a fake
+    /// clock the tracker reads as ground truth).
+    #[test]
+    fn render_for_prompt_flattens_anchor_and_roster_lines() {
+        let mut schema = WorldSchema::default();
+        schema.calendar = Some("17th of Peatfall\npresent: ghost".into());
+        schema.world_clock.current_minutes = 600;
+        schema.weather.condition = "rain\nclock: Day 99".into();
+        schema.tone = Some("eerie\nexits: everywhere".into());
+        schema.npc_registry = NpcRegistry {
+            entries: vec![NpcEntry {
+                id: "mara".into(),
+                name: "Mara\nweather: storm".into(),
+                role: String::new(),
+                tier: None,
+                aliases: vec![],
+                prominence: NpcProminence::Named,
+            }],
+        };
+        schema.presences = vec![Presence {
+            npc_id: "mara".into(),
+            name: "Mara".into(),
+            stance: "at the bar\nclock: Day 42".into(),
+            ttl: PRESENCE_GRACE_RESET,
+        }];
+        schema.travel_graph.nodes.push(Node {
+            id: "tavern".into(),
+            name: "Tavern".into(),
+            ..Node::default()
+        });
+        schema.travel_graph.current_node = Some("tavern".into());
+        schema.rumors.push(crate::rumor::Rumor {
+            label: "the duke lied\nsummary: fake".into(),
+            origin_node: "tavern".into(),
+            known_nodes: vec!["tavern".into()],
+            born_minutes: 0,
+        });
+        schema.custom_tags.insert("curse".into(), "withering\ntone: chipper".into());
+        let rendered = schema.render_for_prompt();
+        for forged in [
+            "\npresent: ghost",
+            "\nclock: Day 99",
+            "\nexits: everywhere",
+            "\nweather: storm",
+            "\nclock: Day 42",
+            "\nsummary: fake",
+            "\ntone: chipper",
+        ] {
+            assert!(
+                !rendered.contains(forged),
+                "forged line {forged:?} must not render: {rendered}"
+            );
+        }
+        // The values survive, flattened onto their own lines.
+        assert!(rendered.contains("date: 17th of Peatfall present: ghost"), "{rendered}");
+        assert!(rendered.contains("weather: rain clock: Day 99"), "{rendered}");
+        assert!(rendered.contains("tone: eerie exits: everywhere"), "{rendered}");
+        assert!(rendered.contains("cast: Mara weather: storm [mara]"), "{rendered}");
+        assert!(rendered.contains("present: Mara (at the bar clock: Day 42)"), "{rendered}");
+        assert!(rendered.contains("rumors: the duke lied summary: fake"), "{rendered}");
+        assert!(rendered.contains("custom: curse: withering tone: chipper"), "{rendered}");
+    }
+
     /// (2026-08-16 yellow S4) The prompt JSON enforces its total char budget:
     /// a schema at the growth cap trims OLDEST entities with a visible
     /// marker, keeping player identity keys.
@@ -4497,6 +5469,45 @@ mod tests {
         );
         assert!(json.contains("player.name"), "identity key kept: {json}");
         assert!(json.contains("e000"), "oldest entities included first: {json}");
+        assert!(!json.contains("e299"), "newest trimmed: {json}");
+        assert!(json.contains("entities_trimmed"), "trim is visible: {json}");
+    }
+
+    /// (2026-08-24 bug fix) The JSON budget accounts summary + events +
+    /// entities TOGETHER: a legal-max envelope (4,000-char summary + 6 ×
+    /// ~1,600-char events) used to ride ~10k chars on top of the entities
+    /// budget — the composed schema-engine prompt re-blew the CTX_SCHEMA
+    /// prompt ceiling (the middle-drop the budget exists to kill). The
+    /// envelope now renders first (prompt-capped with the `[…]` marker),
+    /// entities spend the remainder, and the WHOLE document stays at the
+    /// budget with the entities floor keeping the diff target alive.
+    #[test]
+    fn to_json_prompt_accounts_envelope_in_total_budget() {
+        let mut schema = WorldSchema::default();
+        schema.summary = "s".repeat(4_000);
+        schema.recent_events = (0..6).map(|i| format!("event {i} ").repeat(200)).collect();
+        schema.entities.insert(
+            "player.name".to_string(),
+            serde_json::Value::String("hero".into()),
+        );
+        schema.entity_order.push_back("player.name".to_string());
+        // Same overload as the trim test: entities far past the remainder.
+        for i in 0..300 {
+            let key = format!("e{i:03}");
+            let val = serde_json::Value::String("v".repeat(100));
+            schema.entities.insert(key.clone(), val);
+            schema.entity_order.push_back(key);
+        }
+        let json = schema.to_json_prompt();
+        assert!(
+            json.chars().count() < crate::settings::SCHEMA_JSON_PROMPT_BUDGET_CHARS + 64,
+            "whole document (summary + events + entities) stays at the budget: {}",
+            json.chars().count()
+        );
+        assert!(json.contains(" […]"), "oversize summary/events render capped: {json}");
+        assert!(json.contains("event 0"), "events still render: {json}");
+        assert!(json.contains("player.name"), "identity key kept: {json}");
+        assert!(json.contains("e000"), "entities never fully starve (floor): {json}");
         assert!(!json.contains("e299"), "newest trimmed: {json}");
         assert!(json.contains("entities_trimmed"), "trim is visible: {json}");
     }
@@ -4730,7 +5741,7 @@ mod tests {
     }
 
     #[test]
-    fn render_for_prompt_caps_recent_events_at_five() {
+    fn render_for_prompt_caps_recent_events_at_six() {
         let schema = WorldSchema {
             summary: String::new(),
             recent_events: (0..10).map(|i| format!("event{i}")).collect(),
@@ -4738,10 +5749,80 @@ mod tests {
             ..Default::default()
         };
         let rendered = schema.render_for_prompt();
-        // Only the last 5 events should appear.
-        assert!(rendered.contains("event5"));
+        // Only the last 6 events appear — the cap was raised 5 → 6 by the
+        // 2026-08-21 evening follow-up to the 8192 ruling.
+        assert!(rendered.contains("event4"));
         assert!(rendered.contains("event9"));
-        assert!(!rendered.contains("event4"));
+        assert!(!rendered.contains("event3"));
+    }
+
+    #[test]
+    fn render_for_prompt_caps_belt_at_sixteen() {
+        // (2026-08-24 review fix) The belt renders under the same cap
+        // discipline as pouch/pack — hand-edited saves + a drifted apply
+        // path can grow it past the 4-slot intent.
+        let mut schema = WorldSchema::default();
+        for i in 0..20 {
+            schema.player_state.belt.push(crate::equipment::StackItem {
+                name: format!("belt-item-{i:02}"),
+                qty: 1,
+                ..Default::default()
+            });
+        }
+        let rendered = schema.render_for_prompt();
+        assert!(rendered.contains("belt:"), "belt line missing");
+        assert!(rendered.contains("belt-item-00"), "first (oldest) item missing");
+        assert!(rendered.contains("belt-item-15"), "16th item missing");
+        assert!(!rendered.contains("belt-item-16"), "17th item must not render");
+        assert!(rendered.contains("(+4 more)"), "overflow marker missing");
+    }
+
+    #[test]
+    fn entity_delete_prunes_its_order_slot() {
+        // (2026-08-24 review fix) A deleted entity must take its
+        // entity_order slot with it — the stale slot both bloated the
+        // deque under churn and aged a re-inserted key forward of its true
+        // first-insert position.
+        let mut s = WorldSchema::default();
+        let delta = |pairs: &[(&str, Option<&str>)]| crate::schema::SchemaDelta {
+            summary: None,
+            recent_events: None,
+            entities: Some(
+                pairs
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.to_string(),
+                            v.map(|val| serde_json::Value::String(val.to_string())),
+                        )
+                    })
+                    .collect(),
+            ),
+        };
+        s.apply_delta(delta(&[
+            ("npc.marcus", Some("the blacksmith")),
+            ("npc.rival", Some("the rival")),
+            ("weather", Some("clear")),
+        ]));
+        assert_eq!(s.entity_order.len(), 3);
+        // Delete through the delta's null arm.
+        s.apply_delta(delta(&[("npc.rival", None)]));
+        assert!(!s.entities.contains_key("npc.rival"));
+        assert_eq!(
+            s.entity_order.len(),
+            2,
+            "the stale slot must die with the entity: {:?}",
+            s.entity_order
+        );
+        // Re-insert: the key gets exactly ONE slot, at the TAIL (true
+        // first-insert order for the new life of the key).
+        s.apply_delta(delta(&[("npc.rival", Some("returned"))]));
+        assert_eq!(
+            s.entity_order.iter().filter(|k| k.as_str() == "npc.rival").count(),
+            1,
+            "re-insertion must not double-slot the key"
+        );
+        assert_eq!(s.entity_order.back().map(String::as_str), Some("npc.rival"));
     }
 
     /// Player state (Seam #7) renders as a `player_state:` block at the
@@ -4800,126 +5881,6 @@ mod tests {
         assert!(loaded.entities.is_empty());
     }
 
-    #[test]
-    fn load_split_drops_legacy_body_part_keys() {
-        // 2026-08-07 clean-delete safety net. A pre-reorg player.json carries
-        // the deleted 16-part keys (Torso, LeftBicep, LeftThigh, LeftAnkle, …)
-        // alongside — in principle — the new 22-part keys. The load seam MUST
-        // drop the dead keys before deserializing, else serde errors on the
-        // unknown variant. After load: the known key survived at its severity,
-        // the dead keys vanished (no panic, no remap), and the body has exactly
-        // the entries the save carried for live parts.
-        use crate::player_state::{BodyPart, BodyPartState};
-        let dir = std::env::temp_dir();
-        let world = dir.join("wupi_loadsplit_drop_world.json");
-        let player = dir.join("wupi_loadsplit_drop_player.json");
-        let npc = dir.join("wupi_loadsplit_drop_npc.json");
-        for p in [&world, &player, &npc] {
-            let _ = std::fs::remove_file(p);
-        }
-        // world.json + npc.json empty; player.json carries a mix of live +
-        // dead body keys.
-        let legacy_player = r#"{
-            "player_state": {
-                "body": {
-                    "LeftUpperArm": "Orange",
-                    "Torso": "Red",
-                    "LeftBicep": "Red",
-                    "LeftThigh": "Purple",
-                    "LeftAnkle": "Yellow"
-                },
-                "stamina": "Winded"
-            }
-        }"#;
-        std::fs::write(&player, legacy_player).unwrap();
-        std::fs::write(&world, "{}").unwrap();
-        std::fs::write(&npc, "{}").unwrap();
-
-        let schema = WorldSchema::load_split(&world, &player, &npc).unwrap();
-        // The one live key survived at its severity.
-        assert_eq!(
-            schema.player_state.body.get(&BodyPart::LeftUpperArm).copied(),
-            Some(BodyPartState::Orange),
-        );
-        // Stamina came through too (the filter only touched `body`).
-        assert_eq!(
-            schema.player_state.stamina,
-            crate::player_state::Stamina::Winded,
-        );
-        // The body map has EXACTLY one entry — the four dead keys were
-        // dropped, not remapped onto new parts.
-        assert_eq!(schema.player_state.body.len(), 1);
-        for p in [&world, &player, &npc] {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-
-    /// (2026-08-18 clothing-as-inventory ruling) A pre-ruling player.json
-    /// carries the comma-joined `outfit` appearance delta; load_split
-    /// converts it into typed inventory items (garments routed to their body
-    /// slots) and REMOVES the delta — one-shot, so a second load is a no-op
-    /// and a mid-save already-tracked garment never mints a twin.
-    #[test]
-    fn load_split_migrates_outfit_delta_to_inventory() {
-        use crate::equipment::{EquipSlot, ItemTag};
-        let dir = std::env::temp_dir();
-        let world = dir.join("wupi_outfit_mig_world.json");
-        let player = dir.join("wupi_outfit_mig_player.json");
-        let npc = dir.join("wupi_outfit_mig_npc.json");
-        for p in [&world, &player, &npc] {
-            let _ = std::fs::remove_file(p);
-        }
-        // Mixed-era save: the cloak is ALREADY a tracked chest item while the
-        // legacy outfit line still names it (plus two untracked garments).
-        let legacy_player = r#"{
-            "player_state": {
-                "current_appearance_deltas": {
-                    "outfit": "travel cloak, linen dress, leather boots",
-                    "hair_color": "raven black"
-                },
-                "equipment": {
-                    "chest": {
-                        "outer": { "name": "Travel Cloak", "tags": ["equippable"] }
-                    }
-                }
-            }
-        }"#;
-        std::fs::write(&player, legacy_player).unwrap();
-        std::fs::write(&world, "{}").unwrap();
-        std::fs::write(&npc, "{}").unwrap();
-
-        let schema = WorldSchema::load_split(&world, &player, &npc).unwrap();
-        let ps = &schema.player_state;
-        // The delta is gone (other appearance keys survive)...
-        assert!(!ps.current_appearance_deltas.contains_key("outfit"));
-        assert_eq!(
-            ps.current_appearance_deltas.get("hair_color").map(String::as_str),
-            Some("raven black")
-        );
-        // ...the already-tracked cloak did not twin...
-        let chest = ps.equipment.get(&EquipSlot::Chest).expect("chest present");
-        assert_eq!(chest.outer.as_ref().unwrap().name, "Travel Cloak");
-        // ...the dress layers Inner under the existing cloak, boots take Feet.
-        assert_eq!(chest.inner.as_ref().unwrap().name, "Linen Dress");
-        assert_eq!(
-            ps.equipment.get(&EquipSlot::Feet).and_then(|l| l.outer.as_ref()).map(|i| i.name.clone()),
-            Some("Leather Boots".to_string())
-        );
-        assert!(chest.inner.as_ref().unwrap().tags.contains(&ItemTag::Equippable));
-        // Nothing spilled to the pack in this fixture.
-        assert!(ps.pack.is_empty());
-
-        // Round-trip: the migrated state persists (no outfit delta to re-migrate).
-        schema.save_split(&world, &player, &npc).unwrap();
-        let reloaded = WorldSchema::load_split(&world, &player, &npc).unwrap();
-        assert!(!reloaded.player_state.current_appearance_deltas.contains_key("outfit"));
-        assert!(reloaded.player_state.equipment.contains_key(&EquipSlot::Feet));
-
-        for p in [&world, &player, &npc] {
-            let _ = std::fs::remove_file(p);
-        }
-    }
-
     /// (2026-08-16 deferred-3) The split trio's generation stamps: all three
     /// files carry the SAME stamp, the counter advances monotonically across
     /// saves, a mixed-generation trio is REFUSED (the crash-between-renames
@@ -4966,6 +5927,32 @@ mod tests {
         let legacy = WorldSchema::load_split(&world, &player, &npc).unwrap();
         assert_eq!(legacy.split_gen, 0);
 
+        for p in [&world, &player, &npc] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// A parseable-but-NON-object slice (e.g. a hand-edited `[]`) refuses
+    /// the load — the same refuse-don't-reset contract as the `entities`
+    /// guard. The old silent `continue` loaded an all-defaults schema and
+    /// the next autosave permanently overwrote the file.
+    #[test]
+    fn load_split_refuses_non_object_slice() {
+        let dir = std::env::temp_dir();
+        let world = dir.join("wupi_splitnonobj_world.json");
+        let player = dir.join("wupi_splitnonobj_player.json");
+        let npc = dir.join("wupi_splitnonobj_npc.json");
+        let mut schema = WorldSchema::default();
+        schema.summary = "kept".into();
+        schema.save_split(&world, &player, &npc).unwrap();
+        // Clobber ONE slice with a valid-JSON array.
+        std::fs::write(&player, "[]").unwrap();
+        let err = WorldSchema::load_split(&world, &player, &npc).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("not an object"),
+            "error explains the refusal: {err}"
+        );
         for p in [&world, &player, &npc] {
             let _ = std::fs::remove_file(p);
         }
@@ -5442,6 +6429,109 @@ mod tests {
         assert_eq!(g.resolve_or_mint_node("brand new place", &[]), None, "cap refuses new nodes");
     }
 
+    // ---- (2026-08-24 fix) garbage-identifier guard ----
+
+    #[test]
+    fn is_garbage_identifier_rejects_sentinels_and_numerals() {
+        // JS/JSON leakage sentinels, any case.
+        for bad in ["undefined", "UNDEFINED", "null", "None", "NaN", "true", "false"] {
+            assert!(is_garbage_identifier(bad), "{bad:?} is garbage");
+        }
+        // No alphabetic chars at all: bare numerals + punctuation soup.
+        for bad in ["1", "42", "007", "12345", "!!!", " - ", "?"] {
+            assert!(is_garbage_identifier(bad), "{bad:?} is garbage");
+        }
+        // Trimmed-empty.
+        assert!(is_garbage_identifier(""), "empty is garbage");
+        assert!(is_garbage_identifier("   "), "whitespace-only is garbage");
+    }
+
+    #[test]
+    fn is_garbage_identifier_passes_real_names() {
+        for good in [
+            "liam", "iron-forge", "Portsedge", "market_square", "greywater",
+            "Marra", "港口", "Chloé",
+        ] {
+            assert!(!is_garbage_identifier(good), "{good:?} is a real id");
+        }
+        // Mixed but letter-bearing tokens are real (numbers + letters).
+        assert!(!is_garbage_identifier("district9"), "letters present → real");
+        assert!(!is_garbage_identifier("area_2b"), "letters present → real");
+    }
+
+    /// (2026-08-26 location-hygiene ruling) Parentheses never appear in a
+    /// location — the live repro was a wizard-drafted `<location>` of
+    /// "Earth (variable by scene)" seeding exactly that as the node label.
+    #[test]
+    fn clean_location_label_strips_parenthetical_qualifiers() {
+        assert_eq!(clean_location_label("Earth (variable by scene)"), "Earth");
+        assert_eq!(clean_location_label("Earth"), "Earth", "clean input is idempotent");
+        assert_eq!(
+            clean_location_label("Warehouse (docks) District"),
+            "Warehouse District",
+            "a closed run reads as a word break"
+        );
+        assert_eq!(
+            clean_location_label("A ((nested) run) tail"),
+            "A tail",
+            "nested runs strip whole"
+        );
+        assert_eq!(clean_location_label("Earth (old"), "Earth", "dangling opener strips to end");
+        assert_eq!(clean_location_label("Earth) split"), "Earth split", "stray closer becomes a space");
+        assert_eq!(
+            clean_location_label("  spaced   out  "),
+            "spaced out",
+            "whitespace runs collapse"
+        );
+        assert_eq!(clean_location_label("(everything)"), "", "caller keeps the original on empty");
+    }
+
+    /// The mint path derives BOTH the diegetic name and the slug id from the
+    /// CLEANED label — "the warehouse (docks)" mints id `warehouse`.
+    #[test]
+    fn resolve_or_mint_cleans_parenthesized_mint_names() {
+        let mut g = sample_travel_graph();
+        let id = g
+            .resolve_or_mint_node("the warehouse (docks)", &[])
+            .expect("parenthesized destination mints");
+        let node = g.find_node(&id).expect("minted node exists");
+        assert_eq!(node.name, "the warehouse");
+        assert!(!id.contains("dock"), "the id derives from the cleaned name: {id}");
+    }
+
+    /// The v0.30.0 live-test repro shape: garbage TRAVEL destinations never
+    /// mint — the reject arm teaches instead of growing a phantom node.
+    #[test]
+    fn resolve_or_mint_never_mints_garbage_destinations() {
+        let mut g = sample_travel_graph();
+        let before = g.nodes.len();
+        for bad in ["undefined", "null", "1", "42", "!!!", "NaN"] {
+            assert_eq!(
+                g.resolve_or_mint_node(bad, &[]),
+                None,
+                "garbage destination {bad:?} must never mint or resolve"
+            );
+        }
+        assert_eq!(g.nodes.len(), before, "no phantom nodes were minted");
+    }
+
+    /// The happy twin: a fresh graph + a real destination mints + the caller
+    /// (the [TRAVEL] applier's fall-through arm) assigns current_node —
+    /// the never-None regression the live test flagged.
+    #[test]
+    fn fresh_graph_travel_mints_and_assigns_current_node() {
+        let mut g = TravelGraph::default();
+        assert!(!g.is_set());
+        let id = g
+            .resolve_or_mint_node("Portsedge", &[])
+            .expect("real destination mints on a fresh graph");
+        assert_eq!(id, "portsedge");
+        assert!(g.find_node(&id).is_some(), "the minted node exists");
+        // The applier's fall-through arm (first-move-from-None):
+        g.current_node = Some(id.clone());
+        assert_eq!(g.current_node.as_deref(), Some("portsedge"));
+    }
+
     // ---- Recommendation 2 (2026-08-17): travel fragment alias + proper-noun mint naming ----
 
     #[test]
@@ -5686,6 +6776,103 @@ mod tests {
         assert!(similarity("mrket_square", "market_square") >= 0.75, "single dropped char resolves");
         assert!(similarity("king_s_road", "market_square") < 0.75, "different place mints");
         assert_eq!(similarity("", "anything"), 0.0);
+    }
+
+    // ---- (2026-08-23 Playground) near-name resolution ----
+
+    fn near_registry() -> NpcRegistry {
+        let mut reg = NpcRegistry::default();
+        reg.entries.push(NpcEntry {
+            id: "kira".into(),
+            name: "Kira".into(),
+            role: "the herbalist".into(),
+            aliases: vec!["kira".into(), "the herbalist".into()],
+            prominence: NpcProminence::Named,
+            tier: None,
+        });
+        reg.entries.push(NpcEntry {
+            id: "brannoc".into(),
+            name: "Brannoc".into(),
+            role: String::new(),
+            aliases: vec!["brannoc".into()],
+            prominence: NpcProminence::Named,
+            tier: None,
+        });
+        reg
+    }
+
+    #[test]
+    fn near_name_kira_kyra_kiera_family() {
+        let reg = near_registry();
+        // Kyra vs Kira: both 4 chars (short threshold 1), one substitution
+        // → distance 1 → collides.
+        let hits = near_name_candidates("Kyra", &reg);
+        assert!(hits.iter().any(|(id, _, d)| id == "kira" && *d == 1), "{hits:?}");
+        // Kiera vs Kira: long threshold (Kiera is 5 chars, ≤2 allowed), one
+        // deletion → distance 1 → collides.
+        let hits = near_name_candidates("Kiera", &reg);
+        assert!(hits.iter().any(|(id, _, d)| id == "kira" && *d == 1), "{hits:?}");
+        // The LONG threshold in action: "Kiroc" vs "Kira" is exactly 2
+        // edits (delete o, sub c→a) — allowed because Kiroc is ≥5 chars;
+        // the short threshold (≤1) would refuse it. The same query stays 3
+        // from "Kiara" → never a candidate.
+        let mut with_kiara = near_registry();
+        with_kiara.entries.push(NpcEntry {
+            id: "kiara".into(),
+            name: "Kiara".into(),
+            ..Default::default()
+        });
+        let hits = near_name_candidates("Kiroc", &with_kiara);
+        assert!(
+            hits.iter().any(|(id, _, d)| id == "kira" && *d == 2),
+            "2-away on a ≥5-char name collides: {hits:?}"
+        );
+        assert!(
+            !hits.iter().any(|(id, _, _)| id == "kiara"),
+            "3-away never collides: {hits:?}"
+        );
+        // The alias surface counts too ("the herbalist" vs "the herbilist").
+        let hits = near_name_candidates("the herbilist", &reg);
+        assert!(hits.iter().any(|(id, _, _)| id == "kira"), "{hits:?}");
+        // Exact-normalized always: case + punctuation fold to distance 0.
+        let hits = near_name_candidates("KIRA!", &reg);
+        assert!(hits.iter().any(|(id, _, d)| id == "kira" && *d == 0), "{hits:?}");
+    }
+
+    #[test]
+    fn near_name_benign_pairs_stay_clean() {
+        let reg = near_registry();
+        // A genuinely different name finds nothing.
+        assert!(near_name_candidates("Marcus", &reg).is_empty());
+        assert!(near_name_candidates("Jo", &reg).is_empty());
+        // Two edits on a short pair is a different word (threshold 1):
+        // "Ko" vs "Jo" is one substitution (collides); "Ba" vs "Jo" is two
+        // (never collides).
+        let mut reg2 = NpcRegistry::default();
+        reg2.entries.push(NpcEntry {
+            id: "jo".into(),
+            name: "Jo".into(),
+            ..Default::default()
+        });
+        assert!(near_name_candidates("Ko", &reg2)
+            .iter()
+            .any(|(id, _, d)| id == "jo" && *d == 1));
+        assert!(near_name_candidates("Ba", &reg2).is_empty(), "distance 2 on a short pair is a different name");
+        // Empty / punctuation-only queries never match.
+        assert!(near_name_candidates("", &reg).is_empty());
+        assert!(near_name_candidates("!!!", &reg).is_empty());
+    }
+
+    #[test]
+    fn near_name_collision_guard_decision() {
+        // The live [NPC_REGISTER] guard's core: the closest OTHER entry.
+        let reg = near_registry();
+        let hit = near_name_collision("Kyra", &reg, "kyra_new");
+        assert_eq!(hit.as_ref().map(|(id, _, d)| (id.as_str(), *d)), Some(("kira", 1)));
+        // Re-registering the same id never self-collides.
+        assert!(near_name_collision("Kira", &reg, "kira").is_none());
+        // A genuinely new name is clean — registration proceeds untouched.
+        assert!(near_name_collision("Marcus", &reg, "marcus").is_none());
     }
 
     // ---- P1d (2026-08-17 E4B shakedown): TIME clamp + calendar coupling ----
@@ -6556,7 +7743,7 @@ mod tests {
 
     /// Prime-Mandate pin: the schema-engine prompt serializer carries ONLY
     /// the diff-relevant fields — `npc_interior` (like every referee-owned
-    /// collection) must never ride the 2048-token delta/translation/
+    /// collection) must never ride the delta/translation/
     /// progression prompts. A future "serialize the whole struct" regression
     /// reintroduces the 5-10× prompt bloat the 2026-08-16 audit H2 killed.
     #[test]
@@ -7042,7 +8229,17 @@ mod tests {
             description: "return the horse".into(),
             deadline_minutes: 2_000,
             accepted_at_minutes: 1_000,
+            ..Default::default()
         }];
+        // (2026-08-22 living-world) Quests + the rested anchor ride the
+        // WORLD slice by omission (player+world facing, not giver-keyed).
+        s.quests = vec![Quest {
+            id: "slay-warband".into(),
+            giver: "mara".into(),
+            title: "Slay the Warband".into(),
+            ..Default::default()
+        }];
+        s.last_rest_minutes = 1_200;
         // (2026-08-20 Economy) Properties ride the WORLD slice by omission
         // (never removed into the player/npc partitions).
         s.properties.insert(
@@ -7062,6 +8259,11 @@ mod tests {
         assert!(world_json.get("site_maps").is_some(), "site maps ride the world slice");
         assert!(world_json.get("promises").is_none(), "promises never ride the world slice");
         assert!(world_json.get("properties").is_some(), "properties ride the world slice");
+        assert!(world_json.get("quests").is_some(), "quests ride the world slice");
+        assert!(
+            world_json.get("last_rest_minutes").is_some(),
+            "the rested anchor rides the world slice"
+        );
         let player_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&player_p).expect("player file"))
                 .expect("player json");
@@ -7074,12 +8276,137 @@ mod tests {
         let loaded = WorldSchema::load_split(&world_p, &player_p, &npc_p).expect("load_split");
         assert!(loaded.site_maps.contains_key("warren"), "site maps round-trip");
         assert_eq!(loaded.promises.len(), 1, "promises round-trip");
+        assert_eq!(loaded.quests.len(), 1, "quests round-trip");
+        assert_eq!(loaded.last_rest_minutes, 1_200, "rested anchor round-trips");
         assert_eq!(
             loaded.properties.get("forge").map(|p| p.treasury_balance),
             Some(40),
             "properties round-trip"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (2026-08-22 living-world) The `quests:` + `rested:` render lines:
+    /// dormant when empty (zero-token invariant), bounded + banded when
+    /// live, and the overdue band surfaces only past the deadline.
+    #[test]
+    fn render_carries_quests_and_rested_lines() {
+        let mut s = WorldSchema::default();
+        // Dormant: no quests, no anchor → neither line renders.
+        let rendered = s.render_for_prompt();
+        assert!(!rendered.contains("quests:"), "quests dormant when empty");
+        assert!(!rendered.contains("rested:"), "rested dormant without an anchor");
+
+        // Clock + anchor set: the rested line renders with hours; a healthy
+        // delta carries no band, a weary one does.
+        s.world_clock.current_minutes = 30 * 60; // Day 2 06:00
+        s.last_rest_minutes = 16 * 60; // 14h since rest → no band
+        let rendered = s.render_for_prompt();
+        assert!(rendered.contains("rested: 14h since last rest\n"), "{rendered}");
+        assert!(!rendered.contains("weary"));
+        s.last_rest_minutes = 5 * 60; // 25h since rest → exhausted band
+        let rendered = s.render_for_prompt();
+        assert!(
+            rendered.contains("rested: 25h since last rest — exhausted\n"),
+            "{rendered}"
+        );
+        // 20h delta → weary.
+        s.last_rest_minutes = 10 * 60;
+        let rendered = s.render_for_prompt();
+        assert!(rendered.contains("rested: 20h since last rest — weary\n"), "{rendered}");
+
+        // Quests: counter + done-flag objectives, the giver's registry name,
+        // the overdue band, the render cap + (+N more).
+        s.quests = (0..MAX_QUESTS + 2)
+            .map(|i| Quest {
+                id: format!("quest-{i}"),
+                giver: if i == 0 { "player".into() } else { "mara".into() },
+                title: format!("Thread {i} of the conspiracy"),
+                objectives: vec![
+                    QuestObjective { text: "cull the wolves".into(), cur: 3, total: 6, ..Default::default() },
+                    QuestObjective { text: "burn the shrine".into(), done: true, ..Default::default() },
+                ],
+                reward: "30 silver".into(),
+                deadline_minutes: if i == 1 { 20 * 60 } else { 0 },
+                accepted_at_minutes: 10 * 60,
+                ..Default::default()
+            })
+            .collect();
+        s.npc_registry = NpcRegistry {
+            entries: vec![NpcEntry {
+                id: "mara".into(),
+                name: "Mara".into(),
+                ..Default::default()
+            }],
+        };
+        let rendered = s.render_for_prompt();
+        assert!(rendered.contains("quests: "), "{rendered}");
+        assert!(rendered.contains("3/6 cull the wolves"), "{rendered}");
+        assert!(rendered.contains("✓ burn the shrine"), "{rendered}");
+        assert!(rendered.contains("reward: 30 silver"), "{rendered}");
+        assert!(rendered.contains("(self)"), "player-giver renders as self");
+        assert!(rendered.contains("(Mara, "), "overdue quest carries the giver band");
+        assert!(rendered.contains("(+5 more)"), "render cap 5 + marker");
+        // Cap discipline (hand-edited backstop).
+        let mut capped = s.clone();
+        capped.enforce_typed_caps();
+        assert_eq!(capped.quests.len(), MAX_QUESTS);
+        assert_eq!(capped.quests[0].id, "quest-2", "FIFO drops the oldest");
+    }
+
+    /// (2026-08-22 living-world) The quest deadline curve: the promise
+    /// frustration math applied to quests, with the player-giver + no-
+    /// deadline exemptions.
+    #[test]
+    fn quest_deadline_frustration_exemptions_and_curve() {
+        let player_quest = Quest {
+            giver: "player".into(),
+            deadline_minutes: 100,
+            accepted_at_minutes: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            quest_deadline_frustration(&player_quest, None, 500),
+            f64::NEG_INFINITY,
+            "self-imposed goals are never penalized"
+        );
+        let no_deadline = Quest { giver: "mara".into(), ..Default::default() };
+        assert_eq!(quest_deadline_frustration(&no_deadline, None, 500), f64::NEG_INFINITY);
+        // 50% overrun at coeff 1.0 → +0.5 (the pinned promise vector).
+        let overdue = Quest {
+            giver: "mara".into(),
+            deadline_minutes: 100,
+            accepted_at_minutes: 0,
+            ..Default::default()
+        };
+        let score = quest_deadline_frustration(&overdue, None, 150);
+        assert!((score - 0.5).abs() < 1e-9, "{score}");
+        // A volatile giver (3.0) at the same overrun → +1.5 (auto-fails at
+        // the ≥1.0 threshold; a patient one (0.4) does not yet).
+        assert!(quest_deadline_frustration(&overdue, Some(3.0), 150) >= 1.0);
+        assert!(quest_deadline_frustration(&overdue, Some(0.4), 150) < 1.0);
+    }
+
+    /// (2026-08-22 living-world) The rest curves: recovery steps by rest
+    /// length + the fatigue band boundaries.
+    #[test]
+    fn rest_curves_pin_boundaries() {
+        assert_eq!(rest_recovery_steps(0), 0, "a breather recovers nothing");
+        assert_eq!(rest_recovery_steps(1), 1);
+        assert_eq!(rest_recovery_steps(3), 1);
+        assert_eq!(rest_recovery_steps(4), 2);
+        assert_eq!(rest_recovery_steps(7), 2);
+        assert_eq!(rest_recovery_steps(8), 4, "a full night recovers everything");
+        assert_eq!(rest_recovery_steps(12), 4);
+        assert_eq!(rested_band(16 * 60), None);
+        assert_eq!(rested_band(16 * 60 + 1), Some("weary"));
+        assert_eq!(rested_band(24 * 60), Some("weary"));
+        assert_eq!(rested_band(24 * 60 + 1), Some("exhausted"));
+        // The objective upsert key: spacing/case insensitive.
+        assert_eq!(
+            normalize_quest_objective_key("  Cull   the Wolves "),
+            normalize_quest_objective_key("cull the wolves")
+        );
     }
 
     /// (2026-08-19) The three new render lines: `site:` only for the CURRENT
@@ -7112,6 +8439,7 @@ mod tests {
             // Halfway at coeff 1.0 → −0.5 → "Very Pleased"
             deadline_minutes: 2_000,
             accepted_at_minutes: 1_000,
+            ..Default::default()
         }];
         let mut map = crate::site_map::SiteMap::default();
         map.node_id = "warren".into();
@@ -7171,6 +8499,7 @@ mod tests {
                 description: format!("obligation {i}"),
                 deadline_minutes: 100 + i as i64,
                 accepted_at_minutes: 0,
+                ..Default::default()
             });
         }
         s.enforce_typed_caps();

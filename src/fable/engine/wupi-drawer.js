@@ -34,6 +34,7 @@
 import { invoke, Channel } from '@tauri-apps/api/core';
 import * as savesIo from './saves-io.js';
 import { resetTabRail } from './tab-rail.js';
+import { wireLineLockedInput } from './input-lines.js';
 
 let drawerEl = null;
 let messagesEl = null;
@@ -43,14 +44,30 @@ let activeToolChip = null; // tool-call status chip (Phase 5), null between turn
 let generating = false;    // tracks whether a chat_send turn is in flight
 let open = false;
 let locked = false;        // LOCK state: when true, mouseleave does NOT auto-close
+// (2026-08-25 stuck-screen fix) The post-open input focus timer, OWNED so
+// closeDrawer/resetWupiDrawer can cancel it. The bare setTimeout used to
+// OUTLIVE any close that landed inside its 320ms window — a fast swipe-off
+// right after the drawer opens, or the blur-path close stage.js's
+// dismissStaleEdgeLocks runs on alt-tab. The focus then fired on the
+// PARKED drawer's input (the closed drawer sits at translateX(100%), fully
+// past the right edge), and the engine's focus-scroll-into-view scrolled
+// the nearest scrollable ancestor — #fable, whose overflow:hidden still
+// makes it a PROGRAMMATIC scroll container — hard right to reveal it.
+// Nothing ever scrolled back: the whole stage sat shifted left with the
+// parked drawer posing as "stuck open" while its JS state said CLOSED
+// (so Esc + mouseleave had nothing to close), and the left-edge hover
+// strip — the only way to summon the left drawer — sat off-screen. Only
+// leaving the game rebuilt the DOM + reset the scroll. The LEFT drawer
+// can never trigger this: it parks at translateX(-100%), and an LTR page
+// cannot scroll to a negative scrollLeft.
+let openFocusTimer = null;
 let panelManager = null;   // injected: { summon(focus, entities) }
 let greetingSeeded = false;
-// Edge-lock visibility probe: set by stage.js via setEdgeLockProbe. When the
-// edge lock is visible, auto-close on mouseleave is SUPPRESSED — the user is
-// at the absolute edge trying to click the lock, and moving onto the lock
-// (a separate element on top of the drawer) would otherwise fire mouseleave
-// and yank the drawer + lock away before the click lands (the "phasing" bug).
-let edgeLockVisible = () => false;
+// (2026-08-25 lock redesign) The edgeLockVisible probe + onDrawerMouseLeave
+// are GONE — stage.js now owns auto-close entirely, via a distance check on
+// the stage mousemove (the pointer must clear the drawer's inner edge by
+// DRAWER_CLOSE_GRACE_PX before an unlocked, non-generating drawer closes).
+// The drawer modules expose only isOpen/isLocked/isGenerating for that.
 
 // Chloe 2026-07-27: the WUPI_INTROS greeting array was REMOVED. The drawer
 // now opens EMPTY — the user's first message is the first thing in the
@@ -85,11 +102,16 @@ export function initWupiDrawer(opts) {
     boundCloseBtn = opts.closeBtn;
     opts.form && opts.form.addEventListener('submit', onFormSubmit);
     boundForm = opts.form;
-    inputEl && inputEl.addEventListener('input', onInputGrow);
     inputEl && inputEl.addEventListener('keydown', onInputKeydown);
+    // Line-locked grow/scroll (2026-08-24): replaces the old scrollHeight
+    // dance — 3 whole 22px lines max, one line per wheel click, no slivers.
+    if (inputEl) unwireLineLock = wireLineLockedInput(inputEl, 3) || null;
     boundInput = inputEl;
   }
 }
+
+// Teardown for the line-lock wiring handed back by wireLineLockedInput.
+let unwireLineLock = null;
 
 // Named handlers (so they can be removed if the elements ever change) +
 // refs to the currently-bound elements (so initWupiDrawer can no-op on a
@@ -104,7 +126,8 @@ function onFormSubmit(e) {
   const text = inputEl.value.trim();
   if (!text) return;
   inputEl.value = '';
-  inputEl.style.height = 'auto';
+  // Drive the line-lock grower's reset (height → 1 line, scroll → 0).
+  inputEl.dispatchEvent(new Event('input', { bubbles: true }));
   sendWupiTurn(text);
 }
 // Enter does double duty (2026-07-27, no send button): on a non-empty field
@@ -120,16 +143,14 @@ function onInputKeydown(e) {
   }
   boundForm && boundForm.requestSubmit();
 }
-function onInputGrow() { autoGrow(inputEl); }
-
 // Remove the drawer's element listeners. Only needed defensively (same-
 // element re-init is already short-circuited); called if initWupiDrawer is
 // ever handed DIFFERENT elements than last time.
 function unbindDrawer() {
   if (boundCloseBtn) { boundCloseBtn.removeEventListener('click', closeDrawer); boundCloseBtn = null; }
   if (boundForm) { boundForm.removeEventListener('submit', onFormSubmit); boundForm = null; }
+  if (unwireLineLock) { unwireLineLock(); unwireLineLock = null; }
   if (boundInput) {
-    boundInput.removeEventListener('input', onInputGrow);
     boundInput.removeEventListener('keydown', onInputKeydown);
     boundInput = null;
   }
@@ -177,40 +198,48 @@ export function openDrawer() {
   // No greeting/intro seeded (2026-07-27): the drawer opens empty so the
   // user's first message is the first thing in the panel. `greetingSeeded`
   // is retained as a no-op flag for reset-bookkeeping only.
-  setTimeout(() => inputEl && inputEl.focus(), 320);
+  // (2026-08-25) The delayed focus is OWNED (closeDrawer cancels it) and
+  // lands with preventScroll — focusing the drawer's input must NEVER let
+  // the engine scroll anything to "reveal" it (see openFocusTimer's decl
+  // for the stuck-screen bug this closes).
+  if (openFocusTimer) clearTimeout(openFocusTimer);
+  openFocusTimer = setTimeout(() => {
+    openFocusTimer = null;
+    inputEl && inputEl.focus({ preventScroll: true });
+  }, 320);
 }
 
 export function closeDrawer() {
   if (!drawerEl) return;
   drawerEl.classList.remove('open');
   open = false;
+  // (2026-08-25 v2) An explicit close resets the lock — lock means "stay
+  // open", so once ANY path closes the drawer (Esc, the ✕ button), the tab
+  // must fall back to its resting chevron instead of wearing a padlock on a
+  // closed drawer. Auto-close never fires while locked, so this only
+  // affects deliberate closes.
+  if (locked) { locked = false; drawerEl.classList.remove('locked'); }
+  // (2026-08-25) A close landing inside the 320ms focus window must kill
+  // the pending focus: firing it on the parking drawer's off-screen input
+  // is what scroll-stranded the whole stage (see openFocusTimer's decl).
+  if (openFocusTimer) { clearTimeout(openFocusTimer); openFocusTimer = null; }
   // Collapse any open tab dropdown + deactivate its icon so nothing persists
   // behind the closed drawer (Chloe 2026-08-06: match the left drawer's reset-
   // on-close). Touches ONLY the tab rail — the Wupi chat history (messagesEl)
   // is a separate element + is never cleared here.
   resetTabRail();
+  // (2026-08-25 Chloe) The Playground STAYS ACTIVE behind the closed drawer
+  // — no resetPlayground() here anymore. The wand stays pressed, the strip +
+  // domain panel persist; reopening the drawer shows them exactly as left.
+  // Only the stage teardown (stage.js) collapses the Playground.
 }
 
-// Set the edge-lock visibility probe. stage.js calls this with a fn that
-// returns true when THIS drawer's edge lock is currently visible (mouse at
-// the absolute edge). See onDrawerMouseLeave for why this matters.
-export function setEdgeLockProbe(probe) {
-  edgeLockVisible = typeof probe === 'function' ? probe : () => false;
-}
-
-// Auto-pull-in: when the mouse fully exits the drawer, close it UNLESS:
-//   - locked (the user clicked the lock to pin it open), OR
-//   - generating (don't yank mid-stream), OR
-//   - the edge lock is visible (the user is at the absolute edge, about to
-//     click the lock — moving onto the lock fires this mouseleave, so we
-//     suppress to let the click land. This is the fix for the "phasing"
-//     bug where the drawer + lock vanished the moment you reached for it).
-export function onDrawerMouseLeave() {
-  if (locked) return;
-  if (generating) return;
-  if (edgeLockVisible()) return;
-  closeDrawer();
-}
+// (2026-08-25 lock redesign) setEdgeLockProbe + onDrawerMouseLeave were
+// removed here: stage.js's distance-based auto-close (see the module-state
+// note above) replaced the mouseleave trigger, and the probe it consulted
+// only existed to keep the now-deleted invisible edge-lock bars from
+// "phasing" the drawer away mid-reach. The visible side bars need no
+// suppression — hovering one keeps the pointer inside the drawer's span.
 
 // Hard reset of all module state (Chloe 2026-07-23: the resource-isolation
 // audit, "reset every re-entry"). Called from teardownStage on stage exit so:
@@ -227,20 +256,19 @@ export function resetWupiDrawer() {
   activeBubble = null;
   greetingSeeded = false;
   locked = false;
+  // (2026-08-25) A stage exit inside the 320ms focus window must not leave
+  // the timer armed to focus a stale input after teardown.
+  if (openFocusTimer) { clearTimeout(openFocusTimer); openFocusTimer = null; }
   if (drawerEl) drawerEl.classList.remove('locked');
   if (open && drawerEl) drawerEl.classList.remove('open');
   open = false;
   if (messagesEl) messagesEl.innerHTML = '';
   if (inputEl) {
     inputEl.value = '';
-    inputEl.style.height = 'auto';
+    // Drive the line-lock grower's reset instead of poking height directly.
+    inputEl.dispatchEvent(new Event('input', { bubbles: true }));
     inputEl.placeholder = IDLE_PLACEHOLDER;
   }
-}
-
-function autoGrow(el) {
-  el.style.height = 'auto';
-  el.style.height = Math.min(el.scrollHeight, 120) + 'px';
 }
 
 function esc(s) {
@@ -362,6 +390,19 @@ function handleEvent(msg, originalText) {
     case 'fable_state_query':
       onFableStateQuery(msg.focus, msg.state);
       break;
+    case 'api_fallback':
+      // (2026-08-24 hybrid chat) The API handoff failed and the local model
+      // answered instead — note it on the turn (the voice change is audible).
+      // One-shot chip, left in place like a tool chip; the fallback reply
+      // streams into the bubble right after.
+      if (activeBubble && messagesEl) {
+        const chip = document.createElement('div');
+        chip.className = 'drawer-tool-chip fail';
+        chip.textContent = `⚠ ${msg.message || 'api unreachable — answered locally'}`;
+        messagesEl.insertBefore(chip, activeBubble);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+      }
+      break;
     case 'error':
       finalizeBubble(activeBubble, null);
       addWupiError(msg.message || 'Something went wrong.');
@@ -371,7 +412,14 @@ function handleEvent(msg, originalText) {
       break;
     case 'done':
       if (activeBubble) {
-        finalizeBubble(activeBubble, msg.final_text);
+        // (2026-08-24) A cancelled-before-any-text turn reverts fully on the
+        // backend (done{cancelled:true}) — drop the empty bubble rather than
+        // finalize it. Partial stops still finalize below.
+        if (msg.cancelled && !activeBubble._raw) {
+          activeBubble.remove();
+        } else {
+          finalizeBubble(activeBubble, msg.final_text);
+        }
         activeBubble = null;
       }
       activeToolChip = null;

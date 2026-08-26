@@ -3,6 +3,11 @@ import { listen } from '@tauri-apps/api/event';
 import { getVersion } from '@tauri-apps/api/app';
 import { initFable, launchFable } from './fable/fable.js';
 import { initPrism } from './prism/prism.js';
+// Spellcheck (2026-08-23): the sanctioned custom right-click menu +
+// misspelling underlines for the two written-input zones (#fable +
+// the #chat OS chat). Initialized app-wide below; see the call site.
+import { initSpellcheck } from './fable/engine/spellcheck.js';
+import { wireLineLockedInput } from './fable/engine/input-lines.js';
 // Shell-wide rapid-click / double-launch guard (src/shell-guard.js). Importing
 // it self-registers the capture-phase click/pointerdown swallower on `document`
 // + exposes withShellBusy to wrap the shell-chrome transition entry points
@@ -3576,6 +3581,11 @@ const dropdownMenu = document.getElementById('dropdownMenu');
     const inputEl = document.getElementById('chatInput');
     if (!msgsEl) return;
 
+    // Line-locked input (2026-08-24): 3 whole 21px lines max, one line per
+    // wheel click, no fractional-line slivers — same law as the Fable
+    // composers (the chrome lives on the .chat-input-box wrapper).
+    if (inputEl) wireLineLockedInput(inputEl, 3);
+
     // Tauri v2 Channel for streaming: imported statically at the top of the
     // module, so it's always available (no race with a dynamic import).
     let generating = false;
@@ -3678,6 +3688,8 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       if (!text) return;
 
       inputEl.value = '';
+      // Drive the line-lock grower's reset (height → 1 line, scroll → 0).
+      inputEl.dispatchEvent(new Event('input', { bubbles: true }));
       addUserBubble(text);
 
       const bubble = startWupiBubble();
@@ -3689,8 +3701,9 @@ const dropdownMenu = document.getElementById('dropdownMenu');
       // backend's natural ~30 tok/s speed. The backend's StreamFilter
       // (stream_filter.rs) already strips protocol markers (<|channel|>,
       // <audio|>, etc.) before they reach the DOM, so the visible text is
-      // clean prose live. The .streaming class on the bubble drives the
-      // blinking caret CSS until `done` finalizes it.
+      // clean prose live. The .streaming class stays on the bubble until
+      // `done` finalizes it (state hook only; the blinking block caret was
+      // removed 2026-08-25).
       const channel = new Channel();
       let toolChip = null;  // tool-call status chip, created on first tool_call
       channel.onmessage = (e) => {
@@ -3725,10 +3738,26 @@ const dropdownMenu = document.getElementById('dropdownMenu');
               : `✗ ${e.name || 'tool'}: ${e.output || 'failed'}`;
             scrollBottom();
           }
+        } else if (e.type === 'api_fallback') {
+          // (2026-08-24 hybrid chat) The API handoff failed and the local
+          // model answered instead — note it on the turn.
+          const chip = document.createElement('div');
+          chip.className = 'msg tool-chip fail';
+          chip.textContent = `⚠ ${e.message || 'api unreachable — answered locally'}`;
+          msgsEl.insertBefore(chip, bubble);
+          scrollBottom();
         } else if (e.type === 'done') {
           setGenerating(false);
-          const finalText = e.final_text != null ? e.final_text : streamed;
-          finalizeWupiBubble(bubble, finalText);
+          // (2026-08-24) A cancelled-before-any-text turn reverts fully on
+          // the backend (done{cancelled:true}) — drop the empty bubble
+          // instead of finalizing it as "(no response)". Partial stops
+          // still finalize their streamed text below.
+          if (e.cancelled && !streamed) {
+            bubble.remove();
+          } else {
+            const finalText = e.final_text != null ? e.final_text : streamed;
+            finalizeWupiBubble(bubble, finalText);
+          }
         }
       };
 
@@ -3813,6 +3842,12 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         setGenerating(false);
         invoke('chat_stop').catch((err) => console.warn('[Wupi] chat_stop (close) failed', err));
       }
+      // (2026-08-24) Exiting the chat resets the conversation HISTORY too:
+      // the reopen view is already fresh (loadIntro wipes + re-intros), and
+      // the backend session dies with it so the next sitting starts clean —
+      // the 16-message window spans one sitting, never the process lifetime.
+      // Memory recall (memory.sqlite) is untouched by the backend reset.
+      invoke('chat_reset').catch((err) => console.warn('[Wupi] chat_reset failed', err));
     });
     loadIntro();
   })();
@@ -3835,6 +3870,19 @@ const dropdownMenu = document.getElementById('dropdownMenu');
 //   closeWindow — ref to the OS closeWindow so Fable's own close paths
 //     (the title-screen EXIT button) keep the openWindows set in sync.
 //
+// =============================================================
+// SPELLCHECK (2026-08-23, Chloe) — the ONE sanctioned right-click
+// surface, app-wide. Initializes the document-level delegation
+// (focusin/focusout/contextmenu) + the shell-guard contextmenu
+// pass-through for the two spellcheck zones: every written input
+// inside #fable (brass underlines) and the OS-home Wupi chat input in
+// #chat (purple underlines). Idempotent; the dictionary lazy-loads on
+// the first input focus, so boot pays nothing. Module:
+// src/fable/engine/spellcheck.js (pure logic pinned by
+// tests/spellcheck.test.mjs).
+// =============================================================
+initSpellcheck();
+
 // This is the wiring the Fable UI shell has been waiting on: the source
 // under src/fable/ was complete but initFable() was never called, so the
 // Games home tile was an inert "coming soon" stub. With this call the

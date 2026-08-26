@@ -102,7 +102,20 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     opacity: 0;
     pointer-events: none;
     transition: opacity 420ms ease;
-    overflow: hidden;
+    /* (2026-08-25 stuck-screen fix) clip, NOT hidden: overflow:hidden makes
+       this box a PROGRAMMATIC scroll container, so any focus() on an
+       off-screen descendant — the parked right drawer's chat input, focused
+       by the 320ms post-open timer when a close raced inside its window —
+       made the engine's focus-scroll-into-view set THIS box's scrollLeft,
+       permanently shifting the entire app left to reveal the parked drawer
+       (nothing ever scrolled it back; the "stuck-open" drawer was actually
+       CLOSED in JS, so no close path fired, and the left-edge hover strip
+       sat off-screen). clip paints identically (both axes, padding box) but
+       is NOT a scroll container — the Fable root can never scroll, so this
+       whole bug class is structurally dead. The left drawer is additionally
+       immune by physics: it parks at translateX(-100%), and LTR scrollLeft
+       can never go negative. */
+    overflow: clip;
     /* OVERRIDE the inherited .app-window glass chrome. The OS shell styles
        (.app-window: purple accent border + 18px radius + inset glow) would
        otherwise bleed a magenta frame + rounded-corner gaps around the
@@ -463,16 +476,13 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 }
 /* Translate by exactly one tile period (--tile-w, set by JS = the tile
    width the canvas was stamped with) → seamless infinite loop. Linear so
-   the drift is constant-velocity (wind doesn't ease). */
+   the drift is constant-velocity (wind doesn't ease). (2026-08-24 review
+   fix) The stale fixed `-1200px` duplicate that used to sit below OVERRIDED
+   this variable-driven one (last definition wins) — the canvas snapped
+   back to 0 every 90s mid-pattern instead of looping a full period. */
 @keyframes fableCloudDrift {
     from { transform: translate3d(0, 0, 0); }
     to   { transform: translate3d(calc(var(--tile-w, 1500px) * -1), 0, 0); }
-}
-/* Translate by exactly one tile period (1200px) → seamless infinite loop.
-   Linear so the drift is constant-velocity (wind doesn't ease). */
-@keyframes fableCloudDrift {
-    from { transform: translate3d(0, 0, 0); }
-    to   { transform: translate3d(-1200px, 0, 0); }
 }
 
 /* --- Sparse wind-blown leaves (behind the dim) --- */
@@ -758,6 +768,27 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 .fable-title-btn.primary,
 .fable-title-btn.ghost { /* intentionally empty: uniform wood-sign style */ }
 
+/* (2026-08-24 review fix) Short-window compression. The menu column is
+   absolutely anchored at top:450px and the title screen clips
+   (overflow:hidden) — under ~900px-tall windows the last one or two
+   buttons fell off-screen with no way to reach them (every existing media
+   query in this file is max-WIDTH; there was not a single max-height).
+   Graduated: the anchor rises with the viewport (min(450px, 46vh)) and
+   the buttons + gaps compress in two steps so the whole column always
+   fits inside the fold. */
+@media (max-height: 900px) {
+    .fable-title-actions { top: min(450px, 46vh); gap: 16px; }
+    .fable-title-btn { padding: 18px 26px; font-size: 26px; }
+}
+@media (max-height: 780px) {
+    .fable-title-actions { top: min(450px, 46vh); gap: 12px; }
+    .fable-title-btn { padding: 14px 24px; font-size: 22px; }
+}
+@media (max-height: 660px) {
+    .fable-title-actions { top: min(450px, 44vh); gap: 10px; }
+    .fable-title-btn { padding: 11px 22px; font-size: 19px; }
+}
+
 /* Reduced motion: the title PNG has no animation, so nothing to gate here.
    (The old rule targeted .fable-title-heading, which no longer exists after
    the PNG swap. Removed.) */
@@ -1023,15 +1054,17 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
    void keeps the current transparent-card aesthetic). */
 /* Scoped readability: when a background is active (the .has-bg class is toggled
    on .fable-stage by engine/backgrounds.js#applyBackground), each narrative
-   card's prose block becomes a translucent glass panel so the light text stays
+   card's prose block becomes a translucent dark panel so the light text stays
    legible over any photo. Without this the cards are transparent
    (.fable-mes-block is background:none — fine over the default black void,
    unreadable over a busy photo). Scoped to .has-bg so the void keeps the
-   floating transparent-card look; the panels appear only with a background. */
+   floating transparent-card look; the panels appear only with a background.
+   (2026-08-24 review fix) backdrop-filter: blur(4px) is GONE: the feed keeps
+   50 beats in the DOM, and 50 simultaneous blur layers composited on every
+   scroll/frame was a heavy GPU tax for a soft readability effect — the
+   rgba darkening alone carries the legibility. */
 .fable-stage.has-bg .fable-mes-block {
     background: rgba(2, 4, 10, 0.55);
-    backdrop-filter: blur(4px);
-    -webkit-backdrop-filter: blur(4px);
     border-radius: 12px;
 }
 /* The fx-layer z-index + classes live in fx/fx.css. */
@@ -1069,45 +1102,55 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     width: 100%;
     max-width: 760px;             /* composer narrowed 2026-08-12 per Chloe — no longer flush with the 1040px dialogue column; the input sits centered and narrower than the bubbles above it. Was 1040 (synced to .fable-mes). */
 }
-/* The text box: holds the textarea, flexing to fill the group minus the
-   aid cluster. Chloe 2026-07-27: position: relative so absolutely-
-   positioned affordances resolve against it. */
+/* The text box: holds the textarea, flexing to fill the whole group —
+   the aid cluster OVERLAYS its right end (2026-08-24), it no longer
+   takes a flex slot. Chloe 2026-07-27: position: relative so absolutely-
+   positioned affordances resolve against it.
+   (2026-08-24 line-lock fix) The box now OWNS the vertical inset + the
+   visual chrome (bg/border/radius/sheen/backdrop): its 13px vertical
+   padding sits OUTSIDE the textarea's scroll viewport, so the viewport
+   can be EXACTLY 3 lines (78px) tall. When the chrome lived on the
+   textarea, its vertical padding rode inside the scroll area and the
+   viewport framed 3½ lines — the bottom-cut sliver. */
 .fable-input-box {
     flex: 1 1 auto;
     min-width: 0;
     position: relative;
-}
-.fable-input {
-    width: 100%;
-    box-sizing: border-box;
-    resize: none;
-    /* Explicit height (Chloe 2026-07-26): pins the field's box so the
-       rendering is stable. Right padding 44px (historical: was 18, bumped to
-       reserve room for a since-removed inline button; kept at 44 as a stable
-       no-op — no element floats there now). The BOX SIZE IS UNCHANGED (still
-       54px tall) — only the inner right padding, so the field does not resize
-       (per Chloe's standing instruction). */
-    height: 54px;
-    padding: 13px 18px;
-    /* Symmetric 18px side padding (2026-08-12 per Chloe): the prior 44px right
-       gutter was a no-op reserve for a since-removed inline button — it left a
-       visible gap on the right vs the 18px left. Box height unchanged (54px). */
-    background: rgb(10, 10, 10);                  /* pure black fill 2026-08-12 per Chloe (was rgb(12,12,12) — slightly darker still). */
-    color: var(--fable-text);
-    /* Aged-brass frame restored 2026-08-12 per Chloe — the same brown the
-       icons + chrome use (was iron #5a5f66 for one pass). */
-    border: 1px solid var(--fable-brass-dim);
+    padding: 13px 0;   /* the vertical inset — scroll-free by construction */
+    background: rgb(10, 10, 10);                  /* pure black fill 2026-08-12 per Chloe */
+    border: 1px solid var(--fable-brass-dim);     /* aged-brass frame restored 2026-08-12 */
     border-radius: 10px;
-    font-size: 17px;
-    font-family: inherit;
-    line-height: 26px;    /* whole-px (2026-08-22): 17×1.5=25.5 left fractional line boxes — the autoGrow scroll cut landed mid-line (half of line 4 peeking). 26px keeps every line boundary on a whole pixel. */
-    max-height: 106px;    /* caps auto-grow at 3 lines (2026-08-21 per Chloe, was 77px/2 lines): 3×26 + 26 padding + 2 border. Backstop for the live-metric cap in stage.js::autoGrow. */
-    overflow: hidden;     /* default: no scroll handle, no 4th-line peek. autoGrow flips to `auto` only once content exceeds 3 lines (line-locked internal scroll — the cut always lands on a line boundary). */
     backdrop-filter: blur(8px);
     box-shadow:
         inset 0 1px 0 rgba(232, 201, 138, 0.14),   /* top inner sheen */
         inset 0 0 0 1px rgba(0, 0, 0, 0.25);       /* crisp inner edge */
     transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+/* The chromeless field: height is PURE line math (autoGrow writes 26 /
+   52 / 78). No vertical padding, no border — the scroll viewport is
+   exactly N whole 26px lines, always. */
+.fable-input {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    resize: none;
+    height: 26px;         /* 1 line at rest (26 + the box's 28px chrome = the tuned 54px resting box) */
+    padding: 0 18px;
+    /* Right padding reserves the in-box aid strip (2026-08-24): the pencil +
+       open-book icons (with their thin bronze dividers) overlay the field's
+       right end (see .fable-input-aids), and this 60px gutter keeps typed
+       text + the centered placeholder clear of the glyphs while the box
+       keeps its FULL row width. */
+    padding-right: 60px;
+    background: transparent;
+    border: none;
+    color: var(--fable-text);
+    font-size: 17px;
+    font-family: inherit;
+    line-height: 26px;    /* whole-px (2026-08-22): 17×1.5=25.5 left fractional line boxes — the autoGrow scroll cut landed mid-line (half of line 4 peeking). 26px keeps every line boundary on a whole pixel. */
+    max-height: 78px;     /* EXACTLY 3 lines — the whole-line viewport cap (synced with stage.js::autoGrow). */
+    overflow: hidden;     /* default: no scroll handle, no 4th-line peek. autoGrow flips to `auto` only once content exceeds 3 lines (line-locked internal scroll — the cut always lands on a line boundary). */
+    outline: none;
 }
 /* Placeholder: centered (Chloe 2026-07-26) + italic. Silver gray, darkened
    a touch 2026-08-12 per Chloe (was #b8bcc4). */
@@ -1116,8 +1159,7 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     font-style: italic;
     text-align: center;
 }
-.fable-input:focus {
-    outline: none;
+.fable-input-box:focus-within {
     border-color: var(--fable-brass-bright);   /* bright brass glow on focus — matches the nameplate/WANDERER polish (was --fable-brass) */
     box-shadow:
         inset 0 1px 0 rgba(230, 213, 138, 0.15),   /* sheen softened 2026-08-12 (was 0.22) */
@@ -1168,6 +1210,72 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     50%      { opacity: 1; }
 }
 
+/* --- Jump-to-latest arrow (2026-08-25, Chloe) --- */
+/* A small centered circular down-arrow pinned DIRECTLY above the input box
+   while the feed is scrolled up in history (stage.js toggles .is-visible
+   from the feed's scroll events; click → beats.scrollDown — all the way to
+   the newest beat). Same mounting discipline as the typing indicator:
+   INSIDE the .fable-input-row form + anchored bottom:100%, so it rides the
+   form's top edge whether the field is at rest or auto-grown. While the
+   typing indicator is up (form .has-typing) the arrow rides ABOVE it —
+   the two never overlap. */
+.fable-jump-bottom {
+    position: absolute;
+    left: 50%;
+    bottom: calc(100% + 6px);        /* a breath above the box's top border */
+    width: 34px;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border-radius: 50%;
+    border: 1px solid var(--fable-brass-dim);
+    background: rgba(10, 10, 10, 0.85);
+    backdrop-filter: blur(6px);
+    color: var(--fable-brass-bright, #E6D58A);
+    cursor: pointer;
+    box-shadow:
+        0 4px 14px rgba(0, 0, 0, 0.55),
+        inset 0 1px 0 rgba(232, 201, 138, 0.12);
+    opacity: 0;
+    pointer-events: none;
+    transform: translateX(-50%) translateY(6px);
+    transition:
+        opacity 200ms ease,
+        transform 200ms ease,
+        bottom 200ms ease,
+        border-color 140ms ease,
+        box-shadow 140ms ease;
+    z-index: 26;                     /* above the feed cards it floats over */
+}
+.fable-jump-bottom.is-visible {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateX(-50%) translateY(0);
+}
+.fable-jump-bottom:hover {
+    border-color: var(--fable-brass-bright);
+    box-shadow:
+        0 4px 16px rgba(0, 0, 0, 0.6),
+        0 0 10px var(--fable-brass-glow),
+        inset 0 1px 0 rgba(232, 201, 138, 0.16);
+}
+.fable-jump-bottom:active {
+    transform: translateX(-50%) translateY(1px);
+}
+.fable-jump-bottom svg {
+    width: 18px;
+    height: 18px;
+    display: block;
+    pointer-events: none;
+}
+/* While the typing indicator occupies the flush-above-the-box stratum, the
+   arrow rides above IT (indicator ≈19px tall + its own breath). */
+.fable-input-row.has-typing .fable-jump-bottom {
+    bottom: calc(100% + 34px);
+}
+
 /* API-lost composer lock (2026-08-07 override). When the API narrator dies
    mid-session there's no local fallback: the input greys out + a red glowing
    "API LOST CONNECTION" message takes the placeholder. Enter probes the
@@ -1175,6 +1283,8 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 .fable-input-row.is-api-lost .fable-input {
     opacity: 0.45;
     cursor: not-allowed;
+}
+.fable-input-row.is-api-lost .fable-input-box {
     border-color: rgba(255, 59, 59, 0.55);
     box-shadow:
         inset 0 0 0 1px rgba(0, 0, 0, 0.25),
@@ -1209,21 +1319,33 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
    + symmetric padding untouched — it just yields ~60px to the cluster.
    (The group/box rules above carry the layout; this section owns the
    icons, menus, notice chip, + the Crossroads deck.) */
-/* The icon cluster: the ghost left, the octagon right. position:relative
-   so both aid menus anchor against it (bottom:100%, right-aligned). */
+/* The icon cluster: the pencil left, the open book right (2026-08-24).
+   OVERLAYED inside .fable-input-box (2026-08-24): absolutely pinned to the
+   box's right edge, vertically centered — the field no longer shrinks to
+   make room (the textarea's 66px right padding reserves the strip). The
+   box's position:relative anchors both aid menus (bottom:100%,
+   right-aligned). */
 .fable-input-aids {
-    position: relative;
+    position: absolute;
+    right: 2px;
+    /* (2026-08-24) Centered on the BOX (which owns the 13px insets now), not
+       the old text-area math — the box grows with autoGrow, so the icons ride
+       the middle of the visible field at every height. */
+    top: 50%;
+    transform: translateY(-50%);
     display: flex;
     align-items: center;
-    gap: 6px;
-    flex: 0 0 auto;
+    gap: 0;
+    z-index: 2;
 }
-/* One aid icon: a quiet 26px brass-line button that lights on hover.
+/* One aid icon: a quiet brass-line button that lights on hover.
    Same metallic family as the drawer's foot icons, scaled to the
-   composer. aria-label only — hover tooltips are banned shell-wide. */
+   composer. 30px tile (2026-08-24, was 26) — a slightly bigger, easier
+   hover/click target. aria-label only — hover tooltips are banned
+   shell-wide. */
 .fable-aid-icon {
-    width: 26px;
-    height: 26px;
+    width: 32px;
+    height: 32px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1236,14 +1358,24 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     transition: color 140ms ease, background 140ms ease, box-shadow 140ms ease;
 }
 .fable-aid-icon svg {
-    width: 17px;
-    height: 17px;
+    width: 26px;
+    height: 26px;
     display: block;
 }
+/* Hover (2026-08-24 per Chloe): NO square glow — no background tile, no
+   emboss box-shadow. Only the glyph itself lights (color shift to bright
+   brass); the tile stays invisible. */
+/* The pencil tile leans 2px toward the book (visual-only, same trick as
+   the old divider nudges). */
+.fable-aid-icon[data-ghost-aid] { transform: translateX(6px); }
+/* Press-dip must PRESERVE the lean — the shared :active translateY(1px)
+   replaces the whole transform, so without this the pencil snapped its
+   full 6px lean off on every click. */
+.fable-aid-icon[data-ghost-aid]:active { transform: translateX(6px) translateY(1px); }
+/* Dividers removed (2026-08-24): the book sits 1px off the pencil. */
+.fable-aid-icon[data-crossroads-aid] { margin-left: 1px; }
 .fable-aid-icon:hover {
     color: var(--fable-brass-bright);
-    background: rgba(197, 179, 88, 0.10);
-    box-shadow: var(--fable-emboss);
 }
 .fable-aid-icon:active { transform: translateY(1px); }
 /* API-lost lock: the aids need the narrator API, so they grey with the
@@ -1253,15 +1385,19 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     cursor: default;
 }
 
-/* The shared aid menu: a small dark-glass list that drops in directly
-   above the icon cluster (bottom:100% of the aids). Ghost + Crossroads
-   menus share this chrome; only the item set differs. */
+/* The shared aid menu: a small dark-glass list. Positioning (2026-08-24
+   per Chloe): BOTH menus open at the exact same spot — directly to the
+   RIGHT of the input box, its BOTTOM edge level with the input box's
+   bottom. Anchored against the aids cluster, which is vertically
+   centered in the 54px box (its bottom sits 14px above the box bottom —
+   bottom:-14px squares them up). +17px past the cluster = 8px inset +
+   9px gap from the box edge. Items are UPPERCASE + CENTERED. */
 .fable-aid-menu {
     position: absolute;
-    bottom: calc(100% + 10px);
-    right: 0;
-    min-width: 132px;
-    padding: 5px;
+    bottom: -12px;
+    left: calc(100% + 17px);
+    min-width: 118px;
+    padding: 4px;
     background: var(--fable-glass);
     border: 1px solid var(--fable-brass-dim);
     border-radius: 10px;
@@ -1278,6 +1414,120 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 .fable-aid-menu-item {
     display: block;
     width: 100%;
+    padding: 6px 10px;
+    background: none;
+    border: none;
+    border-radius: 7px;
+    color: var(--fable-text);
+    font-family: inherit;
+    font-size: 17.5px;
+    text-transform: uppercase;
+    text-align: center;
+    cursor: pointer;
+    transition: background 120ms ease, color 120ms ease;
+}
+.fable-aid-menu-item:hover {
+    background: rgba(197, 179, 88, 0.14);
+    color: var(--fable-brass-bright);
+}
+/* (2026-08-25 narrow-window fix) Under ~1070px the right-side opening
+   overhangs the viewport: the composer group caps at 760px and centers,
+   so the menu's right edge sits ≈ W/2 + 537 — and the Fable root is
+   overflow: clip (NOT a scroll container), so the overhang is simply
+   unreachable: no scrollbar, no scroll, half the items gone. Below the
+   breakpoint BOTH menus flip to the LEFT of the aid cluster — the input
+   box's own footprint always has the room (the group never narrows past
+   the menu's width before other chrome collapses), so the flipped menu
+   only ever overlays the composer it belongs to. */
+@media (max-width: 1160px) {
+    .fable-aid-menu {
+        left: auto;
+        right: calc(100% + 17px);
+    }
+}
+
+/* --- Spellcheck (2026-08-23, Chloe) ------------------------------------ */
+/* Two surfaces, both owned by engine/spellcheck.js:
+   (1) the transparent MIRROR OVERLAY — a fixed-position copy of the
+       focused field's text (invisible glyphs) whose only visible pixels
+       are the thin brass underline marks under misspelled words;
+   (2) the custom RIGHT-CLICK MENU — correction candidates with the
+       spellcheck toggle pinned below them. The OS right-click ban stays
+       in force (shell-guard.js); this is the sanctioned replacement
+       surface on Fable's written inputs. Chrome mirrors .fable-aid-menu. */
+
+/* The mirror overlay: painted OVER the field (pointer-transparent), so
+   the field itself keeps fully native caret/selection/scroll. It only
+   exists while its field holds focus — nothing legitimately covers a
+   focused input — so the high z-index cannot ride over a modal. */
+.fable-spell-overlay {
+    position: fixed;
+    margin: 0;
+    pointer-events: none;
+    overflow: hidden;
+    box-sizing: border-box;
+    /* The mirror glyphs are INVISIBLE — the field draws the real text;
+       only the underline marks on .fable-spell-miss show through. */
+    color: transparent;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    word-break: normal;
+    user-select: none;
+    z-index: 9000;
+}
+.fable-spell-overlay-content {
+    width: 100%;
+    /* border-box is LOAD-BEARING (2026-08-24 newline-drift fix): with
+       content-box, width:100% sized the TEXT COLUMN to the full field
+       width and the copied padding was added on top — the mirror column
+       was then (pad-left + pad-right) WIDER than the real field, so its
+       line breaks landed later than the textarea's and underlines spilled
+       past the field's right edge on any wrapped/newline'd text. */
+    box-sizing: border-box;
+    white-space: pre-wrap;
+    overflow-wrap: break-word;
+    word-break: normal;
+    will-change: transform;   /* scroll sync rides a per-frame translate */
+}
+/* The misspelling mark: a very thin aged-brass rule under the word —
+   the proofreader's underline, not a red squiggle. */
+.fable-spell-miss {
+    text-decoration-line: underline;
+    text-decoration-style: solid;
+    text-decoration-color: var(--fable-brass);
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
+}
+/* The OS-chat zone (#chat, outside Fable — 2026-08-23, Chloe): the same
+   thin proofread rule, but in the WUPI purple. Hardcoded #b534fa (the
+   Vibrant magenta-violet brand purple), NOT var(--ui-accent) — the OS
+   themes recolor that var per color code, and the mark is specified
+   purple in every theme. */
+.fable-spell-overlay.is-os .fable-spell-miss {
+    text-decoration-color: #b534fa;
+}
+
+/* The right-click menu: same dark-glass / brass-dim / emboss chrome as
+   the aid menus (Ghost Writer + Crossroads), dropped at the cursor
+   (fixed-position, viewport-clamped in JS). */
+.fable-spell-menu {
+    position: fixed;
+    min-width: 172px;
+    max-width: 280px;
+    padding: 5px;
+    background: var(--fable-glass);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 10px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55), var(--fable-emboss);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    font-family: var(--fable-font-body);
+    z-index: 9100;
+    animation: fableAidMenuIn 130ms ease;
+}
+.fable-spell-menu-item {
+    display: block;
+    width: 100%;
     padding: 8px 12px;
     background: none;
     border: none;
@@ -1285,13 +1535,32 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     color: var(--fable-text);
     font-family: inherit;
     font-size: 14.5px;
-    text-align: left;
+    /* Centered + UPPERCASE (2026-08-24 per Chloe) — same treatment as the
+       Ghost Writer / Crossroads aid menus. */
+    text-transform: uppercase;
+    text-align: center;
     cursor: pointer;
     transition: background 120ms ease, color 120ms ease;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
-.fable-aid-menu-item:hover {
+.fable-spell-menu-item:hover {
     background: rgba(197, 179, 88, 0.14);
     color: var(--fable-brass-bright);
+}
+/* The toggle row pinned all the way down: muted until hovered, so the
+   correction candidates above it read as the primary actions. */
+.fable-spell-menu-item.is-footer {
+    color: var(--fable-text-dim);
+}
+.fable-spell-menu-item.is-footer:hover {
+    color: var(--fable-brass-bright);
+}
+.fable-spell-menu-sep {
+    height: 1px;
+    margin: 4px 8px;
+    background: var(--fable-glass-line);
 }
 
 /* The composer NOTICE chip: one small popup directly above the input bar
@@ -1511,9 +1780,9 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 /* --- Wupi trigger: invisible right-edge hover strip (Phase 1, decision 1).
      No visible button. A WIDER strip (~2 inches) down the right edge; the
      300ms dwell (wired in stage.js) opens the Wupi drawer. The wider zone
-     means the UI pops out from a comfortable distance — the super-thin
-     edge LOCK bar (separate element, .fable-edge-lock) only appears at the
-     absolute edge AFTER the drawer is already open. Symmetric with the
+     means the UI pops out from a comfortable distance — the drawer's TAB
+     (.fable-drawer-tab--right) parks at the absolute edge as its visible
+     tip + arms the same dwell. Symmetric with the
      left-edge stats trigger below. Fully transparent. --- */
 .fable-corner-trigger {
     position: absolute;
@@ -1598,7 +1867,7 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
    LEFT DRAWER — Card / Tracker authoring panel (mirrored to the right
    drawer 2026-08-01). EXACT MIRROR of the right Wupi drawer:
    opened by an invisible left-edge hover strip (.fable-corner-trigger--left,
-   below) + pinned by a left edge-lock bar (.fable-edge-lock--left). The old
+   below) + carrying its own drawer tab (.fable-drawer-tab--left). The old
    always-visible `›` handle was removed — the two drawers behave identically,
    just mirrored. Two tabs across the top switch the panel content.
    ============================================================= */
@@ -2474,23 +2743,31 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     width: clamp(155px, 13vw, 213px);
     /* (2026-08-19 inventory bugfix) FIXED height — the panel NEVER resizes
        with its content: the loading placeholder, the empty state, and the
-       6-button list viewport (header ≈33px + body padding 20px + viewport
-       316px ≈ 370px content + border) all render inside the SAME box, so
+       6-button list (header ≈33px + body padding 20px + scroll wrapper
+       332px ≈ 385px content + border) all render inside the SAME box, so
        adding or removing items can't grow/shrink the popup (it used to jump
        ~70px taller the moment a zone gained its first item — bottom-anchored,
-       so it climbed upward into the gems). max-height (65vh here, the live
-       astrolabe clamp in soul-gem.js inline) still shrinks it on short
-       viewports; the body clips + its internal scroll takes over. */
-    height: 376px;
+       so it climbed upward into the gems).
+       (2026-08-25, Chloe) 376 → 392: the scroll wrapper now includes the
+       track's 8px vertical framing padding so the SIXTH button renders
+       fully (the old 316px viewport clipped its bottom 8px). The panel also
+       GROWS DOWNWARD now — soul-gem.js's stampSlotPosition slides the bottom
+       edge toward the backpack when the resting gap would push the top past
+       the time-UI ceiling, so this height is what shows on every viewport
+       that can physically fit it; max-height (65vh here + the live
+       astrolabe clamp inline in soul-gem.js) only bites on pathological
+       short viewports, where the body clips + its internal scroll takes
+       over. */
+    height: 392px;
     max-height: 65vh;
-    /* Flex column + overflow hidden so when soul-gem.js's
-       clampSlotBelowAstrolabe() caps max-height (to keep the panel below the
-       time bar on short viewports), the body shrinks + its viewport scrolls
-       instead of the content overflowing past the panel's top edge. */
+    /* Flex column + overflow hidden so when the soul-gem.js vertical stamp
+       caps max-height (to keep the panel below the time bar on pathological
+       short viewports), the body shrinks + its viewport scrolls instead of
+       the content overflowing past the panel's top edge. */
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    z-index: 10;                       /* above the paperdoll (7), below the gems (9) */
+    z-index: 8;                        /* above the paperdoll (7), below the gems (9) — the code once said 10, painting the panel over bloomed gems and contradicting this very comment */
     background: rgba(13, 13, 13, 0.92);
     border: 1px solid rgba(212, 175, 55, 0.35);
     border-radius: 10px;
@@ -2551,30 +2828,99 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
    ENCUMBRANCE / LIMITS: intentionally NOT rendered here. The old weight-limit
    UI (0.0 / 20.0 lbs) was ripped out; storage arrays are treated as infinite.
    ─────────────────────────────────────────────────────────────────────── */
-/* The scroll viewport. Its height is set INLINE by inventory-panel.js to
-   exactly 6 × (button height + gap). overflow:hidden so a partial 7th button
-   never peeks — the JS step-scroll owns all vertical motion. */
-.inv-viewport {
-    overflow: hidden;
+/* The scroll scaffold (2026-08-25): a fixed-size WRAPPER owns the inline
+   height (exactly 6 × (button + gap) + the track's 2 × 8px vertical
+   padding — set inline by inventory-panel.js) and is the flex child that
+   shrinks when the slot is max-height-capped; the VIEWPORT fills it
+   absolutely (inset 0) and remains THE SCROLL CONTAINER (the element with
+   bounded height + overflow) — all programmatic scrollTop/scrollTo math in
+   inventory-panel.js still reads the viewport. THE HINTS live in the
+   wrapper, not the viewport: absolutely-positioned children of a scroll
+   container scroll WITH the content, so a hint inside the scroller would
+   ride away on the first step; pinned to the wrapper they stay glued to
+   the list's visible top/bottom edges. overflow:hidden still allows
+   PROGRAMMATIC scrolling. scroll-snap + smooth behavior stay on the
+   viewport. flex: 0 1 auto + min-height on the WRAPPER (was the viewport,
+   2026-08-24): when the slot is max-height-capped by the astrolabe clamp,
+   the body shrinks and the wrapper SHRINKS WITH IT instead of overflowing
+   past the body's bottom padding — min-height keeps ~2 buttons visible in
+   the worst case; the (working) scroll covers the rest. */
+.inv-scroll-wrap {
     position: relative;
-    flex: 0 0 auto;                    /* (2026-08-19) fixed inline height — never stretched by the body's flex column */
+    flex: 0 1 auto;
+    min-height: 92px;                 /* ≈ 2 buttons — never collapse to nothing when clamped */
     border-radius: 6px;
     background: rgba(0, 0, 0, 0.35);
+    overflow: hidden;
+}
+.inv-viewport {
+    position: absolute;               /* fill the wrapper exactly — tracks its clamped box */
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    overflow: hidden;
     outline: none;
+    scroll-snap-type: y mandatory;    /* the scroller owns the snap (was .inv-track) */
+    scroll-behavior: smooth;          /* JS scrollTo steps animate */
 }
 .inv-viewport:focus-visible {
     box-shadow: inset 0 0 0 1px rgba(212, 175, 55, 0.4);
 }
-/* The scrollable track holding all item buttons. scroll-snap-y is the visual
-   backstop for the JS step-scroll — each button is a snap point, so the smooth
-   scroll always settles flush on a button top edge. */
+/* ── More-content hints (2026-08-25 Chloe) ─────────────────────────────
+   >6 items (or a clamped viewport): a small brass chevron over a soft fade
+   at the very BOTTOM signals more below; once you scroll down, a matching
+   chevron appears at the very TOP — in the middle, BOTH show (more up AND
+   down). Pure feedback: pointer-events none (clicks pass through to the
+   buttons beneath), visibility driven by the viewport's scroll events.
+   The chevron is a rotated two-border CSS corner — no font glyph (Cinzel
+   ships no arrows + a fallback font would break the aesthetic). */
+.inv-scroll-hint {
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;             /* pure feedback — never eats an item click */
+    opacity: 0;
+    transition: opacity 160ms ease;
+    z-index: 2;                       /* over the scrolled buttons, under nothing */
+}
+.inv-scroll-hint--top {
+    top: 0;
+    background: linear-gradient(180deg, rgba(0, 0, 0, 0.62) 0%, rgba(0, 0, 0, 0) 100%);
+}
+.inv-scroll-hint--bottom {
+    bottom: 0;
+    background: linear-gradient(0deg, rgba(0, 0, 0, 0.62) 0%, rgba(0, 0, 0, 0) 100%);
+}
+.inv-scroll-hint.is-on {
+    opacity: 1;
+}
+.inv-scroll-hint::after {
+    content: '';
+    width: 8px;
+    height: 8px;
+    border-right: 2px solid rgba(230, 213, 138, 0.75);
+    border-bottom: 2px solid rgba(230, 213, 138, 0.75);
+}
+.inv-scroll-hint--top::after {
+    transform: rotate(225deg);        /* corner points UP */
+}
+.inv-scroll-hint--bottom::after {
+    transform: rotate(45deg);         /* corner points DOWN */
+}
+/* The track holding all item buttons — a plain flex column INSIDE the scroll
+   viewport. NOT a scroll container (no overflow, unbounded height): snap +
+   smooth scrolling moved to .inv-viewport above; the buttons' snap-align
+   still applies (snap targets may be any descendant of the scroll container). */
 .inv-track {
     display: flex;
     flex-direction: column;
     gap: 8px;                         /* BUTTON_GAP_PX — keep in sync w/ JS */
     padding: 8px;
-    scroll-snap-type: y mandatory;
-    scroll-behavior: smooth;
 }
 /* The fixed item button. STRICT height + width — never grows. The label sits
    centered; the qty badge sits at the right. Height MUST match
@@ -2793,14 +3139,18 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
    bloom master toggle.
    ============================================================= */
 
-/* ── §2  THE 5-ICON DOCK (Gender · Calendar · Weather · Location · Inventory)
-   2026-08-06 full overhaul. A horizontal flex row pinned to the drawer's
-   BOTTOM, holding all 5 HUD controls as uniform .hud-dock-btn buttons. Every
-   button uses the SAME size + the SAME backpack-style resting/hover/active
-   treatment (drop-shadow ground at rest → pop-out lift + amber glow + brighten
-   on hover → tactile press on active) so the dock reads as one cohesive bar.
-   The line-art SVG icons (calendar/weather/location) + the gender glyph (♂/♀)
-   fill the button via currentColor; the inventory button keeps its PNG <img>.
+/* ── §2  THE 5-ICON DOCK (Gender · Pouch · Calendar · Weather · Location)
+   2026-08-06 full overhaul; 2026-08-23 pouch ruling adds the POUCH icon
+   (2nd position — right of the gender toggle, left of the calendar). The row
+   is now FIVE .hud-dock-btn buttons, so the face size, gap, + divider stops
+   were recalibrated to keep the row inside the drawer's inner width (~441px
+   at Chloe's reference). Every button uses the SAME size + the SAME
+   backpack-style resting/hover/active treatment (drop-shadow ground at rest
+   → pop-out lift + amber glow + brighten on hover → tactile press on active)
+   so the dock reads as one cohesive bar. The line-art SVG icons
+   (pouch/calendar/weather/location) + the gender glyph (♂/♀) fill the button
+   via currentColor; the ICON px sizes below are unchanged — only the hit
+   boxes + gaps shrank to fit the fifth button.
 ────────────────────────────────────────────────────────────────────────── */
 .hud-dock {
     position: absolute;
@@ -2811,10 +3161,10 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     flex-direction: row;
     align-items: center;
     justify-content: center;
-    gap: clamp(18px, 2.8vh, 30px);   /* FLUID (Chloe 2026-08-07): gap shrinks on
-       short screens so the 5-button row fits the narrower drawer. 2.8vh of
-       Chloe's 1067px = ~30px → byte-identical on her screen. 18px floor on
-       laptops keeps the icons visually separated; 30px cap = tuned value. */
+    gap: clamp(10px, 1.5vh, 15px);   /* (2026-08-23) tightened for the 5-button
+       row: 5 × 76px + 4 × 15px = 440px, a hair-fit inside the ~441px inner
+       width at Chloe's reference (27vw of ~1707 CSS px − 2×10px padding).
+       1.5vh keeps the fluid shrink on short screens; 10px floor on laptops. */
     z-index: 6;                      /* above the paperdoll */
     padding: 0 10px;
     box-sizing: border-box;
@@ -2826,14 +3176,14 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     align-items: center;
     justify-content: center;
     /* Uniform button face size — the SAME hit box for all 5 (PNG + SVGs).
-       2026-08-06: bumped 20% (64→77px) per Chloe.
-       2026-08-07 FLUID: scales with viewport HEIGHT so the dock shrinks on
-       short screens (1080p laptops @125% = 864h) to give the paperdoll room
-       — otherwise the figure's toes overlap the dock by ~16px. 8vh of
-       Chloe's 1067px = 85.4 ≈ 86 → byte-identical on her screen + bigger
-       screens (capped at 86). 70px floor = minimum tap target on laptops. */
-    width: clamp(70px, 8vh, 86px);   /* bigger (was 77) per Chloe 2026-08-06 */
-    height: clamp(70px, 8vh, 86px);
+       (2026-08-23 pouch ruling) 86px → 76px cap + 70px → 62px floor: the
+       fifth dock button (the POUCH) required smaller faces to fit the row
+       (5 × 76 + 4 × 15 = 440 ≤ ~441 at the reference). FLUID: scales with
+       viewport HEIGHT so the dock shrinks on short screens (1080p laptops
+       @125% = 864h). 7.2vh of Chloe's 1067px = 76.8 → capped at 76 →
+       near-identical on her screen. 62px floor = minimum tap target. */
+    width: clamp(62px, 7.2vh, 76px);
+    height: clamp(62px, 7.2vh, 76px);
     padding: 0;
     background: transparent;
     border: none;
@@ -2856,57 +3206,52 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     outline-offset: 3px;
 }
 
-/* ── The 3 thin bronze dividers between the dock icons (2026-08-06) ──────
-   3 dividers between the 4 icons. Generated via ::before on every button
-   that FOLLOWS another button (.hud-dock-btn + .hud-dock-btn) — i.e. the
-   2nd, 3rd, + 4th buttons (calendar/weather/location). The first (gender)
-   has no preceding icon so it gets no divider. The divider is a 1px-wide,
-   44px-tall (most of the 77px button height, centered) hairline in dim
-   bronze that reads as a subtle separator, not a hard bar. The gap Chloe
-   tuned is untouched (the divider sits inside it via left:-15px).
-   pointer-events:none so it never steals clicks. */
-/* ── The 3 thin bronze dividers between the dock icons (2026-08-06) ──────
-   3 STATIC dividers between the 4 icons. Painted as a multi-stop background
+/* ── The 4 thin bronze dividers between the dock icons (2026-08-23) ──────
+   4 STATIC dividers between the 5 icons. Painted as a multi-stop background
    on the .hud-dock container (NOT on the buttons) so they never inherit the
    hover scale/lift transform the way a button's ::before would — they stay
    perfectly still while the icons pop. The background is one linear-gradient
-   layer: 3 vertical 1px bronze hairlines, each 44px tall, vertically
-   centered in the 77px-tall dock row, positioned at the centers of the 3 gaps
-   between the 4 buttons. The hairline color is the same dim bronze as the
-   original ::before approach.
-   POSITIONS: the dock is justify-content:center with 4 × 77px buttons + 3 ×
-   30px gaps = 398px content, centered in the ~441px inner width (461px drawer
-   − 2×10px padding). The 3 gap centers land at 1/4, 1/2, 3/4 of that content
-   span measured from the content's left edge — computed here as percentages
-   of the container width (close enough given the centering; sub-pixel drift
-   is imperceptible on a 1px line). Each stop pair draws one hairline (color
-   ON for 1px, then transparent). */
+   layer per hairline: a vertical 1px bronze line, 50px tall, vertically
+   centered in the dock row, positioned at the center of each of the 4 gaps
+   between the 5 buttons. The hairline color is the same dim bronze as the
+   original 2026-08-06 ::before approach.
+   POSITIONS: the dock is justify-content:center; with 5 equal buttons + 4
+   equal gaps the gap centers land at 1/5 .. 4/5 of the content span —
+   computed here as 20%/40%/60%/80% of the container width (close enough
+   given the centering; sub-pixel drift is imperceptible on a 1px line). */
 .hud-dock {
     background-image:
         linear-gradient(
             to right,
-            transparent calc(25% - 0.5px),
-            rgba(212, 175, 55, 0.28) calc(25% - 0.5px),
-            rgba(212, 175, 55, 0.28) calc(25% + 0.5px),
-            transparent calc(25% + 0.5px)
+            transparent calc(20% - 0.5px),
+            rgba(212, 175, 55, 0.28) calc(20% - 0.5px),
+            rgba(212, 175, 55, 0.28) calc(20% + 0.5px),
+            transparent calc(20% + 0.5px)
         ),
         linear-gradient(
             to right,
-            transparent calc(50% - 0.5px),
-            rgba(212, 175, 55, 0.28) calc(50% - 0.5px),
-            rgba(212, 175, 55, 0.28) calc(50% + 0.5px),
-            transparent calc(50% + 0.5px)
+            transparent calc(40% - 0.5px),
+            rgba(212, 175, 55, 0.28) calc(40% - 0.5px),
+            rgba(212, 175, 55, 0.28) calc(40% + 0.5px),
+            transparent calc(40% + 0.5px)
         ),
         linear-gradient(
             to right,
-            transparent calc(75% - 0.5px),
-            rgba(212, 175, 55, 0.28) calc(75% - 0.5px),
-            rgba(212, 175, 55, 0.28) calc(75% + 0.5px),
-            transparent calc(75% + 0.5px)
+            transparent calc(60% - 0.5px),
+            rgba(212, 175, 55, 0.28) calc(60% - 0.5px),
+            rgba(212, 175, 55, 0.28) calc(60% + 0.5px),
+            transparent calc(60% + 0.5px)
+        ),
+        linear-gradient(
+            to right,
+            transparent calc(80% - 0.5px),
+            rgba(212, 175, 55, 0.28) calc(80% - 0.5px),
+            rgba(212, 175, 55, 0.28) calc(80% + 0.5px),
+            transparent calc(80% + 0.5px)
         );
     background-repeat: no-repeat;
     background-position: 0 center;
-    background-size: 100% 50px;       /* each hairline layer is full-width × 50px tall, vertically centered — scaled up (was 44) to match the bigger 86px buttons */
+    background-size: 100% 50px;       /* each hairline layer is full-width × 50px tall, vertically centered */
 }
 
 /* The SVG icon span (calendar/weather/location) fills the button + recolors
@@ -2944,6 +3289,26 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
         drop-shadow(0 0 2px var(--fable-brass-glow))
         drop-shadow(0 4px 4px rgba(0,0,0,0.6))
         brightness(1.1) saturate(1.1);
+}
+
+/* ── Location icon: NEON-RED X on highlight (2026-08-25, Chloe; de-haloed
+   same day — "there's not supposed to be an outer glow! Only the LINES
+   themselves glow") ──────────────────────────────────────────────────────
+   The treasure-map X is a FIXED-red ink mark (left-drawer.js LOCATION_SVG)
+   on the class `treasure-x`. When the dock button is highlighted — hover OR
+   the persistent is-active card-open state — the X's own STROKES flare
+   neon: the red brightens + a brightness/saturate bump on the path itself.
+   NO drop-shadows: they bloom an outer halo around the mark (first draft)
+   which Chloe explicitly banned — the glow lives in the lines only.
+   Resting state carries NO filter; the 220ms transition fades in lockstep
+   with the icon's shared amber glow. */
+.hud-dock-icon .treasure-x {
+    transition: filter 220ms ease, stroke 220ms ease;
+}
+.hud-dock-btn:hover .hud-dock-icon .treasure-x,
+.hud-dock-btn.is-active .hud-dock-icon .treasure-x {
+    stroke: #ff6d6d;
+    filter: brightness(1.3) saturate(1.4);
 }
 
 /* ── BACKPACK (standalone, bottom-right next to the paperdoll) ──────────
@@ -3224,13 +3589,382 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     text-align: center;
 }
 .info-card-tag {
-    margin-top: 4px;
+    /* (2026-08-25 demo transfer) The tag+caption pair sits clear of the
+       title; the setting word alone — no brackets, no italics. */
+    margin-top: 6px;
     font-family: var(--fable-font-serif, 'Cinzel', serif);
-    font-size: 0.82rem;
+    font-size: 0.88rem;
     letter-spacing: 0.08em;
-    font-style: italic;
     color: rgba(212, 175, 55, 0.6);
     text-align: center;
+}
+
+/* ── §D LOCATION CARD — FOG-OF-WAR SITE MAP (engine/site-map.js) ─────────
+   (2026-08-23, modeled on the Multihog DnD Framework's player view.) When
+   the location card carries a site map (the current node is mapped), the
+   container GROWS — 26% → 52% of drawer height, Chloe 2026-08-23 "you may
+   make the UI itself taller for more space" — and the body stacks
+   headline → tags → caption → edge legend → scrollable node graph. The
+   node HOVER TOOLTIP is the THIRD sanctioned hover surface (after the
+   injury-heatmap body-part tooltip + the time-scrubber readout; Chloe,
+   same day: it works exactly like the paperdoll injury tooltip) — native
+   title/tooltip badges stay banned everywhere. */
+.info-card-container.has-map {
+    height: 52%;
+    flex-direction: column;
+    align-items: stretch;
+    justify-content: flex-start;
+    padding: 10px 12px 10px;
+}
+/* (2026-08-25 demo transfer) The map card's headline sits 2px over the
+   1.15rem baseline and wraps BALANCED across two-line titles (the tooltip
+   lines' law). Scoped to .has-map — the calendar/weather cards keep the
+   shared baseline. */
+.has-map .info-card-headline {
+    font-size: 1.275rem;
+    text-wrap: balance;
+}
+.has-map .info-card-body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+}
+/* The map frame: caption + the scrolling graph. position:relative is the
+   hover tooltip's anchor/clamp frame AND the map key's pin (the tooltip
+   itself lives here, pinned over the VISIBLE area while the graph scrolls
+   under it). */
+.site-map-wrap {
+    flex: 1 1 auto;
+    width: 100%;
+    min-height: 0;
+    margin-top: 0;                /* the caption hugs the setting tag above */
+    position: relative;
+    display: flex;
+    flex-direction: column;
+}
+.site-map-label {
+    flex: 0 0 auto;
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    font-size: 0.56rem;
+    letter-spacing: 0.14em;
+    color: rgba(212, 175, 55, 0.6);
+    text-align: center;
+    text-transform: uppercase;
+    margin-top: -2px;             /* pulled up 2px into the tag's line box */
+    margin-bottom: 5px;           /* +2px air before the map frame */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+/* ── THE MAP KEY — one morphing box (2026-08-25 demo transfer) ───────────
+   Collapsed it is a 3-line hamburger chip pinned bottom-left of the frame;
+   clicked, the box widens and the 3 lines grow into the full-width
+   underlines of the three section heads (Area / Path / Marker) with the
+   rows unfolding beneath them. Click the box again, or anywhere outside,
+   and it condenses back into the chip (engine/site-map.js buildMapLegend).
+   Lives in .site-map-wrap — above the graph, BELOW the tooltip (9). */
+.site-map-key {
+    position: absolute;
+    left: 6px;
+    bottom: 6px;
+    z-index: 6;
+    width: 27px;                  /* collapsed chip width */
+    display: flex;
+    flex-direction: column;
+    justify-content: center;      /* the 3 rules center into a hamburger */
+    gap: 4px;
+    padding: 5px 4px;
+    background: rgba(8, 8, 8, 0.85);
+    border: 1px solid rgba(212, 175, 55, 0.4);
+    border-radius: 4px;
+    cursor: pointer;
+    overflow: hidden;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    text-transform: uppercase;    /* every character in the key, always */
+    transition: width 260ms cubic-bezier(0.2, 0.8, 0.2, 1),
+                border-color 180ms ease;
+}
+.site-map-key:hover { border-color: rgba(212, 175, 55, 0.7); }
+.site-map-key:focus-visible { outline: 1px solid rgba(212, 175, 55, 0.7); }
+.site-map-key.is-open { width: 154px; }
+
+.key-sec { display: flex; flex-direction: column; }
+.key-sec-head {
+    height: 0;
+    opacity: 0;
+    overflow: hidden;
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    font-size: 8px;
+    letter-spacing: 0.18em;
+    color: rgba(212, 175, 55, 0.55);
+    transition: height 220ms ease, opacity 160ms ease, margin 220ms ease;
+}
+.site-map-key.is-open .key-sec-head {
+    height: 11px;
+    opacity: 1;
+    margin-bottom: 2px;
+}
+.key-sec-rule {
+    display: block;
+    width: 16px;                  /* collapsed: a short centered hamburger line */
+    height: 1.5px;
+    background: rgba(230, 213, 138, 0.85);
+    border-radius: 1px;
+    margin: 0 auto;
+    transition: width 260ms cubic-bezier(0.2, 0.8, 0.2, 1), margin 260ms ease,
+                background 260ms ease;
+}
+.site-map-key.is-open .key-sec-rule {
+    width: 100%;                  /* expanded: the head's full-width underline */
+    margin: 0;
+    background: rgba(212, 175, 55, 0.35);
+}
+.key-sec-rows {
+    display: grid;
+    grid-template-rows: 0fr;      /* collapsed: folded to nothing */
+    /* No opacity fade here — folded rows are height-0 already. With the
+       box anchored at the bottom growing upward, a fade made the bottom
+       sections visibly arrive after the rest (the weird bottom fade-in). */
+    transition: grid-template-rows 260ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.site-map-key.is-open .key-sec-rows {
+    grid-template-rows: 1fr;
+}
+.key-sec-rows-in {
+    overflow: hidden;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+}
+.site-map-key.is-open .key-sec-rows-in { padding-top: 2px; }
+.site-map-key-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 13px;
+}
+.site-map-key-ico {
+    flex: 0 0 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: rgba(230, 213, 138, 0.85);
+}
+.site-map-key-name {
+    font-family: var(--fable-font-sans, 'Segoe UI', system-ui, sans-serif);
+    font-size: 9px;
+    letter-spacing: 0.05em;
+    color: rgba(216, 216, 216, 0.68);
+    white-space: nowrap;
+}
+.site-map-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+    border: 1px solid rgba(212, 175, 55, 0.18);
+    border-radius: 4px;
+    background:
+        radial-gradient(ellipse at 50% 0%, rgba(212, 175, 55, 0.04), transparent 60%),
+        rgba(8, 8, 8, 0.55);
+    /* (2026-08-25 demo transfer) Grab-panning + wheel zoom replace the
+       visible scrollbar — the connectors' full extent is explored by
+       dragging (cursor: grab), so the scrollbar is hidden entirely. */
+    cursor: grab;
+    user-select: none;
+    scrollbar-width: none;
+}
+.site-map-scroll::-webkit-scrollbar { display: none; }
+.site-map-scroll.is-grabbing { cursor: grabbing; }
+.site-map-empty {
+    padding: 18px 10px;
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    font-size: 0.78rem;
+    color: rgba(212, 175, 55, 0.5);
+    text-align: center;
+}
+
+/* ── §D.1 THE GRAPH SVG (2026-08-25 demo redesign) ─────────────────────────
+   Knowledge-tiered styling: Visited rooms read solid brass; Discovered
+   rooms dim (name-only knowledge, NO italics); fog stubs are dashed
+   circles with a lone "?". The current room's brass border itself PULSES
+   (subtly, never fading out — stroke floor 0.6 alpha); the entrance keeps
+   a notch triangle on its left border. Paths draw WIDE + bold — the
+   passage state must read at a glance: solid open, long-bright dashes
+   locked, tight burnt dashes blocked; an open passage toward an
+   unexplored endpoint sits dim + dull (PATH-LIGHT). */
+.site-map-svg { display: block; }
+.site-map-node { cursor: default; }
+.site-map-node[data-map-node] {
+    cursor: help;          /* "there's something to read here" (injury pattern) */
+    outline: none;         /* keyboard focus reveals the tooltip; no ring */
+}
+/* The node-box rules target the DIRECT-child rect only (>) — a bare "rect"
+   descendant selector catches the quest scroll's <rect> chip, painting it
+   with the here-border stroke AND the pulse animation (the pulsing-scroll
+   bug). */
+.site-map-node > rect {
+    fill: rgba(24, 21, 14, 0.9);
+    stroke: rgba(212, 175, 55, 0.55);
+    stroke-width: 1.2;
+}
+.site-map-node.is-discovered > rect {
+    fill: rgba(16, 16, 16, 0.7);
+    stroke: rgba(212, 175, 55, 0.28);
+    stroke-width: 1;
+}
+.site-map-node text {
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    font-size: 13px;
+    fill: var(--fable-brass-bright, #E6D58A);
+}
+.site-map-node.is-discovered text { fill: rgba(230, 213, 138, 0.5); }
+.site-map-node.is-current > rect {
+    stroke: #F0CE6A;
+    stroke-width: 1.8;
+    filter: drop-shadow(0 0 3px rgba(240, 206, 106, 0.35));
+    animation: site-map-current-pulse 3.6s ease-in-out infinite;
+}
+@keyframes site-map-current-pulse {
+    0%, 100% { stroke: #F0CE6A; }
+    50%      { stroke: rgba(240, 206, 106, 0.6); }
+}
+.site-map-node.is-fog circle {
+    fill: rgba(10, 10, 10, 0.75);
+    stroke: rgba(212, 175, 55, 0.25);
+    stroke-width: 1;
+    stroke-dasharray: 2 3;
+}
+.site-map-node.is-fog text {
+    fill: rgba(212, 175, 55, 0.4);
+    font-size: 17px;
+}
+.site-map-entry-notch { fill: rgba(212, 175, 55, 0.45); }
+.site-map-edge { stroke: rgba(230, 213, 138, 0.6); stroke-width: 2.2; }
+/* PATH-LIGHT: an OPEN passage with an unexplored endpoint (fog or
+   discovered-but-unvisited) sits dim + dull; visiting the area lights the
+   edge to the usual brass. */
+.site-map-edge.is-fogward { stroke: rgba(212, 175, 55, 0.25); }
+.site-map-edge.is-locked {
+    stroke: rgba(160, 160, 160, 0.75);
+    stroke-width: 2.2;
+    stroke-dasharray: 8 4;
+}
+.site-map-edge.is-blocked {
+    stroke: rgba(220, 20, 60, 0.9);
+    stroke-width: 2.2;
+    stroke-dasharray: 3 5;
+}
+/* Each edge carries an invisible 10px fat hit-line so hovering the
+   connector opens the state tooltip (open / locked / blocked). */
+.site-map-edge-g { cursor: help; }
+.site-map-edge-hit {
+    stroke: transparent;
+    stroke-width: 10;
+    pointer-events: stroke;
+}
+
+/* ── §D.2 THE NODE HOVER TOOLTIP ──────────────────────────────────────────
+   The same dark-gold card as .injury-heatmap-tooltip (the shared badge
+   aesthetic — keep the two rules in sync); the inner .injury-tooltip-*
+   classes are REUSED verbatim from the injury module. Anchoring, reveal,
+   + clamp are JS-driven in mountSiteMap, mirroring injury-heatmap.js §4. */
+.site-map-tooltip {
+    position: absolute;
+    transform: translate(-50%, -50%); /* center the badge ON the node's
+                                         bbox center set by JS */
+    background: #0d0d0d;
+    border: 1px solid rgba(212, 175, 55, 0.55);
+    padding: 7px 12px;
+    border-radius: 5px;
+    font-family: var(--fable-font-serif, 'Cinzel', serif);
+    color: var(--fable-brass-bright, #E6D58A);
+    text-align: center;
+    line-height: 1.35;
+    min-width: 120px;
+    max-width: 230px;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 180ms ease;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.55), 0 0 6px rgba(212, 175, 55, 0.08);
+    z-index: 9;
+}
+.site-map-tooltip.is-visible { opacity: 1; }
+/* (2026-08-25 demo transfer) The map tooltip's DETAIL LIST — centered,
+   balanced-wrapping lines with the marker glyph pinned hard left and a
+   thin WHITE hairline between lines. Scoped under .site-map-tooltip so
+   the injury heatmap's own .injury-tooltip-list (left-aligned, bronze
+   bullets) is untouched — same shared classes, different reading mode. */
+.site-map-tooltip .injury-tooltip-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    text-align: center;
+}
+.site-map-tooltip .injury-tooltip-list li {
+    font-size: 0.72rem;
+    font-family: var(--fable-font-sans, 'Segoe UI', system-ui, sans-serif);
+    color: #ffffff;
+    line-height: 1.3;
+    padding: 1px 0;
+    white-space: normal;
+    word-break: break-word;
+    /* Balanced wrapping — a two-line entry splits its words evenly across
+       both lines instead of a full first line + lone trailing word. */
+    text-wrap: balance;
+    position: relative;    /* anchors the out-of-flow divider ::before */
+}
+.site-map-tooltip .injury-tooltip-list li + li { margin-top: 6px; }
+/* No bronze bullets here (the injury list's • column) — the map's detail
+   lines are centered bare text. Specificity note: this plain-li override
+   (0,2,2) loses to the li+li hairline below (0,2,3), so only the FIRST
+   line's bullet dies while the hairline keeps rendering. */
+.site-map-tooltip .injury-tooltip-list li::before { content: none; }
+/* The kind glyph sits ALL THE WAY LEFT, absolutely pinned against the
+   card's left edge, fully OUT of the text flow — the text lines keep
+   their exact centered block layout, wrapping independently, dividers
+   intact. Flex here fought the divider pseudo-elements and squashed the
+   format. */
+.site-map-tooltip .tip-ico {
+    position: absolute;
+    left: -10px;             /* inside the tooltip's 12px side padding */
+    top: calc(50% + 0.5px);  /* optical center for text-only li height */
+    transform: translateY(-50%);
+    display: inline-flex;
+    color: rgba(212, 175, 55, 0.85); /* light bronze */
+}
+.site-map-tooltip .tip-ico svg { display: block; }
+.site-map-tooltip .tip-ico g {
+    stroke: currentColor;
+    stroke-width: 1.05;
+    fill: none;
+}
+/* Thin WHITE hairline between detail lines (only where a line follows
+   another — single-line bodies stay undivided). The header divider above
+   stays bronze. It is OUT OF FLOW — an in-flow divider added height to
+   every li but the first, which pushed the FIRST line's icon low (its 50%
+   anchor shifted); all li's keep text-only height so the icon offset
+   lands identically on every line. Full pixel height — a 0.5px line
+   vanishes on subpixel boundaries depending on where it lands. */
+.site-map-tooltip .injury-tooltip-list li + li::before {
+    content: '';
+    position: absolute;
+    top: -3.5px;             /* centered in the 6px inter-entry gap */
+    left: 7.5%;
+    display: block;
+    width: 85%;
+    height: 1px;
+    background: linear-gradient(
+        to right,
+        rgba(255, 255, 255, 0) 0%,
+        rgba(255, 255, 255, 0.45) 50%,
+        rgba(255, 255, 255, 0) 100%
+    );
 }
 
 /* ── DOCK ICON ACTIVE STATE (when its card is open) ──────────────────────
@@ -3256,6 +3990,9 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
    the RIGHT drawer under the WUPI brand (see .fable-tab-rail* + .fable-tab-drop*).
    ============================================================= */
 .fable-wupi-header {
+    /* (2026-08-23 Playground) position:relative anchors the ABSOLUTELY
+       positioned wand button so the centered brand never shifts. */
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -3616,6 +4353,11 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 }
 .fable-raw-editor-text.invalid { box-shadow: inset 0 0 0 1px #f4a0a0; }
 .fable-raw-editor-text.shake { animation: fable-raw-shake 320ms ease; }
+/* (2026-08-22 Chloe ruling, landed 2026-08-23) The UA default placeholder
+   reads near-invisible on the rgb(20,20,20) well — a failed read keeps the
+   modal open with the error as the textarea placeholder, and the box looked
+   completely empty with the failure reason sitting right in it. */
+.fable-raw-editor-text::placeholder { color: var(--fable-text-faint); }
 @keyframes fable-raw-shake {
     0%, 100% { transform: translateX(0); }
     25% { transform: translateX(-4px); }
@@ -3900,6 +4642,201 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 .fable-codex-link-load:hover { background: rgba(212, 175, 55, 0.22); border-color: var(--fable-brass); }
 .fable-codex-link-load:disabled { opacity: 0.5; cursor: default; }
 
+/* =============================================================
+   CODEX LIBRARY SCREEN (title LOAD → CODEX, 2026-08-23) — the universal
+   library browser. Text-only tiles (no portraits: a codex is authored
+   lore, not a character) in the shared mini-card chrome; the detail modal
+   reuses the picker modal frame with a pinned action row + internally
+   scrolling entries. The LINK popup + the name/raw editor reuse the
+   .fable-codex-link-* / .fable-raw-editor-* chrome wholesale.
+   ============================================================= */
+.fable-codexlib-grid {
+    position: relative;
+    z-index: 2;                    /* above the flow ambiance layer */
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 18px;
+    padding: 32px 28px 100px;
+    max-width: 1240px;
+    margin: 0 auto;
+    width: 100%;
+    align-content: center;
+    justify-items: center;         /* the player-grid discipline: tiles cap
+                                      at their max-width + center in cell */
+}
+@media (max-width: 980px) {
+    .fable-codexlib-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 560px) {
+    .fable-codexlib-grid { grid-template-columns: 1fr; }
+}
+/* The codex tile rides the shared .fable-player-mini-card chrome (same
+   panel, border, hover lift) but swaps the portrait column for a text
+   stack: the name row (name + entry count beside it), the shared divider,
+   then the linked-cards line. */
+.fable-player-mini-card.fable-codexlib-tile {
+    justify-content: center;
+    gap: 12px;
+    padding: 20px 16px;
+    min-height: 158px;
+}
+.fable-codexlib-name-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 10px;
+    width: 100%;
+    padding: 0 4px;
+    box-sizing: border-box;
+}
+.fable-codexlib-name {
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: 26px;
+    color: #FFF6E0;                /* the grids' ivory */
+    line-height: 1.1;
+    text-align: center;
+    text-transform: uppercase;
+    overflow-wrap: anywhere;
+    min-width: 0;
+}
+.fable-codexlib-count {
+    flex: 0 0 auto;
+    font-family: var(--fable-font-body);
+    font-size: 12px;
+    color: rgba(242, 236, 220, 0.5);   /* the small-gray metadata tone */
+    white-space: nowrap;
+}
+.fable-codexlib-links {
+    font-family: var(--fable-font-body);
+    font-size: 13px;
+    line-height: 1.45;
+    color: rgba(242, 236, 220, 0.55);
+    text-align: center;
+    width: 100%;
+    padding: 0 4px;
+    box-sizing: border-box;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+/* The detail modal: the shared picker frame, but a fixed column — the
+   entries scroll INSIDE the body while the LINK/EDIT/DELETE row stays
+   pinned. Compound selectors (.fable-player-modal.fable-codexlib-modal) so
+   the overrides win over the flow-cinematic.css base regardless of cascade
+   order. */
+.fable-player-modal.fable-codexlib-modal {
+    display: flex;
+    flex-direction: column;
+    width: min(760px, 94vw);
+    max-height: 86vh;
+    padding: 0;
+    overflow: hidden;
+}
+.fable-codexlib-detail-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: center;
+    gap: 12px;
+    padding: 18px 22px 14px;
+    border-bottom: 1px solid var(--fable-glass-line);
+}
+.fable-codexlib-detail-name {
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: 30px;
+    color: #FFF6E0;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    text-align: center;
+    overflow-wrap: anywhere;
+}
+.fable-codexlib-detail-body {
+    min-height: 0;
+    overflow-y: auto;
+    padding: 18px 26px 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 24px;
+}
+/* Each entry: centered title over the shared divider language, small gray
+   middle-dot tags beneath, then the full body — the Creator's codex review
+   composition. */
+.fable-codexlib-entry { text-align: center; }
+.fable-codexlib-entry-title {
+    font-family: 'Almendra', var(--fable-font-serif);
+    font-weight: 700;
+    font-size: 20px;
+    color: var(--fable-brass-bright);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    text-shadow: 0 0 4px var(--fable-brass-glow);
+    overflow-wrap: anywhere;
+}
+.fable-codexlib-entry-tags {
+    margin: 5px 0 12px;
+    font-family: var(--fable-font-body);
+    font-size: 12px;
+    color: rgba(242, 236, 220, 0.5);
+}
+.fable-codexlib-entry-body {
+    font-family: var(--fable-font-body);
+    font-size: 14.5px;
+    line-height: 1.6;
+    color: #e8dfc8;
+    white-space: pre-wrap;
+    text-align: left;
+    overflow-wrap: anywhere;
+}
+.fable-codexlib-entry-empty {
+    padding: 40px 0;
+    text-align: center;
+    color: var(--fable-text-faint);
+}
+.fable-codexlib-modal .fable-player-modal-actions {
+    margin: 0;
+    padding: 14px 18px 18px;
+}
+/* The codex editor's NAME field — a labeled single-line input above the raw
+   text (the rest of the frame is the shared raw-editor chrome). */
+.fable-codexlib-edit-name-label {
+    display: block;
+    padding: 12px 16px 4px;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--fable-brass);
+}
+.fable-codexlib-edit-name {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    margin: 0;
+    padding: 9px 16px;
+    background: rgb(20, 20, 20);
+    color: var(--fable-text);
+    border: none;
+    border-bottom: 1px solid var(--fable-glass-line);
+    font-family: var(--fable-font-body);
+    font-size: 15px;
+    outline: none;
+}
+.fable-codexlib-edit-name:focus { box-shadow: inset 0 -2px 0 var(--fable-brass-dim); }
+.fable-codexlib-edit-name.invalid { box-shadow: inset 0 0 0 1px #f4a0a0; }
+/* Inline failure notes — the LINK popup's foot + the editor's top banner
+   (a failed write keeps its overlay open with the reason shown in-place). */
+.fable-codexlib-popup-error {
+    font-size: 12.5px;
+    color: rgba(244, 160, 160, 0.95);
+    line-height: 1.4;
+}
+.fable-codexlib-popup-error.fable-codexlib-edit-error {
+    padding: 10px 16px;
+    border-bottom: 1px solid rgba(244, 160, 160, 0.3);
+}
+
 .fable-wupi-messages {
     flex: 1; overflow-y: auto; padding: 18px;
     scrollbar-width: none; /* hidden scrollbar — still scrollable */
@@ -3921,7 +4858,8 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     background: rgba(40, 28, 18, 0.85); color: var(--fable-text);
     border: 1px solid var(--fable-brass-dim); border-radius: 14px 14px 14px 4px; max-width: 88%; text-align: left;
 }
-.fable-wupi-msg.wupi.streaming .fable-wupi-msg-body::after { content: "▌"; color: var(--fable-brass); animation: fableBlink 1s steps(2) infinite; }
+/* No streaming caret on the drawer Wupi bubble (block cursor removed
+   2026-08-25); streamed text simply grows until the turn lands. */
 /* User: bubble hugs the RIGHT side of the column. */
 .fable-wupi-msg.user { text-align: right; }
 .fable-wupi-msg.user .fable-wupi-msg-body {
@@ -3932,22 +4870,36 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 .fable-wupi-msg.error { text-align: left; }
 .fable-wupi-msg.error .fable-wupi-msg-body { background: rgba(120,30,30,0.5); color: #f4c4c4; border-color: rgba(244,114,114,0.4); }
 .fable-wupi-input-row { display: flex; align-items: center; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--fable-glass-line); }
-.fable-wupi-input {
-    flex: 1; resize: none; padding: 0.6em 0.75em; max-height: 120px;   /* em padding rides the clamped font; =10/12px at 16px reference */
+/* (2026-08-24 line-lock, mirrors the composer) The BOX owns the vertical
+   inset + chrome; the textarea inside is chromeless with pure line-math
+   height — its scroll viewport is always a whole number of 22px lines,
+   so a 4th-line sliver at the bottom is geometrically impossible. */
+.fable-wupi-input-box {
+    flex: 1; min-width: 0; position: relative;
+    padding: 10px 0;   /* the vertical inset — OUTSIDE the scroll viewport */
     /* Color scheme mirrored from .fable-input 2026-08-12 per Chloe — pure
        black fill + aged-brass frame (same brown the icons/chrome use) +
-       bright-brass focus glow + silver-gray placeholder. Keeps the two
-       composer surfaces visually unified. */
-    background: rgb(10, 10, 10); color: var(--fable-text);
+       bright-brass focus glow. Keeps the composer surfaces visually
+       unified. */
+    background: rgb(10, 10, 10);
     border: 1px solid var(--fable-brass-dim); border-radius: 8px;
-    font-size: clamp(14px, 3.48cqi, 17px); font-family: inherit; line-height: 1.4;   /* 3.48cqi·460 ≈ 16px (unchanged on the reference drawer) */
     box-shadow:
         inset 0 1px 0 rgba(232, 201, 138, 0.14),   /* top inner sheen — matches .fable-input */
         inset 0 0 0 1px rgba(0, 0, 0, 0.25);       /* crisp inner edge */
     transition: border-color 160ms ease, box-shadow 160ms ease;
 }
-.fable-wupi-input:focus {
-    outline: none;
+.fable-wupi-input {
+    display: block; width: 100%; box-sizing: border-box; resize: none;
+    height: 22px;            /* 1 line at rest (autoGrow writes 22/44/66) */
+    max-height: 66px;        /* EXACTLY 3 lines — the whole-line viewport cap */
+    padding: 0 12px;
+    background: transparent; border: none; outline: none;
+    color: var(--fable-text);
+    font-size: clamp(14px, 3.48cqi, 17px); font-family: inherit;
+    line-height: 22px;       /* WHOLE-PX (line-lock law): the scroll grid is 22px multiples */
+    overflow: hidden;
+}
+.fable-wupi-input-box:focus-within {
     border-color: var(--fable-brass-bright);       /* bright brass glow — matches .fable-input:focus */
     box-shadow:
         inset 0 1px 0 rgba(230, 213, 138, 0.15),   /* softened sheen — matches .fable-input:focus */
@@ -3957,55 +4909,126 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 /* The drawer's send/stop toggle uses the shared .send-toggle-btn style
    (defined in styles.css). No per-surface button style needed here. */
 
-/* --- Edge lock bars (super-thin strips at the absolute screen edges) --- */
-/* Standalone elements (NOT attached to the drawers). INVISIBLE by default;
-   the .visible class (added by stage.js when the mouse touches the edge +
-   the drawer is open) fades them in. Super-thin (2px), full drawer height,
-   no glyph/icon — color is the only feedback. Cyan = unlocked, magenta =
-   locked (the .locked class on the bar itself, toggled by stage.js after
-   each click).
-   z:50 sits ABOVE the drawers (z:40) so the bar is CLICKABLE even when the
-   drawer covers that edge — without this the drawer ate the clicks (the
-   "doesn't work when clicking it" bug). The bar is 10px wide (Chloe 2026-08-10:
-   widened from 2px) so it reads as a real, easy-to-click control rather than a
-   hairline — the prior 2px strip was hard to land on + its two brass states
-   (bright vs dark) read as the same line. No glow / box-shadow — kept off per
-   the 2026-07-26 dark-rectangle-artifact call; the hue + luminance delta alone
-   is the state signal now. */
-.fable-edge-lock {
+/* --- Drawer tabs (2026-08-25 lock redesign v2/v3, Chloe) --- */
+/* The lock affordance, PHYSICALLY ATTACHED to the drawer: a slim glass tab
+   riding the drawer's inner edge. It is a SIBLING element carrying the SAME
+   slide transform + transition as the drawer itself, with .is-open flipped
+   in lockstep by stage.js's class observer — the LEFT drawer is
+   overflow:hidden (it clips the scrubber glows) so a child tab would be
+   clipped there; a mirrored sibling gives both sides one mechanism + a
+   pixel-glued ride. Closed, the tab is the drawer's visible tip at the
+   screen edge — a wide-angle chevron pointing the way the drawer pulls
+   inward ("<" right / ">" left); open, it sits at the drawer's lip so
+   locking needs no trip back to the screen edge. Click toggles the lock;
+   the chevron becomes a tiny padlock in emerald (the engaged/secured read,
+   2026-08-10 ruling). Glass + brass hairline so it reads as a physical
+   extension of the panel. NO glow (the 2026-07-26 dark-rectangle call).
+   (v5–v7) At rest the tab is a WHISPER: the glass body sits at a tiny
+   fraction of opacity (just enough to read as a presence behind the
+   glyph) with NO frame — only the arrow (or padlock) is crisp. As the
+   drawer opens, the body ramps to the DRAWER'S OWN glass over the SAME
+   320ms + bezier as the slide while the bronze hairline frame fades in
+   with it, arriving as a seamless framed extension of the panel (same
+   --fable-glass, blur, and border color its edges wear). The glyph itself
+   never fades in any state. */
+.fable-drawer-tab {
+    /* Layout + glyph host ONLY — the glass body lives on the ::before and
+       the frame on the ::after, so each layer fades on its own curve and
+       neither ever multiplies the arrow. */
     position: absolute;
-    top: 0;
-    bottom: 0;
-    width: 10px;
+    top: 50%;
+    width: 12px;
+    height: 220px;
     z-index: 50;
-    background: transparent;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
     cursor: pointer;
-    opacity: 0;
-    transition: opacity 180ms ease, background 180ms ease;
-    pointer-events: none;  /* ignore clicks until visible */
+    /* (v5 fix) The tab is a <button>: without this reset WebView2 paints its
+       NATIVE chrome — the white-bordered box. Kill it ALL (appearance,
+       background, border, focus outline); the only visible parts are the
+       glyph + the two fading pseudo-layers. */
+    appearance: none;
+    background: none;
+    border: none;
+    outline: none;
+    color: var(--fable-brass-dim);
+    pointer-events: auto;   /* the left mount is pointer-transparent */
+    -webkit-user-select: none;
+    user-select: none;
+    /* MUST mirror the drawers' own slide — same duration + bezier — so the
+       tab rides glued to the drawer's edge. translateY(-50%) is the constant
+       vertical centering; only the X leg animates. */
+    transition: transform 320ms cubic-bezier(0.2,0.8,0.2,1),
+                color 180ms ease;
 }
-.fable-edge-lock--right { right: 0; }
-.fable-edge-lock--left { left: 0; }   /* mirror of the right edge-lock bar */
-/* Visible UNLOCKED state: a muted cool steel-blue. Reads as a neutral "idle"
-   line — deliberately NOT brass (the prior bright-brass unlocked vs darker-
-   brass locked were too similar to tell apart at a glance). */
-.fable-edge-lock.visible {
-    opacity: 1;
-    pointer-events: auto;
-    background: #5a6b7a;
+/* The glass body (background + blur): a WHISPER at rest, the drawer's own
+   glass when open. Same 320ms bezier as the slide, so the ramp completes
+   exactly when the drawer arrives. */
+.fable-drawer-tab::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: var(--fable-glass);
+    backdrop-filter: blur(16px);
+    border-radius: inherit;
+    opacity: 0.08;          /* a whisper of presence behind the glyph at rest */
+    transition: opacity 320ms cubic-bezier(0.2,0.8,0.2,1);
 }
-.fable-edge-lock.visible:hover {
-    background: #7a8b9a;
+/* The bronze hairline frame — the SAME border the drawer's edges carry, on
+   ALL FOUR sides. INVISIBLE at rest (no borders while closed); it fades in
+   with the open. The flush-side line is load-bearing: the tab paints at
+   z:50 OVER the drawer, so where they meet this frame supplies the seam
+   (the drawer's own border can hide under the tab's glass to sub-pixel
+   rounding). */
+.fable-drawer-tab::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: inherit;
+    opacity: 0;             /* no borders while the drawer is closed */
+    transition: opacity 320ms cubic-bezier(0.2,0.8,0.2,1);
 }
-/* Locked state: saturated EMERALD GREEN (Chloe 2026-08-10 — was darker brass).
-   Green-vs-steel is an unambiguous "engaged/secured" read, far from the
-   unlocked steel in BOTH hue and luminance. No glow. */
-.fable-edge-lock.visible.locked {
-    background: #3fa66a;
+/* RIGHT tab: anchored at the right drawer's inner edge. The anchor + parked
+   offset use the SAME width formula as .fable-wupi-drawer (clamp capped by
+   its max-width) — keep the three expressions in sync if that rule ever
+   changes. The body's exposed (left) end is softly rounded; the flush side
+   is square so it meets the drawer's edge seamlessly. */
+.fable-drawer-tab--right {
+    right: min(clamp(440px, 27vw, 640px), 90vw);
+    transform: translateY(-50%) translateX(min(clamp(440px, 27vw, 640px), 90vw));
+    border-radius: 6px 0 0 6px;   /* soft exposed end; flush side square */
 }
-.fable-edge-lock.visible.locked:hover {
-    background: #54c98a;
+.fable-drawer-tab--right.is-open { transform: translateY(-50%) translateX(0); }
+/* Open = body at full glass + the bronze frame arrived — same 320ms bezier
+   as the slide, so the tab becomes a seamless framed extension of the panel
+   exactly as the drawer lands. The GLYPH is never part of this fade. */
+.fable-drawer-tab.is-open::before { opacity: 1; }
+.fable-drawer-tab.is-open::after { opacity: 1; }
+/* LEFT tab — the mirror: anchored at the LEFT drawer's inner edge, parked
+   one drawer-width LEFT while closed (its tip flush with the left screen
+   edge). */
+.fable-drawer-tab--left {
+    left: min(clamp(440px, 27vw, 640px), 90vw);
+    transform: translateY(-50%) translateX(calc(-1 * min(clamp(440px, 27vw, 640px), 90vw)));
+    border-radius: 0 6px 6px 0;
 }
+.fable-drawer-tab--left.is-open { transform: translateY(-50%) translateX(0); }
+.fable-drawer-tab:hover { color: var(--fable-brass); }
+/* Locked: the emerald glyph alone — the engaged/secured read. */
+.fable-drawer-tab.locked { color: #3fa66a; }
+.fable-drawer-tab.locked:hover { color: #54c98a; }
+.fable-drawer-tab-glyph {
+    /* relative so the glyph paints ABOVE the (absolute) ::before body */
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+}
+.fable-drawer-tab-glyph svg { display: block; }
 
 /* (The mannequin/stats/stamina/vitals/injuries/legend CSS blocks were
    removed 2026-07-25 with the left-side UI. Find them in git history when
@@ -4048,8 +5071,15 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     box-shadow: 0 24px 60px rgba(0,0,0,0.6), var(--fable-emboss);
     scrollbar-width: thin; scrollbar-color: var(--fable-brass-dim) transparent;
 }
-.fable-panel::-webkit-scrollbar { width: 8px; }
-.fable-panel::-webkit-scrollbar-thumb { background: rgba(203,163,92,0.25); border-radius: 4px; }
+/* (2026-08-24 review fix) Prefixed to outrank flow-cinematic.css's global
+   scrollbar hider (`.app-window.fable-app *::-webkit-scrollbar`, (0,2,0) +
+   loaded later) — at bare `.fable-panel` specificity the visible thin brass
+   scrollbar was zeroed like every hidden one. The standard `scrollbar-width`
+   is re-asserted prefixed too: the global `.app-window.fable-app *`
+   `scrollbar-width: none` beat the bare-class rule on Firefox. */
+.app-window.fable-app .fable-panel { scrollbar-width: thin; scrollbar-color: var(--fable-brass-dim) transparent; }
+.app-window.fable-app .fable-panel::-webkit-scrollbar { width: 8px; }
+.app-window.fable-app .fable-panel::-webkit-scrollbar-thumb { background: rgba(203,163,92,0.25); border-radius: 4px; }
 .panel-head { margin-bottom: 22px; }
 .panel-head h2 {
     margin: 0 0 4px;
@@ -5590,17 +6620,9 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 .fable-mes-text .quote {
     color: #f6efd9;                /* warm ivory — dialogue */
 }
-/* Streaming caret: a brass block cursor appended while a beat is live. */
-.fable-mes.streaming .fable-mes-text::after {
-    content: "▌";
-    color: var(--fable-brass);
-    animation: fableBlink 1s steps(2) infinite;
-    margin-left: 1px;
-}
-@keyframes fableBlink {
-    0%, 49%   { opacity: 1; }
-    50%, 100% { opacity: 0; }
-}
+/* No streaming caret on narrator beats: the blinking block cursor was
+   removed (2026-08-25); streamed prose simply grows until the turn ends.
+   The .streaming class remains a JS state hook with no visual caret. */
 
 /* ── Inline editor (✎ edit mode) ────────────────────────────────── */
 .fable-mes-editor {
@@ -5802,10 +6824,9 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 /* open Wupi drawer (40)?? — no: 45 > 40, so a snapped sprite floats  */
 /* OVER an open drawer. That's the VN-correct read: the character    */
 /* stays visible as the foreground even when the management drawer   */
-/* is summoned. Below the edge-lock (50) so the lock bar never gets  */
-/* covered. (If the drawer-over-sprite read ever feels wrong, drop   */
-/* this to 35 — but the VN sprite-as-foreground convention is the    */
-/* intent.)                                                          */
+/* is summoned. Below the drawer tabs (50) so they never get covered.  */
+/* (If the drawer-over-sprite read ever feels wrong, drop this to    */
+/* 35 — but the VN sprite-as-foreground convention is the intent.)   */
 .fable-mes-avatar-img.vn-snapped {
     position: fixed;
     bottom: 14px;
@@ -6547,6 +7568,23 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     visibility: hidden;
     opacity: 0;
 }
+/* (2026-08-26 Chloe) ‹ is never VISIBLE on the FIRST variant — the bar at
+   active 0 reads "1 / 2 ›" with no left chevron. Same visibility/opacity
+   discipline as the :not(.multi) gate above (slot reserved, no re-flow,
+   the base opacity transition fades it back in on a swipe back). */
+.fable-mes-drawer.at-first .fable-mes-drawer-variantbar [data-drawer-act="prev"] {
+    visibility: hidden;
+    opacity: 0;
+}
+/* (2026-08-26 Chloe) A swipe-LOCKED beat (an assistant beat with a later
+   message — the intro beat once turns start, any beat after a rewind)
+   renders NO variant affordance at all. The backend's trailing-beat
+   contract refuses its swipes, so grayed-out ‹ 1/2 › chevrons were a dead
+   UI that read as broken ("it says 1/2 but nothing works"). The gold
+   edit/delete pair above stays untouched. */
+.fable-mes-drawer.is-locked .fable-mes-drawer-variantbar {
+    display: none;
+}
 
 /* ── History-beat iron tools (2026-08-14 per Chloe) ────────────────── */
 /* The ARCHIVE beats (.vn-history — everything older than the recent 2)  */
@@ -6663,7 +7701,9 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 /* it can float over any beat regardless of each beat's transform/overflow. */
 .fable-slice-pencil {
     position: fixed;
-    z-index: 60;                          /* above bubbles + drawer chrome */
+    /* Body-mounted sibling of the opaque .app-window.fable-app (z:4000) —
+       must clear it like every other body-mounted chrome (100100). */
+    z-index: 100100;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -6725,7 +7765,8 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
 /* The in-place streaming target while a slice is regenerating. Sits       */
 /* between the beat's pre + post prose; a faint brass underline + soft    */
 /* glow mark the active splice site so the player sees exactly where the   */
-/* replacement is landing. Empty (data-empty) → a 1ch brass caret pulse.  */
+/* replacement is landing (no block caret; the blinking cursor was        */
+/* removed 2026-08-25).                                                   */
 .fable-slice-streaming {
     background: linear-gradient(
         transparent 92%,
@@ -6735,21 +7776,6 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     border-radius: 2px;
     box-shadow: 0 0 8px rgba(197, 179, 88, 0.22);
     min-width: 1ch;
-}
-.fable-slice-streaming[data-empty="1"]::before {
-    content: '\2592';                       /* a faint block caret */
-    color: var(--fable-brass-bright);
-    opacity: 0.55;
-    animation: fable-slice-blink 1s steps(2, end) infinite;
-}
-@keyframes fable-slice-blink {
-    0%, 100% { opacity: 0.55; }
-    50%      { opacity: 0.15; }
-}
-@media (prefers-reduced-motion: reduce) {
-    .fable-slice-streaming[data-empty="1"]::before {
-        animation: none;
-    }
 }
 /* While a beat is mid-slice-regen, the pencil is suppressed (no           */
 /* re-selections allowed until the in-flight one lands).                   */
@@ -6945,6 +7971,25 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
         flex-direction: column;
         gap: 56px;
     }
+}
+
+/* =============================================================
+   LOAD SPLIT PYRAMID (2026-08-23 rework) — the title LOAD flow's
+   three-way chooser: PLAYER on top, SIM bottom-left, CODEX bottom-right.
+   The wrapper ONLY arranges — every visual comes from the shared
+   .fable-newgame-tile slab CSS above, so the chooser reads as exactly the
+   New Game tile language. The rows reuse .fable-newgame-tile-row (same
+   centering + the same gap family), so only the vertical stacking + its
+   gap are defined here.
+   ============================================================= */
+.fable-load-split {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: clamp(24px, 5vw, 80px);   /* the pair row's gap family */
+    width: 100%;
 }
 
 /* =============================================================
@@ -7291,9 +8336,659 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     border-color: rgba(244, 114, 114, 0.45);
     box-shadow: 0 2px 14px rgba(0, 0, 0, 0.45), 0 0 12px rgba(244, 114, 114, 0.28);
 }
+/* (2026-08-23 hazard referees) the rest-interruption bubble — a troubled
+   sleep, not a wound: a dusky violet tint, distinct from the injury red. */
+.fable-turn-notice.is-rest {
+    color: #d8c7f5;
+    border-color: rgba(167, 127, 235, 0.45);
+    box-shadow: 0 2px 14px rgba(0, 0, 0, 0.45), 0 0 12px rgba(167, 127, 235, 0.26);
+}
+/* (2026-08-24 Part II B8) the rank-advance bubble — mastery deepens: a
+   quiet brass sheen, celebratory without the injury's alarm. */
+.fable-turn-notice.is-skill {
+    color: #f2dfa2;
+    border-color: rgba(212, 175, 55, 0.5);
+    box-shadow: 0 2px 14px rgba(0, 0, 0, 0.45), 0 0 12px rgba(212, 175, 55, 0.3);
+}
 @keyframes fable-turn-notice-in {
     /* Fully off the left edge → slides in to its slot (the viewport
        clips the overshoot; leftward overflow never spawns a scrollbar). */
     from { opacity: 0; transform: translateX(calc(-100% - 24px)); }
     to   { opacity: 1; transform: none; }
 }
+
+/* =============================================================
+   THE PLAYGROUND (2026-08-23) — the Sand Table turned player-facing
+   UI. The wand in the brand header reveals the [ PLAYGROUND ACTIVE ]
+   strip over the tab-rail zone + the domain panel beneath. All rules
+   live under fable-playground-*; z-index stays local to the rail mount
+   (no ladder conflicts).
+   ============================================================= */
+
+/* The wand trigger — absolutely pinned right in the header so the
+   centered WUPI brand never shifts. Redone 2026-08-24 as a CAST TILE:
+   a small light-bronze square with the wand glyph stamped INTO the metal
+   (darker bronze fill + inset shadow on the tile reads as an imprint).
+   Tile 30px + 22px glyph, both sparkles enlarged (Chloe 2026-08-24).
+   Idle = quiet bronze; hover brightens the tile; pressed (aria-pressed)
+   = brass glow ring, same as the foot-icon active family. */
+.fable-playground-wand,
+.fable-chronicle-book {
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 30px;
+    height: 30px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(180deg, #b08d57 0%, #9a7742 55%, #8a6835 100%);
+    border: 1px solid #6f5228;
+    border-radius: 5px;
+    color: #4a3416;
+    cursor: pointer;
+    padding: 0;
+    box-shadow:
+        inset 0 1px 0 rgba(255, 233, 190, 0.45),
+        inset 0 -1px 0 rgba(0, 0, 0, 0.35),
+        inset 1px 0 0 rgba(255, 233, 190, 0.12),
+        inset -1px 0 0 rgba(0, 0, 0, 0.18);
+    transition: filter 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+.fable-playground-wand svg,
+.fable-chronicle-book svg { width: 22px; height: 22px; display: block; overflow: visible; }
+.fable-playground-wand:hover,
+.fable-chronicle-book:hover {
+    filter: brightness(1.12);
+    border-color: #8a6a38;
+}
+.fable-playground-wand:active,
+.fable-chronicle-book:active { filter: brightness(0.95); }
+.fable-playground-wand.is-active,
+.fable-playground-wand[aria-pressed="true"] {
+    border-color: var(--fable-brass);
+    box-shadow:
+        inset 0 1px 0 rgba(255, 233, 190, 0.45),
+        inset 0 -1px 0 rgba(0, 0, 0, 0.35),
+        0 0 10px var(--fable-brass-glow);
+}
+
+/* (2026-08-25) The Chronicle book — the wand tile's twin pinned directly
+   LEFT of the wand (right:46px = the wand's 10px + 30px tile + 6px gap);
+   the centered WUPI brand never shifts because both tiles are absolute.
+   Opens the chronicle overlay — a momentary opener, so it never carries
+   the wand's pressed/glow state. */
+.fable-chronicle-book { right: 46px; }
+
+/* The mount anchors the ABSOLUTE strip + owns the rail-zone height — the
+   ONE custom property both the rail-zone layout + the strip reference
+   (same stylesheet, one source of truth). 56px = divider (1 + 8 below) +
+   rail row (38 + 8 pad) + border (1). */
+.fable-tab-rail-mount {
+    position: relative;
+    --fable-rail-zone-h: 56px;
+    /* (2026-08-25) Clips the Playground strip's slide so it emerges from
+       below the header divider — WITHOUT this the translateY(-110%) hidden
+       state sits over the WUPI brand and the reveal falls across it. */
+    overflow: clip;
+}
+
+/* The covering strip — slides over the rail zone when the wand is on.
+   (2026-08-25 rework) STACKED + CENTERED: the PLAYGROUND ACTIVE label on
+   top (bigger), the three domain buttons UNDER it. The bar SPANS THE FULL
+   rail zone (min-height = --fable-rail-zone-h) so it reaches the second
+   divider and sits flush on the panel below — the covered rail stays
+   painted underneath (no see-through sliver, nothing swallows clicks).
+   TOP-anchored under the header divider: the mount's overflow:clip
+   contains the translateY(-110%) hidden state, so the reveal FALLS from
+   just below WUPI's divider (never across the brand, never rising from
+   the rail's own bottom border). */
+.fable-playground-strip {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    min-height: var(--fable-rail-zone-h);
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    padding: 2px 14px 2px;
+    background: linear-gradient(180deg, rgba(22, 18, 12, 0.98), rgba(18, 15, 10, 0.99));
+    border-bottom: 1px solid var(--fable-glass-line);
+    transform: translateY(-110%);
+    visibility: hidden;
+    transition: transform 320ms cubic-bezier(0.2, 0.8, 0.2, 1), visibility 0s linear 320ms;
+    z-index: 2;
+}
+.fable-playground-strip.is-open {
+    transform: translateY(0);
+    visibility: visible;
+    transition: transform 320ms cubic-bezier(0.2, 0.8, 0.2, 1), visibility 0s;
+}
+.fable-playground-strip__label {
+    font-size: 14px;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    color: var(--fable-brass-bright);
+    text-shadow: 0 0 8px var(--fable-brass-glow);
+    white-space: nowrap;
+    line-height: 1.1;
+}
+/* The label's fade divider — the same transparent → line → transparent
+   gradient the rail divider + most Fable hairlines use. */
+.fable-playground-strip__divider {
+    width: calc(70% - 28px);
+    height: 2px;
+    margin: 1px 0 2px;
+    background: linear-gradient(90deg, transparent, var(--fable-glass-line), transparent);
+}
+.fable-playground-strip__domains {
+    display: flex;
+    gap: 6px;
+}
+.fable-playground-strip__btn {
+    width: 32px;
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    color: var(--fable-text-faint);
+    cursor: pointer;
+    padding: 0;
+    transition: color 160ms ease, border-color 160ms ease, background 160ms ease, box-shadow 160ms ease;
+}
+.fable-playground-strip__btn svg { width: 22px; height: 22px; display: block; }
+.fable-playground-strip__btn:hover { color: var(--fable-text); border-color: var(--fable-brass-dim); }
+.fable-playground-strip__btn.is-active {
+    color: var(--fable-brass-bright);
+    border-color: var(--fable-brass);
+    background: rgba(197, 179, 88, 0.10);
+    box-shadow: 0 0 10px var(--fable-brass-glow), inset 0 0 6px rgba(230, 213, 138, 0.10);
+}
+
+/* The domain content area — scrollable like the tab dropdown (42vh cap,
+   thin scrollbar). */
+.fable-playground-panel {
+    max-height: 42vh;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    padding: 12px 16px 14px;
+    border-bottom: 1px solid var(--fable-glass-line);
+    background: rgba(16, 13, 9, 0.55);
+}
+.fable-playground-panel[hidden] { display: none; }
+
+/* Sections / rows / controls — the brass token vocabulary. */
+.fable-playground-section { margin-bottom: 12px; }
+.fable-playground-section__title {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--fable-brass);
+    margin-bottom: 6px;
+}
+.fable-playground-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+.fable-playground-lbl {
+    font-size: 12px;
+    color: var(--fable-text);
+    white-space: nowrap;
+}
+.fable-playground-btn {
+    background: transparent;
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 6px;
+    color: var(--fable-text);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    padding: 4px 9px;
+    cursor: pointer;
+    transition: color 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+}
+.fable-playground-btn:hover { color: var(--fable-brass-bright); border-color: var(--fable-brass); }
+.fable-playground-btn:disabled { opacity: 0.45; cursor: default; }
+.fable-playground-btn.is-on {
+    color: var(--fable-brass-bright);
+    border-color: var(--fable-brass);
+    background: rgba(197, 179, 88, 0.12);
+    box-shadow: 0 0 8px var(--fable-brass-glow);
+}
+.fable-playground-input,
+.fable-playground-select {
+    background: rgba(10, 8, 5, 0.7);
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 6px;
+    color: var(--fable-text);
+    font-size: 12px;
+    padding: 4px 7px;
+    min-width: 0;
+}
+.fable-playground-input--num { width: 62px; }
+.fable-playground-input:focus,
+.fable-playground-select:focus {
+    outline: none;
+    border-color: var(--fable-brass);
+}
+.fable-playground-taglbl {
+    font-size: 11px;
+    color: var(--fable-text-faint);
+    margin-right: 2px;
+}
+
+/* Inline report lines — ok (brass), error (backend errors verbatim, red),
+   info (dim). */
+.fable-playground-report {
+    font-size: 11.5px;
+    line-height: 1.45;
+    color: var(--fable-brass-bright);
+    padding: 4px 0 2px;
+    overflow-wrap: anywhere;
+}
+.fable-playground-report.is-error { color: #fca5a5; }
+.fable-playground-report.is-info { color: var(--fable-text-faint); }
+
+.fable-playground-directive {
+    font-size: 11px;
+    line-height: 1.45;
+    color: var(--fable-text-faint);
+    padding: 2px 0;
+    overflow-wrap: anywhere;
+}
+.fable-playground-error {
+    font-size: 12px;
+    color: #fca5a5;
+    padding: 8px 0;
+    overflow-wrap: anywhere;
+}
+.fable-playground-empty {
+    font-size: 11.5px;
+    color: var(--fable-text-faint);
+    padding: 4px 0;
+}
+.fable-playground-depth {
+    font-size: 10.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--fable-text-faint);
+    margin-bottom: 4px;
+    display: inline-block;
+}
+
+/* NPC cards inside the State & Bond Overrides section. */
+.fable-playground-npc {
+    border: 1px solid var(--fable-glass-line);
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin-bottom: 8px;
+}
+.fable-playground-npc__head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+.fable-playground-npc__name {
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--fable-text);
+}
+.fable-playground-npc__id {
+    font-size: 10.5px;
+    color: var(--fable-text-faint);
+}
+.fable-playground-npc__core {
+    font-size: 9.5px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    color: var(--fable-brass);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 4px;
+    padding: 1px 5px;
+}
+.fable-playground-npc__archived {
+    font-size: 11px;
+    color: var(--fable-text-faint);
+    font-style: italic;
+    margin-bottom: 4px;
+}
+.fable-playground-tierlbl {
+    min-width: 84px;
+    color: var(--fable-brass-bright);
+}
+
+/* The near-name candidate list. */
+.fable-playground-nearlist {
+    border-left: 2px solid var(--fable-brass-dim);
+    padding-left: 8px;
+    margin: 4px 0 8px;
+}
+
+/* Reduced motion: the strip reveal snaps instead of sliding. */
+@media (prefers-reduced-motion: reduce) {
+    .fable-playground-strip,
+    .fable-playground-strip.is-open {
+        transition: none;
+    }
+}
+
+/* =============================================================
+   ASSET CHIPS on the site map (2026-08-24 Part II C2; redesigned
+   2026-08-25 from the location-ui demo) — ONE BIG per-kind marker
+   glyph centered under the node name. Icons stroke currentColor and
+   inherit the node's knowledge tint; the colored markers (quest white,
+   loot green, hazard amber, friendly blue, hostile red, boss white)
+   carry inline-styled <g> markup so their color survives this
+   currentColor rule. State overlays (slash/hollow/dot/suspected-dim)
+   and the "+N" overflow label are REMOVED — chips are glyph-only;
+   states ride the hover text ("Aged Cask (taken)").
+   ============================================================= */
+.site-map-chip {
+    color: inherit;
+}
+.site-map-chip .site-map-chip-glyph {
+    stroke: currentColor;
+    stroke-width: 1.05;
+    fill: none;
+}
+
+/* =============================================================
+   NPC DOSSIER (2026-08-24 Part II C1) — the cast-card deep-dive
+   popup, mounted inside the panel overlay (the id-card details
+   pattern; z sits above the panel content, below stage toasts).
+   ============================================================= */
+.fable-npc-dossier-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 52;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 5vh 24px;
+    opacity: 0;
+    transition: opacity 220ms ease;
+    pointer-events: none;
+}
+/* (2026-08-24 review P2) The fetch-failure notice — a transient inline
+   replacement for the dead click, centered like the modal. */
+.fable-npc-dossier-error {
+    position: absolute;
+    left: 50%;
+    bottom: 18px;
+    transform: translateX(-50%);
+    max-width: 80%;
+    padding: 8px 14px;
+    background: rgba(30, 16, 16, 0.92);
+    border: 1px solid rgba(244, 114, 114, 0.5);
+    border-radius: 6px;
+    color: #f47272;
+    font-size: 12.5px;
+    text-align: center;
+    z-index: 53;
+    pointer-events: none;
+}
+.fable-npc-dossier-overlay[hidden] { display: none; }
+.fable-npc-dossier-overlay.is-open { opacity: 1; pointer-events: auto; }
+.fable-npc-dossier-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(2, 4, 10, 0.85);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+}
+.fable-npc-dossier-modal {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    width: min(640px, 92vw);
+    max-height: 82vh;
+    overflow: hidden;
+    background: linear-gradient(180deg, rgba(38, 26, 16, 0.98), rgba(20, 14, 9, 0.98));
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 12px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.7), var(--fable-emboss);
+    transform: scale(0.92);
+    transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.fable-npc-dossier-overlay.is-open .fable-npc-dossier-modal { transform: scale(1); }
+.fable-npc-dossier-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 18px 10px;
+    border-bottom: 1px solid var(--fable-brass-dim);
+}
+.fable-npc-dossier-title {
+    font-family: var(--fable-font-display);
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--fable-brass-bright);
+    text-shadow: 0 0 12px var(--fable-brass-glow);
+}
+.fable-npc-dossier-close {
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    background: transparent;
+    border: 1px solid var(--fable-glass-line);
+    color: var(--fable-text-dim);
+    font-size: 14px;
+    cursor: pointer;
+}
+.fable-npc-dossier-close:hover { color: #f47272; border-color: rgba(244, 114, 114, 0.5); }
+.fable-npc-dossier-body {
+    overflow-y: auto;
+    padding: 12px 18px 18px;
+}
+.fable-npc-dossier-section { margin-bottom: 14px; }
+.fable-npc-dossier-section h3 {
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    color: var(--fable-brass);
+    margin: 0 0 6px;
+}
+.fable-npc-dossier-row {
+    display: flex;
+    gap: 10px;
+    padding: 3px 0;
+    font-size: 14px;
+}
+.fable-npc-dossier-row dt {
+    min-width: 96px;
+    color: var(--fable-text-dim);
+}
+.fable-npc-dossier-row dd {
+    margin: 0;
+    color: var(--fable-text);
+    white-space: pre-line;
+}
+.fable-npc-dossier-events,
+.fable-npc-dossier-tasks {
+    list-style: none;
+    margin: 4px 0 0;
+    padding: 0;
+}
+.fable-npc-dossier-events li,
+.fable-npc-dossier-tasks li {
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 2px 0;
+    font-size: 13.5px;
+    color: var(--fable-text);
+}
+.fable-npc-dossier-events li.is-hostile span:first-child { color: #f47272; }
+.fable-npc-dossier-pts { color: var(--fable-brass); }
+.fable-npc-dossier-task-meta { color: var(--fable-text-dim); font-size: 12.5px; }
+.fable-npc-dossier-empty {
+    color: var(--fable-text-dim);
+    font-size: 13px;
+    font-style: italic;
+}
+
+/* =============================================================
+   THE CHRONICLE (2026-08-24 Part II C3) — the pin/rollback panel.
+   Overlay chrome mirrors the backgrounds panel (z:46 above the
+   drawer's 40); rows are turn cards with PIN / ROLLBACK actions.
+   ============================================================= */
+.fable-chronicle-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 46;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 5vh 24px;
+    opacity: 0;
+    transition: opacity 220ms ease;
+    pointer-events: none;
+}
+.fable-chronicle-overlay[hidden] { display: none; }
+.fable-chronicle-overlay.is-open { opacity: 1; pointer-events: auto; }
+.fable-chronicle-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(2, 4, 10, 0.75);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+}
+.fable-chronicle-modal {
+    position: relative;
+    z-index: 2;
+    display: flex;
+    flex-direction: column;
+    width: min(720px, 92vw);
+    max-height: 82vh;
+    overflow: hidden;
+    background: linear-gradient(180deg, rgba(38, 26, 16, 0.97), rgba(20, 14, 9, 0.97));
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 12px;
+    box-shadow: 0 24px 60px rgba(0, 0, 0, 0.7), var(--fable-emboss);
+    transform: scale(0.92);
+    transition: transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.fable-chronicle-overlay.is-open .fable-chronicle-modal { transform: scale(1); }
+.fable-chronicle-close {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    z-index: 3;
+    width: 30px; height: 30px;
+    border-radius: 50%;
+    background: transparent;
+    border: 1px solid var(--fable-glass-line);
+    color: var(--fable-text-dim);
+    font-size: 14px;
+    cursor: pointer;
+}
+.fable-chronicle-close:hover { color: #f47272; border-color: rgba(244, 114, 114, 0.5); }
+.fable-chronicle-modal-body {
+    overflow-y: auto;
+    padding: 16px 18px 18px;
+}
+.fable-chronicle-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.fable-chronicle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 12px;
+    background: rgba(197, 179, 88, 0.06);
+    border: 1px solid var(--fable-glass-line);
+    border-left: 3px solid var(--fable-brass-dim);
+    border-radius: 6px;
+    /* (2026-08-24 review P2) The inline pin/rollback failure line wraps to
+       its own row when present. */
+    flex-wrap: wrap;
+}
+.fable-chronicle-row.is-pinned {
+    border-left-color: var(--fable-brass-bright);
+    background: rgba(197, 179, 88, 0.12);
+}
+.fable-chronicle-row-main { min-width: 0; flex: 1; }
+.fable-chronicle-snippet {
+    font-size: 14px;
+    color: var(--fable-text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.fable-chronicle-meta {
+    font-size: 12px;
+    color: var(--fable-text-dim);
+    margin-top: 2px;
+}
+.fable-chronicle-row-actions {
+    display: flex;
+    gap: 6px;
+    flex: 0 0 auto;
+}
+.fable-chronicle-loading {
+    color: var(--fable-text-dim);
+    font-size: 14px;
+    text-align: center;
+    padding: 24px 0;
+}
+/* (2026-08-24 review P2) Inline pin/rollback failure surface — the close
+   button's hover red, dim enough to sit under the row actions. */
+.fable-chronicle-row-error {
+    flex-basis: 100%;
+    font-size: 12px;
+    color: #f47272;
+    margin-top: 4px;
+}
+
+/* =============================================================
+   PROGRESS CLOCKS (2026-08-24 Part II C4) — conic-gradient ring
+   chips for deadline-bearing quests + promises in the World tab.
+   Brass ring fills with elapsed fraction; overdue flips red.
+   ============================================================= */
+.fable-clock-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    max-width: 100%;
+}
+.fable-clock-ring {
+    position: relative;
+    width: 18px;
+    height: 18px;
+    flex: 0 0 auto;
+    border-radius: 50%;
+    background:
+        radial-gradient(farthest-side, rgba(20, 14, 9, 1) calc(100% - 3px), transparent calc(100% - 3px)),
+        conic-gradient(var(--fable-brass) calc(var(--clock-frac) * 360deg), rgba(122, 94, 44, 0.25) 0deg);
+    box-shadow: 0 0 6px rgba(212, 175, 55, 0.35);
+}
+.fable-clock-chip.is-overdue .fable-clock-ring {
+    background:
+        radial-gradient(farthest-side, rgba(20, 14, 9, 1) calc(100% - 3px), transparent calc(100% - 3px)),
+        conic-gradient(#f47272 360deg);
+    box-shadow: 0 0 6px rgba(244, 114, 114, 0.45);
+}
+.fable-clock-text {
+    font-size: 12.5px;
+    color: var(--fable-text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.fable-clock-chip.is-overdue .fable-clock-text { color: #f47272; }

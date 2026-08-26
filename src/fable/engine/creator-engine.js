@@ -100,8 +100,8 @@ export function buildReviewSections(kind, d) {
           .map(([k, v]) => row(prettyTagKey(k), v))
           .filter(Boolean)
       : [];
-    // The v2 inventory seed (the optional sibling) — accepts either the
-    // structured inventory object or the legacy flat fields.
+    // The inventory seed (the optional sibling) — accepts either the
+    // structured inventory object or GLM's flat draft fields.
     const inv = d.inventory && typeof d.inventory === 'object' && !Array.isArray(d.inventory) ? d.inventory : {};
     const persona = d.persona && typeof d.persona === 'object' && !Array.isArray(d.persona) ? d.persona : {};
     return [
@@ -113,7 +113,7 @@ export function buildReviewSections(kind, d) {
         row('Clothing', inv.clothing != null ? inv.clothing : d.clothing),
         row('Equipped', inv.equipped != null ? inv.equipped : d.equipped),
         row('Accessories', inv.accessories != null ? inv.accessories : d.accessories),
-        row('Stored', inv.stored != null ? inv.stored : d.gear),
+        row('Stored', inv.stored != null ? inv.stored : d.stored),
       ].filter(Boolean)],
       // The OPT-IN persona block (2026-08-19: the wizard's final question —
       // absent entirely when the player declined).
@@ -128,7 +128,7 @@ export function buildReviewSections(kind, d) {
       ].filter(Boolean)],
       // (2026-08-22 Chloe ruling) NO wealth/currency/fame/popularity/reputation
       // section — money is inventory-only; standings are live tracker state
-      // that never appears on a card (even from a legacy draft carrying them).
+      // that never appears on a card (even from a draft carrying them).
       ['Custom tags', customRows],
     ].filter(([, rows]) => rows.length);
   }
@@ -156,7 +156,7 @@ export function buildReviewSections(kind, d) {
         row('Clothing', d.clothing),
         row('Equipped', d.equipped),
         row('Accessories', d.accessories),
-        row('Stored', d.stored != null ? d.stored : d.gear),
+        row('Stored', d.stored),
       ].filter(Boolean)]);
     } else if (subtype === 'scenario') {
       sections.push(['Scenario', [row('Premise', d.directive), row('Trigger', d.trigger_condition), row('Objective', d.primary_objective), row('Actors', d.participating_actors), row('Hazards', d.environmental_hazards), row('Outcomes', d.outcomes)].filter(Boolean)]);
@@ -310,7 +310,7 @@ function playerIdCard(d, isNpc) {
       idRow('Clothing', inv.clothing != null ? inv.clothing : d.clothing),
       idRow('Equipped', inv.equipped != null ? inv.equipped : d.equipped),
       idRow('Accessories', inv.accessories != null ? inv.accessories : d.accessories),
-      idRow('Stored', inv.stored != null ? inv.stored : d.gear),
+      idRow('Stored', inv.stored != null ? inv.stored : d.stored),
     ].filter(Boolean)],
     ['Holdings', holdingsRows(d)],
     // The OPT-IN persona block (2026-08-19) — absent entirely when the
@@ -489,7 +489,7 @@ export function missingMandatoryFields(kind, d) {
     // marker (an absence with no marker means the wizard never asked).
     const subtype = toText(draft.card_type).toLowerCase();
     if (subtype === 'npc'
-      && !['equipped', 'accessories', 'stored', 'gear'].some((k) => mandatoryFilled(draft[k]))
+      && !['equipped', 'accessories', 'stored'].some((k) => mandatoryFilled(draft[k]))
       && draft.items_answered !== false) {
       missing.push('items_answer');
     }

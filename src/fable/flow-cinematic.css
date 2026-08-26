@@ -2257,7 +2257,9 @@
     left: 50%;
     bottom: 34px;
     transform: translateX(-50%) translateY(16px);
-    z-index: 90;
+    /* Body-mounted sibling of the opaque .app-window.fable-app (z:4000) —
+       must clear it like every other body-mounted chrome (100100). */
+    z-index: 100100;
     max-width: min(680px, 86vw);
     padding: 12px 22px;
     border-radius: 10px;

@@ -115,14 +115,37 @@ export function withShellBusy(task) {
 // (wupi.html bundles all three surfaces — shell, Fable, PRISM), so one
 // document-level listener covers everything. These run BEFORE the
 // shellBusy gate: they block in every state, busy or not.
+//
+// (2026-08-23, Chloe ruling) THE ONE SANCTIONED RIGHT-CLICK SURFACE: the
+// spellchecker's custom context menu (engine/spellcheck.js — correction
+// candidates + the spellcheck toggle) on written inputs in TWO zones:
+// every text entry inside #fable, and the OS-home Wupi chat input in
+// #chat. The NATIVE menu stays dead everywhere, INCLUDING there — the
+// guard still calls preventDefault() unconditionally. What changes is
+// propagation only: a registered pass-through predicate may let the
+// event reach the spellchecker's own listener (this guard's capture
+// listener would otherwise stopImmediatePropagation it into the void).
+// The predicate lives in the spellcheck module — this file stays
+// surface-agnostic.
 function isReloadKey(e) {
   if (e.key === 'F5') return true;
   return (e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'r' || e.key === 'R');
 }
 
+let contextMenuPassThrough = null;
+
+// Register the single consumer allowed to see contextmenu events (the
+// native menu remains blocked for it too). Pass null to revoke.
+export function setContextMenuPassThrough(fn) {
+  contextMenuPassThrough = typeof fn === 'function' ? fn : null;
+}
+
 export function initShellGuard() {
   document.addEventListener('contextmenu', (e) => {
+    // Native menu: dead everywhere, no exceptions.
     e.preventDefault();
+    // Propagation: swallowed unless the sanctioned surface claims it.
+    if (contextMenuPassThrough && contextMenuPassThrough(e)) return;
     e.stopImmediatePropagation();
   }, { capture: true });
   ['click', 'pointerdown', 'keydown'].forEach((evt) => {
@@ -141,4 +164,7 @@ export function initShellGuard() {
 
 // Auto-register on import. The guard is a pure no-op when shellBusy is
 // false (the common case), so there's no cost to mounting it eagerly.
-initShellGuard();
+// (The `document` probe keeps the module importable under plain Node —
+// tests/spellcheck.test.mjs reaches this file through engine/spellcheck.js.
+// In the browser the guard arms exactly as before.)
+if (typeof document !== 'undefined') initShellGuard();

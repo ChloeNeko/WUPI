@@ -47,10 +47,11 @@
 // DOM, not the IPC, mirroring the hooks pattern beats.js already uses.
 // =============================================================
 
-// Tuning constants. The flank band mirrors stage.js's EDGE_HIT_PX (14px)
-// so the drawer-trigger shrink + the flank-toggle coexist.
+// Tuning constants. The flank band (2026-08-25: 14 → 40) starts PAST the
+// 12px drawer tabs — a tab (z:50) eats edge dblclicks inside its width, so
+// the flank-toggle needs reach beyond it to stay usable.
 const RECENT_BEATS = 2;             // last N dialogue beats tagged vn-recent
-const FLANK_BAND_PX = 14;           // dblclick-within-X-px-of-edge toggles portraits
+const FLANK_BAND_PX = 40;           // dblclick-within-X-px-of-edge toggles portraits
 
 // Module state — all listeners + observers are owned here so teardown()
 // can release every one. The stage DOM is reused across entries (see

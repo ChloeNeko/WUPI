@@ -129,12 +129,37 @@ impl Embedder for StubEmbedder {
             for b in text.as_bytes() {
                 v[(*b as usize) % dim] += 1.0;
             }
+            // L2-normalize (2026-08-24 bug-5 fix): the stub is a RUNTIME
+            // fallback, not a test-only toy — lib.rs constructs it when
+            // Embed.gguf is missing or fails to load — and every consumer of
+            // these vectors (vec0's L2 metric, the cos = 1 − d²/2 conversion,
+            // Rust-side cosine gates) assumes unit length. Un-normalized
+            // histograms scaled with text length and poisoned the vec0 index
+            // PERSISTENTLY across boots. Mirrors `LlamaCppEmbedder`'s
+            // post-pooling normalization (memory_embedder_llama.rs).
+            l2_normalize(&mut v);
             Ok(v)
         })
     }
 
     fn dim(&self) -> usize {
         self.dim
+    }
+}
+
+/// In-place L2 normalization; a zero vector is left as-is (its norm is 0 —
+/// dividing would NaN; the only zero histogram is empty input, which the
+/// callers filter before embedding). Local twin of the llama embedder's
+/// private helper: this file is the CUDA-free seam and must not import from
+/// the llama-cpp-2-linked module.
+fn l2_normalize(v: &mut [f32]) {
+    let sum_sq: f32 = v.iter().map(|x| x * x).sum();
+    if sum_sq <= 0.0 {
+        return;
+    }
+    let norm = sum_sq.sqrt();
+    for x in v.iter_mut() {
+        *x /= norm;
     }
 }
 
@@ -178,6 +203,32 @@ mod tests {
         let b = rt.block_on(s.embed("world hello".into())).expect("embed b");
         let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
         assert!(dot > 0.0, "overlapping text must be non-orthogonal, dot={dot}");
+    }
+
+    /// (2026-08-24 bug-6 pin) The stub is a RUNTIME fallback (lib.rs builds
+    /// it when Embed.gguf is missing or fails to load), and every consumer
+    /// of its vectors assumes UNIT length — vec0's L2 metric, the
+    /// `cos = 1 − d²/2` conversion, the Rust-side cosine gates. An
+    /// un-normalized histogram poisoned the vec0 index persistently across
+    /// boots; this pins the norm on every output shape.
+    #[test]
+    fn stub_emits_unit_vectors() {
+        let s = StubEmbedder { dim: EMBED_DIM };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test rt");
+        for text in [
+            "hi",
+            "a much longer text with many repeated characters repeated repeated",
+            "追赶在市场广场上的人",
+        ] {
+            let v = rt.block_on(s.embed(text.into())).expect("embed");
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            assert!(
+                (norm - 1.0).abs() < 1e-5,
+                "stub output must be unit-length (got {norm} for {text:?})"
+            );
+        }
     }
 
     #[test]

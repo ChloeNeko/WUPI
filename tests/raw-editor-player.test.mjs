@@ -10,7 +10,7 @@
 //     XML, an empty half, or a deleted divider),
 //   • the open→edit→save flow against the REAL module (stubbed Tauri):
 //     each half writes through its own IPC ONLY when it changed, and an
-//     XML-only session (no player.json yet) keeps the legacy whole-text
+//     XML-only session (no player.json yet) keeps the XML-only whole-text
 //     save.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -118,7 +118,7 @@ test('combinePlayerRawText: empty JSON half yields the XML alone; round-trips', 
 });
 
 test('playerRawTextLooksValid: each half gates in its own format', () => {
-  assert.equal(editor.playerRawTextLooksValid(XML), true, 'XML alone (legacy shape)');
+  assert.equal(editor.playerRawTextLooksValid(XML), true, 'XML alone (.player only)');
   assert.equal(editor.playerRawTextLooksValid(editor.combinePlayerRawText(XML, JSON_TXT)), true, 'both halves good');
   assert.equal(
     editor.playerRawTextLooksValid(editor.combinePlayerRawText(XML, '{ "player_state": ')),
@@ -244,7 +244,7 @@ test('save: an XML-half edit writes ONLY the .player XML (divider + JSON strippe
   assert.ok(!calls.some((c) => c.cmd === 'fable_json_raw_set'), 'unchanged JSON half is not recomposed over the live schema');
 });
 
-test('XML-only session (no player.json yet): legacy shape end to end', async () => {
+test('XML-only session (no player.json yet): XML-only session end to end', async () => {
   const ui = build();
   invokeImpl = async (cmd) => {
     if (cmd === 'fable_active_player_get') return { id: 'alex' };
@@ -268,4 +268,42 @@ test('XML-only session (no player.json yet): legacy shape end to end', async () 
   assert.ok(set, 'whole-text .player save (the pre-combined behavior)');
   assert.ok(set.args.xml.includes('<note>'));
   assert.ok(!calls.some((c) => c.cmd === 'fable_json_raw_set'), 'no session-state write without a JSON half');
+});
+
+// (2026-08-24 pending-load lock) A ✓ clicked while openRawEditor's read is
+// still resolving must be a no-op — the textarea is the EMPTY pre-fill in
+// that window, and saving it would wipe the file (the codex case: an empty
+// compound text over a real library file). The button stays disabled, the
+// guard holds even for a dispatched click, and ↻ is inert too.
+test('pending-load window: ✓ and ↻ are inert until the read resolves (no empty-file wipe)', async () => {
+  const ui = build();
+  const CODEX = '---\ntitle: Lore\ntags: one, two\n---\n\nSome lore body.';
+  let release = null;
+  const gate = new Promise((r) => { release = r; });
+  invokeImpl = async (cmd) => {
+    if (cmd === 'fable_codex_file_read') { await gate; return { raw: CODEX }; }
+    if (cmd === 'fable_codex_file_write') throw new Error('must not be reached');
+    return undefined;
+  };
+  calls.length = 0;
+
+  const opening = editor.openRawEditor('codex', null, { codexName: 'Lore' });
+  await settle();
+  assert.ok(editor.isOpen(), 'modal visible during the pending read');
+  assert.equal(ui.save.disabled, true, '✓ disabled while the load is pending');
+  assert.equal(ui.revert.disabled, true, '↻ disabled while the load is pending');
+
+  // A ✓ (and ↻) clicked mid-load must do NOTHING — no write IPC fires.
+  ui.save.dispatch('click');
+  ui.revert.dispatch('click');
+  await settle();
+  assert.ok(!calls.some((c) => c.cmd === 'fable_codex_file_write'),
+    'the pending-load ✓ never reached the write IPC');
+
+  release();
+  await opening;
+  await settle();
+  assert.equal(ui.textarea.value, CODEX, 'the read landed after the gate');
+  assert.equal(ui.revert.disabled, false, '↻ re-enabled once the text lands');
+  assert.equal(ui.save.disabled, false, '✓ re-armed by revalidate on the loaded text');
 });

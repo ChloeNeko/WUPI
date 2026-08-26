@@ -48,6 +48,18 @@ pub const MAX_TOOL_ITERATIONS: usize = 3;
 /// Mirrors `MAX_FAILED_DELTA_ATTEMPTS` (lib.rs) — FIFO eviction above this.
 pub const MAX_FAILED_TOOL_ATTEMPTS: usize = 8;
 
+/// (2026-08-24 hybrid chat) The tool-call OPEN marker as it appears in a raw
+/// model turn. Pub so the hybrid API handoff can filter the local dispatcher's
+/// internal turns out of the GLM message window (an assistant turn whose
+/// `raw_output` contains this marker is a dispatch turn, never a real reply).
+pub const TOOL_CALL_MARKER: &str = "<|tool_call>";
+
+/// (2026-08-24 hybrid chat) Content prefix of the user-role session turn the
+/// agent loop inserts to carry a tool result back to the model. Pub for the
+/// same window-filter; kept in one place so the writer (run_agent_loop) and
+/// the filter (wupi_api_reply) can never drift apart.
+pub const TOOL_RESPONSE_MARKER_PREFIX: &str = "{\"__tool_response__\":true";
+
 // ---------------------------------------------------------------------------
 // Parsing: `<|tool_call>call:name{args}<tool_call|>` → ToolCall
 // ---------------------------------------------------------------------------
@@ -190,8 +202,8 @@ fn parse_args_lenient(span: &str) -> serde_json::Value {
 // ---------------------------------------------------------------------------
 
 /// True iff `path` is safe for a *write* tool (file_write, file_delete,
-/// create_sim_card, delete_sim_card, edit_user_profile) to modify. Read tools
-/// bypass this (`file_read`, `file_list`).
+/// create_sim_card, delete_sim_card) to modify. Read tools have their own
+/// gate: see [`is_readable`] (2026-08-24 — reads used to bypass entirely).
 ///
 /// Designed-by-predicate rather than capability-string: the install root
 /// resolves at runtime (`resolve_install_root`), so we evaluate against a
@@ -203,8 +215,12 @@ fn parse_args_lenient(span: &str) -> serde_json::Value {
 /// Callers MUST canonicalize/sandbox the path first via `sandbox_path` so the
 /// relative path can't escape via `..` traversal.
 pub fn is_writable(rel: &Path) -> bool {
-    // Normalize to forward-slash string for cross-platform matching.
-    let rel_str = path_to_unix(rel);
+    // Normalize to forward-slash string for cross-platform matching. Both
+    // lists match on the LOWERCASED form (2026-08-24): the FS is
+    // case-insensitive on Windows, so "DATA/Wupi.Codex" IS data/wupi.codex —
+    // a case variant must never slip the deny-list, and a case-variant user
+    // path still resolves.
+    let rel_str = path_to_unix(rel).to_lowercase();
     if rel_str.is_empty() {
         return false;
     }
@@ -242,12 +258,20 @@ fn is_denied(rel_str: &str) -> bool {
     }
     // Wupi's own persona + playbook (engine content per §8C, replaced on
     // update). She authors USER codex in data/docs/, never her own docs.
-    // Same carve-out for the Fable playbook — engine content (the simulation
-    // narrator reference), never tool-authored.
+    // The two .prompt files are engine content under the same rule (pinned
+    // here 2026-08-24 rather than relying on allow-list default-deny, so a
+    // future allow-list widening can never make them tool-writable).
     if rel_str == "data/wupi.sim"
         || rel_str == "data/wupi.codex"
         || rel_str == "data/fable.codex"
+        || rel_str == "data/wupi.prompt"
+        || rel_str == "data/fable.prompt"
     {
+        return true;
+    }
+    // Session + crash logs: diagnostics, never tool-authored (a forged log
+    // line would poison the very trail troubleshooting reads).
+    if rel_str.starts_with("logs/") || rel_str == "logs" {
         return true;
     }
     // API config (creds — user edits via the dedicated IPC). Covers the
@@ -284,10 +308,11 @@ fn is_user_data(rel_str: &str) -> bool {
     if rel_str.starts_with("data/docs/") || rel_str == "data/docs" {
         return true;
     }
-    // Operator profile.
-    if rel_str == "data/user.xml" {
-        return true;
-    }
+    // (2026-08-24) data/user.xml is NO LONGER raw-writable/deletable: a bare
+    // file_delete on the operator profile used to succeed, and a raw
+    // file_write bypassed the field caps + XML shape the dedicated tool
+    // enforces. `edit_user_profile` (which writes the fixed path directly,
+    // not through this list) is the single validated mutation path.
     // Fable scenario cards (incl. per-card saves/ + .codex + portraits — the
     // per-card folder layout) + the saved-player identity library.
     // (2026-08-16 audit LOW) Allow-list drift fix: the deleted legacy flat
@@ -299,6 +324,41 @@ fn is_user_data(rel_str: &str) -> bool {
         || rel_str.starts_with("apps/fable/players/")
         || rel_str == "apps/fable/players"
     {
+        return true;
+    }
+    false
+}
+
+/// True iff `path` is safe for a *read* tool (`file_read`, `file_list`).
+/// Positive allowlist (2026-08-24): the user-data trees (`apps/`, `data/docs/`)
+/// plus the operator profile and Wupi's OWN playbook `data/wupi.codex` — the
+/// ONE engine-content exception, and strictly read-only (`is_writable` refuses
+/// it, so a read can never become a write or delete). Every other engine
+/// surface (`data/wupi.sim`, both `.prompt` files, api.json, theme.json,
+/// models/, memory/, logs/, bin/, assets/, the exes) is refused, and anything
+/// unknown is default-denied. Mirrors `is_writable`'s case-insensitive match.
+pub fn is_readable(rel: &Path) -> bool {
+    let rel_str = path_to_unix(rel).to_lowercase();
+    if rel_str.is_empty() {
+        return false;
+    }
+    // The playbook exception — checked BEFORE the deny-list, which pins it.
+    if rel_str == "data/wupi.codex" {
+        return true;
+    }
+    if is_denied(&rel_str) {
+        return false;
+    }
+    // apps/ is user data by design: cards, players, the saves tree, the
+    // universal codex library, images, the PRISM gallery.
+    if rel_str.starts_with("apps/") || rel_str == "apps" {
+        return true;
+    }
+    if rel_str.starts_with("data/docs/") || rel_str == "data/docs" {
+        return true;
+    }
+    // The operator profile (edit_user_profile's file).
+    if rel_str == "data/user.xml" {
         return true;
     }
     false
@@ -462,56 +522,90 @@ pub fn fable_specs() -> Vec<ToolSpec> {
 // has `&tauri::State<'_, AppState>` access). Validation lives here so it can
 // be unit-tested without AppState.
 
-/// The three stateful tool names. Used by `dispatch_fable_state_tool` to
+/// The stateful tool names. Used by `dispatch_fable_state_tool` to
 /// decide whether a call name should bypass the sync registry. Kept in sync
 /// with `fable_state_specs()` / `validate_fable_state_tool`.
-pub const FABLE_STATE_TOOL_NAMES: &[&str] =
-    &["fable_message_edit", "fable_message_delete", "fable_schema_patch"];
+pub const FABLE_STATE_TOOL_NAMES: &[&str] = &[
+    "fable_message_edit",
+    "fable_message_delete",
+    "fable_schema_patch",
+    "fable_npc_export",
+    "fable_npc_import",
+];
 
 /// True iff `name` is one of the async-dispatched Fable-state tools.
 pub fn is_fable_state_tool(name: &str) -> bool {
     FABLE_STATE_TOOL_NAMES.contains(&name)
 }
 
-/// The spec list for the three stateful tools. Attached to the chat system
+/// (2026-08-24) Suggest the closest known tool name for an unknown-tool error
+/// so the dispatch repair loop can self-correct a typo in one round trip.
+/// Case-insensitive Levenshtein ≤ 2 over the candidate names; ties break to
+/// the shorter name. Empty string when nothing is close. Pure.
+pub fn near_name_hint(name: &str, known: &[String]) -> String {
+    let needle = name.to_lowercase();
+    let best = known
+        .iter()
+        .filter_map(|k| {
+            let d = levenshtein(&needle, &k.to_lowercase());
+            (d <= 2).then_some((d, k))
+        })
+        .min_by_key(|(d, k)| (*d, k.len()))
+        .map(|(_, k)| k.clone());
+    match best {
+        Some(k) => format!(" (did you mean {k}?)"),
+        None => String::new(),
+    }
+}
+
+/// Classic two-row Levenshtein over CHARS (never bytes — anti-pattern #6:
+/// a byte-indexed edit distance mis-scores multibyte tool names).
+fn levenshtein(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    if a.is_empty() {
+        return b.len();
+    }
+    if b.is_empty() {
+        return a.len();
+    }
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur: Vec<usize> = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+/// The spec list for the stateful tools. Attached to the chat system
 /// prompt only when a Fable game is active (`chat_send` gating in lib.rs).
 /// Each description is the model's only guidance — keep it tight.
 pub fn fable_state_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "fable_message_edit".into(),
-            description: "Edit the content of one message in the active Fable \
-                          session by its 0-based array index. Args: \
-                          {\"index\": 3, \"content\": \"new text\"}. \
-                          Find the index first via file_read on \
-                          apps/fable/cards/<card_id>/session.json (the messages \
-                          array). Clears the message's raw_model_output (it \
-                          will not be KV-cache-coherent for that turn). \"
-                          No-op on system messages."
-                .into(),
+            description: "Edit one message in the ACTIVE Fable session by its 0-based array index. Args: {\"index\": 3, \"content\": \"new text\"}. Find the index first via file_read on the session_file path in the <active_card> block (the messages array). Editing the trailing beat re-tracks world state against the new text; mid-history assistant edits are refused (rewind the timeline first). No-op on system messages.".to_string(),
         },
         ToolSpec {
             name: "fable_message_delete".into(),
-            description: "Permanently remove one message from the active Fable \
-                          session by its 0-based array index. Args: \
-                          {\"index\": 3}. Subsequent messages shift down. Use \
-                          sparingly — fable_message_edit is usually better \
-                          (preserves narrative continuity)."
-                .into(),
+            description: "Permanently remove ONE message from the active Fable session by its 0-based array index. Args: {\"index\": 3}. Later messages shift down; world state is not re-tracked. Use sparingly — fable_message_edit is usually better and preserves continuity.".to_string(),
         },
         ToolSpec {
             name: "fable_schema_patch".into(),
-            description: "Merge a partial WorldSchema JSON into the active \
-                          Fable session's tracked state. Args: \
-                          {\"patch\": {<partial WorldSchema>}}. Per top-level \
-                          key in the patch: entities shallow-merges (null \
-                          value deletes a key); every other field full-\
-                          replaces via typed deserialize. Excludes \
-                          immutable_keys (the meta-lock). Pushes prior state \
-                          to the undo buffer + persists. Read current state \
-                          first via file_read on apps/fable/cards/<card_id>/\
-                          {world,player,npc}.json."
-                .into(),
+            description: "Merge a partial WorldSchema JSON into the active session's tracked state. Args: {\"patch\": {\"summary\": \"...\", \"entities\": {...}}}. ONLY the delta fields are honored — summary, recent_events, entities (entities shallow-merges; a null value deletes a key). Typed referee fields (clock, weather, inventory, relationships, economy, body) are stripped on arrival; those change through play, not patches. Read current state first via file_read on the world/player/npc.json split files next to the session_file. Undoable, persisted.".to_string(),
+        },
+        ToolSpec {
+            name: "fable_npc_export".into(),
+            description: "Save a played NPC from the active Fable simulation as a shareable .sim card (npc subtype). Args: {\"npc_id\": \"marcus\"} — the id or name as it appears in the simulation. Assembles the NPC's facts (registry, mood, wardrobe, relationship history, notable memories), drafts the persona through the narrator API, and writes the card to apps/fable/cards/<Name>/<Name>.sim. Needs a connected API. The simulation is not modified.".to_string(),
+        },
+        ToolSpec {
+            name: "fable_npc_import".into(),
+            description: "Import an existing npc-type .sim card INTO the active Fable simulation. Args: {\"card_id\": \"liam\"} — the card's id. Registers the NPC off-screen (Core cast, wardrobe seeded); the narrator introduces them organically in play — they do NOT teleport on-camera. Refuses if an NPC with the same id already exists.".to_string(),
         },
     ]
 }
@@ -567,6 +661,28 @@ pub fn validate_fable_state_tool(
                 return Err(ToolError::new(
                     "`patch` serializes to >100 KB; split into smaller patches",
                 ));
+            }
+            Ok(())
+        }
+        // (2026-08-23 NPC export/import) Both take one bounded string id.
+        "fable_npc_export" | "fable_npc_import" => {
+            let key = if name == "fable_npc_export" {
+                "npc_id"
+            } else {
+                "card_id"
+            };
+            let id = args
+                .get(key)
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| ToolError::new(format!("missing or non-string argument `{key}`")))?;
+            let id = id.trim();
+            if id.is_empty() {
+                return Err(ToolError::new(format!("`{key}` must not be empty")));
+            }
+            // (2026-08-23 audit) chars, not bytes — the player/card id
+            // discipline (byte gates over-count CJK/accented ids).
+            if id.chars().count() > 64 {
+                return Err(ToolError::new(format!("`{key}` exceeds 64 chars")));
             }
             Ok(())
         }
@@ -643,11 +759,7 @@ impl Tool for FileRead {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "file_read".into(),
-            description: "Read a UTF-8 text file from the WUPI install. \
-                          Argument: {\"path\": \"data/docs/notes.md\"} \
-                          (install-relative, no .. or absolute paths). \
-                          Returns the file contents."
-                .into(),
+            description: "Read a UTF-8 text file. Argument: {\"path\": \"apps/fable/cards/Liam/Liam.sim\"}. Install-relative, forward slashes, no .. or absolute paths. Scope: user data (apps/, data/docs/, data/user.xml) plus data/wupi.codex (her playbook, read-only); every other engine file (data/wupi.sim, the .prompt files, api.json, models/, memory/, logs/, bin/) is refused. Text only, 2 MB cap; binaries refused. Use it to inspect a card before editing, or the <active_card> session_file to find message indexes.".to_string()
         }
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
@@ -656,14 +768,27 @@ impl Tool for FileRead {
     }
     fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
         let rel = req_str(args, "path")?;
-        let path = ctx.resolve(&rel)?;
-        // Read is allowed anywhere under the install (no allowlist gate),
-        // BUT bounded (2026-08-15 audit fix): an unbounded read_to_string on
+        // Read gate (2026-08-24): reads are scoped to user data + her own
+        // playbook (data/wupi.codex, the one engine-content exception, and
+        // read-only). The previous "read anything under the install" posture
+        // exposed engine surfaces (wupi.sim, the .prompt files, session
+        // logs) to the model for no workflow gain.
+        let safe = sandbox_path(&rel)
+            .ok_or_else(|| ToolError::new(format!("unsafe path (absolute or traverses): {rel:?}")))?;
+        if !is_readable(&safe) {
+            return Err(ToolError::new(format!(
+                "refused: {rel:?} is not readable (user data or data/wupi.codex only; engine files are off-limits)"
+            )));
+        }
+        let path = ctx.install_root.join(&safe);
+        // Bounded (2026-08-15 audit fix): an unbounded read_to_string on
         // models/WUPI.gguf (~5.8 GB) loads the whole file into RAM before
         // UTF-8 validation fails — OOM/thrash on a process already holding
         // ~6.5 GB. Binary + credential paths are refused outright: a .gguf
         // is never useful text, and the API config carries the plaintext key
         // (readable → quotable into chat → archived into memory.sqlite).
+        // (.sqlite/.db/-wal/-shm added 2026-08-24: the PRISM gallery + memory
+        // engines are binary even where they live in user-data trees.)
         const FILE_READ_MAX_BYTES: u64 = 2 * 1024 * 1024;
         let lower = rel.to_lowercase();
         if lower.ends_with(".gguf")
@@ -674,6 +799,10 @@ impl Tool for FileRead {
             || lower.ends_with(".exe")
             || lower.ends_with(".dll")
             || lower.ends_with(".safetensors")
+            || lower.ends_with(".sqlite")
+            || lower.ends_with(".db")
+            || lower.ends_with("-wal")
+            || lower.ends_with("-shm")
             || lower == "data/api_config.json"
             || lower == "data/api.json"
         {
@@ -702,12 +831,7 @@ impl Tool for FileWrite {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "file_write".into(),
-            description: "Write a UTF-8 text file under the WUPI install. \
-                          Arguments: {\"path\": \"data/docs/notes.md\", \"content\": \"...\"}. \
-                          `path` must be inside a user-data tree (data/docs/, apps/fable/, \
-                          data/user.xml). Engine files (wupi.exe, *.dll, models/, memory/, \
-                          data/wupi.sim) are denied. Atomic (temp+rename)."
-                .into(),
+            description: "Write a UTF-8 text file. Arguments: {\"path\": \"apps/fable/cards/Liam/Liam.sim\", \"content\": \"...\"}. Paths are install-relative and must land inside a user-data tree: data/docs/, apps/fable/cards/, or apps/fable/players/. data/user.xml is refused (edit_user_profile owns the profile); engine files (wupi.sim, wupi.codex, the .prompt files) are always refused. Atomic write (temp+rename), 200 KB per call; split anything larger. Overwrites silently: file_read the current content first when editing. A write onto the ACTIVE card's .sim is validated (must stay a playable v2 card with the same id) and applies at the next session start.".to_string()
         }
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
@@ -782,11 +906,7 @@ impl Tool for FileDelete {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "file_delete".into(),
-            description: "Delete a file from the WUPI install. \
-                          Argument: {\"path\": \"apps/fable/cards/old.sim\"}. \
-                          Same writable-tree restriction as file_write. \
-                          No-op if the file doesn't exist."
-                .into(),
+            description: "Delete one file. Argument: {\"path\": \"apps/fable/cards/old/old.sim\"}. Same user-data-tree restriction as file_write; files only (directories are never removed); the ACTIVE card's .sim is refused while its game runs, and data/user.xml is refused (edit_user_profile owns the profile). No-op if the file is already absent.".to_string()
         }
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
@@ -820,10 +940,7 @@ impl Tool for FileList {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "file_list".into(),
-            description: "List files in a directory under the WUPI install. \
-                          Argument: {\"path\": \"apps/fable/cards\"}. \
-                          Returns one path per line (install-relative)."
-                .into(),
+            description: "List a directory's entries. Argument: {\"path\": \"apps/fable/cards\"}. Returns one install-relative path per line (directories suffixed with /), sorted. User-data trees only (apps/, data/docs/); engine directories (models/, memory/, logs/, bin/, data) are refused. Use it to discover card folders, players, sessions, or codex files before reading them.".to_string()
         }
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
@@ -832,7 +949,16 @@ impl Tool for FileList {
     }
     fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError> {
         let rel = req_str(args, "path")?;
-        let path = ctx.resolve(&rel)?;
+        // Same read scope as file_read (2026-08-24): listings stay inside the
+        // readable trees so directory walks can't probe engine surfaces.
+        let safe = sandbox_path(&rel)
+            .ok_or_else(|| ToolError::new(format!("unsafe path (absolute or traverses): {rel:?}")))?;
+        if !is_readable(&safe) {
+            return Err(ToolError::new(format!(
+                "refused: {rel:?} is not listable (user-data trees only)"
+            )));
+        }
+        let path = ctx.install_root.join(&safe);
         let entries = std::fs::read_dir(&path)
             .map_err(|e| ToolError::new(format!("read dir {}: {e}", rel)))?;
         let mut lines = Vec::new();
@@ -858,13 +984,7 @@ impl Tool for CreateSimCard {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "create_sim_card".into(),
-            description: "Create or overwrite a Fable scenario card (.sim). \
-                          Arguments: {\"filename\": \"my_scenario\", \"xml\": \"<sim>...</sim>\"}. \
-                          Writes to apps/fable/cards/<filename>/<filename>.sim (the per-card \
-                          folder holds the .sim + sibling .codex + world/player/npc JSON). The \
-                          XML must follow the .sim format (strict XML, CDATA-wrapped prose). \
-                          See rusty_tavern.sim for the shape."
-                .into(),
+            description: "Create or overwrite a Fable sim card (.sim). Arguments: {\"filename\": \"my_scenario\", \"xml\": \"<sim_card>...</sim_card>\"}. Writes to apps/fable/cards/<Name>/<Name>.sim (the display-name folder holds the .sim + its siblings). The XML must follow the v2 .sim format: <sim_card> with <metadata> (type/subtype/id) + CDATA line-block <identity>/<persona>, then the <world>/<location>/<intro>/<inventory> siblings AFTER </sim_card> (strict XML, CDATA prose). <type> must be exactly simulation. An existing card with the same id is overwritten in place and keeps its folder; the call returns the card's id — use that id in future delete/edit calls.".to_string()
         }
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
@@ -889,6 +1009,13 @@ impl Tool for CreateSimCard {
         // An EXISTING card with this id keeps its folder (an edit).
         let card = crate::sim_card::parse_from_xml_str(&xml)
             .map_err(|e| ToolError::new(format!("card XML failed to parse: {e}")))?;
+        // The SAME playability contract every lib.rs write path enforces
+        // (`ensure_playable_v2`): type must be `simulation` AND the shape
+        // v2. The old local check only tested `format_v2` for
+        // simulation-typed cards, so a card with a missing/other `<type>`
+        // slipped through here and then silently vanished from every walker
+        // (the exact failure this gate exists to prevent).
+        crate::ensure_playable_v2(&card).map_err(ToolError::new)?;
         let cards_root = ctx.resolve("apps/fable/cards")?;
         let existing = crate::resolve_card_folder(&cards_root, &card.id);
         let stem = match &existing {
@@ -944,11 +1071,7 @@ impl Tool for DeleteSimCard {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "delete_sim_card".into(),
-            description: "Delete a Fable scenario card. \
-                          Argument: {\"filename\": \"my_scenario\"}. \
-                          Removes the per-card folder apps/fable/cards/<filename>/ (the .sim \
-                          + sibling .codex/world/player/npc JSON + saves). No-op if absent."
-                .into(),
+            description: "Delete a Fable simulation card by its parsed id. Argument: {\"filename\": \"<card_id>\"}. Removes the card's display-named folder under apps/fable/cards/ (the .sim, portraits, .ico); the post-success hook also removes the card's sessions tree (apps/fable/data/saves/), purges its memory partition, and reaps the desktop shortcut. Linked codex library files survive (they are universal). Refused while that card's game session is active. No-op if absent. Total removal — confirm with User first.".to_string(),
         }
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
@@ -995,11 +1118,7 @@ impl Tool for EditUserProfile {
     fn spec(&self) -> ToolSpec {
         ToolSpec {
             name: "edit_user_profile".into(),
-            description: "Set the user's identity profile (data/user.xml). \
-                          Arguments: {\"name\": \"Operator\", \"description\": \"...\"}. \
-                          Both fields optional; pass empty string to clear. \
-                          Hot-reloads on the next chat turn."
-                .into(),
+            description: "Set the operator profile (data/user.xml) — the name Wupi addresses User by plus a short description she keeps in mind. Arguments: {\"name\": \"Chloe\", \"description\": \"...\"}. Both fields optional; pass \"\" to clear one. Name capped at 64 chars. Hot-reloads on the next chat turn.".to_string()
         }
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
@@ -1058,6 +1177,32 @@ mod tests {
 
     fn args(json: &str) -> serde_json::Value {
         serde_json::from_str(json).unwrap()
+    }
+
+    // === near-name hint (2026-08-24) ========================================
+
+    #[test]
+    fn near_name_hint_suggests_close_tool() {
+        let known: Vec<String> = ["file_read", "file_write", "create_sim_card"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // One-char typo → suggestion.
+        assert!(near_name_hint("file_writ", &known).contains("file_write"));
+        // Case-insensitive.
+        assert!(near_name_hint("FileRead", &known).contains("file_read"));
+        // Nothing close → empty hint, no noise.
+        assert_eq!(near_name_hint("banana", &known), "");
+    }
+
+    #[test]
+    fn levenshtein_counts_chars_not_bytes() {
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("abc", ""), 3);
+        // 猫 is 3 UTF-8 bytes; a byte-indexed distance would mis-score these.
+        assert_eq!(levenshtein("猫", "猫"), 0);
+        assert_eq!(levenshtein("猫", "犬"), 1);
     }
 
     // === parse_tool_calls ===================================================
@@ -1196,7 +1341,11 @@ mod tests {
     #[test]
     fn writable_user_data_paths() {
         assert!(is_writable(Path::new("data/docs/notes.md")));
-        assert!(is_writable(Path::new("data/user.xml")));
+        // (2026-08-24) The operator profile is NOT raw-writable/deletable:
+        // a bare file_delete on data/user.xml used to succeed. The
+        // edit_user_profile tool (fixed path, field caps) is the sole
+        // mutation path and bypasses this list.
+        assert!(!is_writable(Path::new("data/user.xml")));
         assert!(is_writable(Path::new("apps/fable/cards/x.sim")));
         assert!(is_writable(Path::new("apps/fable/cards/x/saves/save_1.json")));
         // (2026-08-16 audit LOW pin, updated with the allow-list drift fix)
@@ -1207,6 +1356,19 @@ mod tests {
         assert!(!is_writable(Path::new("apps/fable/saves/x/y.json")));
         assert!(!is_writable(Path::new("apps/fable/schemas/x.json")));
         assert!(!is_writable(Path::new("apps/fable/sessions/x.json")));
+    }
+
+    #[test]
+    fn writable_matching_is_case_insensitive() {
+        // The FS is case-insensitive on Windows: a case variant must never
+        // slip the deny-list (2026-08-24), and case-variant user paths still
+        // resolve.
+        assert!(!is_writable(Path::new("DATA/WUPI.CODEX")));
+        assert!(!is_writable(Path::new("Data/Wupi.Sim")));
+        assert!(!is_writable(Path::new("Data/wupi.prompt")));
+        assert!(!is_writable(Path::new("EVIL.DLL")));
+        assert!(is_writable(Path::new("Apps/Fable/Cards/x.sim")));
+        assert!(is_writable(Path::new("Data/Docs/notes.md")));
     }
 
     #[test]
@@ -1221,6 +1383,10 @@ mod tests {
         assert!(!is_writable(Path::new("memory/memory.sqlite")));
         assert!(!is_writable(Path::new("memory/memory.sqlite-wal")));
         assert!(!is_writable(Path::new("data/wupi.sim")));
+        assert!(!is_writable(Path::new("data/wupi.codex")));
+        assert!(!is_writable(Path::new("data/wupi.prompt")));
+        assert!(!is_writable(Path::new("data/fable.prompt")));
+        assert!(!is_writable(Path::new("logs/wupi-20260824-000000.log")));
         assert!(!is_writable(Path::new("data/api_config.json")));
         assert!(!is_writable(Path::new("data/api.json")));
         assert!(!is_writable(Path::new("data/theme.json")));
@@ -1245,13 +1411,69 @@ mod tests {
         assert!(!is_writable(Path::new("")));
     }
 
+    // === is_readable (2026-08-24) ==========================================
+
+    #[test]
+    fn readable_user_data_and_playbook_only() {
+        // User data trees.
+        assert!(is_readable(Path::new("apps/fable/cards/Liam/Liam.sim")));
+        assert!(is_readable(Path::new(
+            "apps/fable/data/saves/Card/session_1/session.json"
+        )));
+        assert!(is_readable(Path::new("apps/fable/data/codex/World.codex")));
+        assert!(is_readable(Path::new("apps/fable/players/Chloe/Chloe.player")));
+        assert!(is_readable(Path::new("apps")));
+        assert!(is_readable(Path::new("data/docs/notes.md")));
+        assert!(is_readable(Path::new("data/user.xml")));
+        // The PRISM gallery DB is inside a readable tree; the BINARY
+        // extension refusal in file_read catches it downstream (policy scope
+        // and content-type gating are separate layers by design).
+        assert!(is_readable(Path::new("apps/prism/gallery.sqlite")));
+        // The ONE engine-content exception: her own playbook, READ-ONLY.
+        assert!(is_readable(Path::new("data/wupi.codex")));
+        assert!(!is_writable(Path::new("data/wupi.codex")));
+    }
+
+    #[test]
+    fn not_readable_engine_surfaces() {
+        assert!(!is_readable(Path::new("data/wupi.sim")));
+        assert!(!is_readable(Path::new("data/wupi.prompt")));
+        assert!(!is_readable(Path::new("data/fable.prompt")));
+        assert!(!is_readable(Path::new("data/api.json")));
+        assert!(!is_readable(Path::new("data/theme.json")));
+        assert!(!is_readable(Path::new("models/WUPI.gguf")));
+        assert!(!is_readable(Path::new("memory/memory.sqlite")));
+        assert!(!is_readable(Path::new("logs/wupi-20260824-000000.log")));
+        assert!(!is_readable(Path::new("bin/cublas64_13.dll")));
+        assert!(!is_readable(Path::new("assets/index.js")));
+        assert!(!is_readable(Path::new("wupi.exe")));
+        // The data/ dir itself (engine siblings); default-deny for unknowns.
+        assert!(!is_readable(Path::new("data")));
+        assert!(!is_readable(Path::new("random.txt")));
+        assert!(!is_readable(Path::new("")));
+        // Case variants cannot slip the gate.
+        assert!(!is_readable(Path::new("DATA/Wupi.Prompt")));
+        assert!(!is_readable(Path::new("Logs/x.log")));
+        // And the playbook exception is read-only, never writable.
+        assert!(!is_writable(Path::new("DATA/WUPI.CODEX")));
+    }
+
     // === Fable-state tool specs + validation (2026-08-11) ===================
 
     #[test]
-    fn fable_state_specs_lists_three_tools() {
+    fn fable_state_specs_list_the_tools() {
         let s = fable_state_specs();
         let names: Vec<&str> = s.iter().map(|t| t.name.as_str()).collect();
-        assert_eq!(names, vec!["fable_message_edit", "fable_message_delete", "fable_schema_patch"]);
+        assert_eq!(
+            names,
+            vec![
+                "fable_message_edit",
+                "fable_message_delete",
+                "fable_schema_patch",
+                "fable_npc_export",
+                "fable_npc_import",
+            ]
+        );
         // Each spec must carry a non-empty description (it's the model's only
         // guidance).
         for spec in &s {
@@ -1260,14 +1482,49 @@ mod tests {
     }
 
     #[test]
-    fn is_fable_state_tool_matches_three_names() {
+    fn is_fable_state_tool_matches_the_names() {
         assert!(is_fable_state_tool("fable_message_edit"));
         assert!(is_fable_state_tool("fable_message_delete"));
         assert!(is_fable_state_tool("fable_schema_patch"));
+        assert!(is_fable_state_tool("fable_npc_export"));
+        assert!(is_fable_state_tool("fable_npc_import"));
         // Negative cases: file tools + unknowns don't match.
         assert!(!is_fable_state_tool("file_read"));
         assert!(!is_fable_state_tool(""));
         assert!(!is_fable_state_tool("fable_schema_patch_typo"));
+    }
+
+    /// (2026-08-23 NPC export/import) The id args validate: required,
+    /// string, bounded; the two tools take their own key.
+    #[test]
+    fn validate_fable_npc_tools_require_bounded_ids() {
+        let ok = serde_json::json!({ "npc_id": "marcus" });
+        assert!(validate_fable_state_tool("fable_npc_export", &ok).is_ok());
+        let ok = serde_json::json!({ "card_id": "liam" });
+        assert!(validate_fable_state_tool("fable_npc_import", &ok).is_ok());
+        // Wrong key / missing / non-string / empty / oversize.
+        let wrong = serde_json::json!({ "card_id": "marcus" });
+        assert!(validate_fable_state_tool("fable_npc_export", &wrong).is_err());
+        assert!(validate_fable_state_tool("fable_npc_import", &serde_json::json!({})).is_err());
+        assert!(
+            validate_fable_state_tool("fable_npc_export", &serde_json::json!({ "npc_id": 3 }))
+                .is_err()
+        );
+        assert!(
+            validate_fable_state_tool(
+                "fable_npc_export",
+                &serde_json::json!({ "npc_id": "   " })
+            )
+            .is_err()
+        );
+        let long = "x".repeat(65);
+        assert!(
+            validate_fable_state_tool(
+                "fable_npc_import",
+                &serde_json::json!({ "card_id": long })
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1402,14 +1659,16 @@ mod tests {
     #[test]
     fn create_sim_card_writes_parseable_sim() {
         let (_guard, ctx) = temp_ctx();
-        // Root element must be <sim_card> per sim_card.rs's parser. Use CDATA
-        // wrapping for prose (the parser auto-merges it into text nodes).
-        let xml = "<?xml version=\"1.0\"?>\n\
-                   <sim_card>\n\
-                     <identity>\n\
-                       <name>Test Scenario</name>\n\
-                       <core_persona><![CDATA[A test persona.]]></core_persona>\n\
-                     </identity>\n\
+        let xml = "<?xml version=\"1.0\"?>
+                   <sim_card>
+                     <metadata>
+                       <type>simulation</type>
+                       <subtype>scenario</subtype>
+                       <id>test-scenario</id>
+                     </metadata>
+                     <identity><![CDATA[
+                   Name: Test Scenario
+                     ]]></identity>
                    </sim_card>";
         let payload = serde_json::json!({
             "filename": "test_scenario",
@@ -1417,14 +1676,11 @@ mod tests {
         });
         let t = CreateSimCard;
         t.execute(&payload, &ctx).unwrap();
-        // File exists at the right path — the per-card folder layout (§6B)
-        // under the card's PARSED id (the 2026-08-15 audit fix: folder stem
-        // == memory-partition key by construction). This XML carries no
-        // <metadata><id>, so the id derives from the name "Test Scenario" →
-        // "test-scenario" — NOT the raw filename stem. The test pinned the
-        // pre-fix filename-derived folder and had been red since.
+        // File exists at the right path — the per-card folder layout (§6.2):
+        // the folder stem is the DISPLAY name (spaces + capitals preserved);
+        // the parsed <metadata><id> slug is only the memory key.
         let written = ctx
-            .resolve("apps/fable/cards/test-scenario/test-scenario.sim")
+            .resolve("apps/fable/cards/Test Scenario/Test Scenario.sim")
             .unwrap();
         assert!(written.exists(), "card should be written");
         // Round-trips through the parser.

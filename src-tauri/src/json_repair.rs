@@ -414,11 +414,16 @@ fn strip_stray_code_fences(s: &str) -> String {
     }
 }
 
-/// Best-effort bracket/brace balance repair. Two truncation artifacts:
+/// Best-effort bracket/brace balance repair. Three truncation artifacts:
 /// 1. The model hit `max_tokens` mid-object: the JSON is missing one or more
 ///    closers. We append the needed `}`/`]` to close every still-open `{`/`[`.
 /// 2. A stray closer (the model emitted `}}`): serde fails. We DON'T try to
 ///    drop extras (ambiguous + risky); we only ADD missing closers.
+/// 3. The cut landed INSIDE a string literal (the common shape — a long
+///    `detail`/value string cut mid-word): the closers from (1) would land
+///    inside the still-open string, so the string gets its closing quote
+///    FIRST. A dangling escape at the very end (a cut right after `\`) is
+///    dropped — it would escape the quote we append.
 ///
 /// String-aware: brackets inside string literals don't count toward the stack.
 fn balance_brackets(s: &str) -> String {
@@ -452,12 +457,24 @@ fn balance_brackets(s: &str) -> String {
             _ => {}
         }
     }
-    if stack.is_empty() {
+    if stack.is_empty() && !in_string {
         return s.to_string();
+    }
+    // Close an unterminated string literal BEFORE appending closers —
+    // appended inside the open string they'd be string content, and serde
+    // rejects the line on the unterminated string anyway (the v0.30.0
+    // architect-stall shape: every repair pass re-emitted the same
+    // mid-string-truncated map). A dangling trailing `\` is dropped first;
+    // it would escape the quote we're about to append.
+    let mut out = String::from(s);
+    if in_string {
+        if escape_next {
+            out.pop();
+        }
+        out.push('"');
     }
     // Append the closers in reverse-open order. Cheap + unambiguous: every
     // unmatched opener gets its closer.
-    let mut out = String::from(s);
     while let Some(opener) = stack.pop() {
         out.push(match opener {
             b'{' => '}',
@@ -689,6 +706,64 @@ mod tests {
         assert!(r.contains("bought bread, milk]"), "intra-string `,]` is content: {r}");
         let v: serde_json::Value = serde_json::from_str(&r).unwrap();
         assert_eq!(v["note"], "bought bread, milk]");
+    }
+
+    // ---------- balance_brackets: unterminated strings (v0.30.0 stall fix) ----------
+
+    /// The `max_tokens` cut landing INSIDE a string VALUE — the common
+    /// truncation shape (a long detail/name string cut mid-word). The old
+    /// pass appended the bracket closers into the still-open string, so the
+    /// line failed serde on the unterminated string regardless and every
+    /// repair pass re-emitted the same oversized map. Close the string first
+    /// and every complete member above the cut survives.
+    #[test]
+    fn closes_truncated_string_value_then_serde() {
+        let broken = "{\"areas\":[{\"id\":\"gate\",\"name\":\"Main Ga";
+        let repaired = repair(broken);
+        let v: serde_json::Value = serde_json::from_str(&repaired).expect("repaired parses");
+        assert_eq!(v["areas"][0]["id"], "gate");
+        assert_eq!(v["areas"][0]["name"], "Main Ga");
+    }
+
+    /// Cut mid-KEY: the output can't parse (a dangling key has no value) but
+    /// it must be STRING-BALANCED — the closers sit outside a properly closed
+    /// string, so the 3-pass loop's serde error names the real problem
+    /// instead of an unterminated-string mojibake one.
+    #[test]
+    fn closes_truncated_string_key_string_balanced() {
+        let r = repair("{\"areas\":[{\"id");
+        assert!(r.ends_with("\"}]}"), "closers must sit outside the closed string: {r}");
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&r).is_err(),
+            "a dangling key must not parse (semantic — the 3-pass loop's job)"
+        );
+    }
+    /// Cut right after a backslash inside a string: the dangling escape is
+    /// dropped first, else it would escape the appended closing quote and
+    /// leave the string unterminated anyway.
+    #[test]
+    fn drops_dangling_escape_before_closing_quote() {
+        let r = repair("{\"note\":\"line \\");
+        let v: serde_json::Value = serde_json::from_str(&r).expect("repaired parses");
+        assert_eq!(v["note"], "line ");
+    }
+
+    /// Cut right after an ESCAPED QUOTE (still inside the string — `\"` is
+    /// content, not a delimiter): the closing quote lands after it and the
+    /// escaped quote survives as content.
+    #[test]
+    fn closes_after_escaped_quote_content() {
+        let r = repair("{\"note\":\"say \\\"");
+        let v: serde_json::Value = serde_json::from_str(&r).expect("repaired parses");
+        assert_eq!(v["note"], "say \"");
+    }
+
+    /// A cut AFTER a closed string (before the closers) must not gain a
+    /// stray extra quote — the in-string path only fires when the scan truly
+    /// ended inside a string.
+    #[test]
+    fn no_extra_quote_when_cut_after_closed_string() {
+        assert_eq!(repair("{\"a\":\"x\""), "{\"a\":\"x\"}");
     }
 
     // ---------- end-to-end: serde round-trips ----------

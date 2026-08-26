@@ -144,14 +144,15 @@ unsafe impl Send for ChatEngine {}
 unsafe impl Sync for ChatEngine {}
 
 /// The punctuation logit-bias table applied to the chat sampler chain (Prong
-/// 2 of the LOCAL Phase 4 fix, 2026-07-29). Kept byte-identical to
-/// `fable_engine::punct_bias_table` — the chat + fable narrator prose benefit
-/// from the same biases, and §1C lists them under one sampler config. See the
-/// fable_engine copy for the full per-token rationale.
+/// 2 of the LOCAL Phase 4 fix, 2026-07-29). Nearly identical to
+/// `fable_engine::punct_bias_table` — EXCEPT `" -"` (kept at -10.0 here:
+/// Wupi chat is visible prose; the fable copy halved it to -5.0 on
+/// 2026-08-24 because the tracker's removal markers ride that token). See
+/// the fable_engine copy for the full per-token rationale.
 fn punct_bias_table() -> &'static [(&'static str, f32)] {
     &[
         ("-", -10.0),         // hyphen-spam defense (preserved)
-        (" -", -10.0),        // leading-space hyphen (same attractor)
+        (" -", -10.0),        // leading-space hyphen — chat keeps full strength (prose)
         (",", -1.0),          // mild — kills comma-splicing, keeps natural commas
         (";", -10.0),         // heavy — semicolons invite run-ons
         ("\u{2013}", -100.0), // en-dash — hard ban

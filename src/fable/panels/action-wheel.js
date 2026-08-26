@@ -1,8 +1,8 @@
 // =============================================================
 // PANEL: ACTION WHEEL — radial menu of declared activities.
-// Unlike other panels, this reads from the active card's
-// declared_activities (passed in schema via the fable_cards_list
-// path), not from entity prefixes. Falls back to a default set.
+// Unlike other panels, this reads schema.activities (the active card's
+// declared list, injected by the stage's panel-manager summon), not from
+// entity prefixes. Falls back to a default set.
 // =============================================================
 
 const DEFAULT_ACTIVITIES = ['explore', 'talk', 'rest'];

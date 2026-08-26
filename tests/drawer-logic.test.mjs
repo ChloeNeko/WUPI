@@ -7,6 +7,8 @@ import {
   computeDrawerState,
   swipeNextAction,
   canEditMessage,
+  centeredPopupOpen,
+  isTrailingAssistantBeat,
 } from '../src/fable/engine/drawer-logic.js';
 
 let passed = 0;
@@ -64,9 +66,16 @@ test('AI 3 variants, active 2, trailing: › enabled (= reroll)', () => {
   assert.equal(s.canNext, true);
   assert.equal(s.nextLabel, 'Regenerate');
 });
-test('AI 3 variants, active 2, NOT trailing: › disabled (mid-history, no reroll)', () => {
+test('AI 3 variants, active 2, NOT trailing: ‹ › both disabled (swipe lock)', () => {
   const s = computeDrawerState({ role: 'assistant', count: 3, active: 2, isLastAssistant: false });
-  assert.equal(s.canPrev, true);
+  assert.equal(s.canPrev, false);
+  assert.equal(s.canNext, false);
+});
+test('AI 3 variants, active 1, NOT trailing: mid-variants ‹ also disabled (backend locks swipes)', () => {
+  // The swipe-lock contract: a non-trailing beat may never swipe, even with
+  // earlier variants to step back to — the backend refuses once turns start.
+  const s = computeDrawerState({ role: 'assistant', count: 3, active: 1, isLastAssistant: false });
+  assert.equal(s.canPrev, false);
   assert.equal(s.canNext, false);
 });
 test('AI at active 0 with >1 variants: ‹ disabled, › enabled (=Next)', () => {
@@ -116,6 +125,60 @@ test('canEdit: a mid-history assistant beat is NOT editable (backend refuses)', 
 });
 test('canEdit: isLastAssistant is REQUIRED for assistant beats (no undefined ride)', () => {
   assert.equal(canEditMessage({ role: 'assistant', isLastAssistant: undefined }), false);
+});
+
+// ── centeredPopupOpen (the stage keyboard gate over the centered popups) ────
+// A stub root whose querySelector matches exactly one selector string — the
+// predicate is a pure read, so the selector list is the contract under test.
+function rootMatching(sel) {
+  return { querySelector: (q) => (q === sel ? { matched: true } : null) };
+}
+test('centeredPopupOpen: false when the stage root has no popup mounted', () => {
+  assert.equal(centeredPopupOpen({ querySelector: () => null }), false);
+});
+test('centeredPopupOpen: false on a null/shapeless root (never blocks on junk)', () => {
+  assert.equal(centeredPopupOpen(null), false);
+  assert.equal(centeredPopupOpen(undefined), false);
+  assert.equal(centeredPopupOpen({}), false);
+});
+test('centeredPopupOpen: each of the four centered popups trips the gate', () => {
+  assert.equal(centeredPopupOpen(rootMatching('.fable-saves-popup-overlay, .fable-sessions-popup-overlay, [data-chronicle-overlay], [data-npc-dossier]')), true);
+});
+test('centeredPopupOpen: unrelated selectors do not trip the gate', () => {
+  assert.equal(centeredPopupOpen(rootMatching('.fable-some-other-overlay')), false);
+});
+
+// ── isTrailingAssistantBeat (the DOM-side trailing derivation's pure core) ──
+// The swipe-lock contract: a beat is swipeable/editable only when it is the
+// feed's TRAILING MESSAGE — the last role-bearing (user/assistant) beat AND
+// an assistant. The old last-ASSISTANT-only check stayed enabled when a user
+// beat followed (the api_lost composer-restore / rewind shape) → a
+// guaranteed backend "not the trailing beat" error.
+const roleBeat = (role) => ({ dataset: { role } });
+test('trailing: the last role beat when it is an assistant IS trailing', () => {
+  const a = roleBeat('assistant');
+  const feed = [roleBeat('user'), a];
+  assert.equal(isTrailingAssistantBeat(a, feed), true);
+});
+test('trailing: a user beat AFTER the assistant retires it (not the trailing message)', () => {
+  const a = roleBeat('assistant');
+  const feed = [a, roleBeat('user')];
+  assert.equal(isTrailingAssistantBeat(a, feed), false, 'api_lost restore / rewind shape');
+});
+test('trailing: a mid-feed assistant with later assistants is not trailing', () => {
+  const a0 = roleBeat('assistant');
+  const feed = [a0, roleBeat('assistant'), roleBeat('user')];
+  assert.equal(isTrailingAssistantBeat(a0, feed), false);
+});
+test('trailing: a trailing USER beat is never the trailing assistant', () => {
+  const u = roleBeat('user');
+  assert.equal(isTrailingAssistantBeat(u, [roleBeat('assistant'), u]), false);
+});
+test('trailing: empty / junk feeds + beatless calls degrade to false', () => {
+  assert.equal(isTrailingAssistantBeat(roleBeat('assistant'), []), false);
+  assert.equal(isTrailingAssistantBeat(roleBeat('assistant'), null), false);
+  assert.equal(isTrailingAssistantBeat(null, [roleBeat('assistant')]), false);
+  assert.equal(isTrailingAssistantBeat({}, [{}]), false, 'a beat with no dataset never trips it');
 });
 
 console.log('\n%d passed, %d failed', passed, failed);

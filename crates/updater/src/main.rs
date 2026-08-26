@@ -346,16 +346,23 @@ fn result_marker_path() -> std::path::PathBuf {
 /// along byte-identical — no parse, no rewrite), skipped when the source is
 /// gone (idempotent); when BOTH exist the NEW file wins (it is the
 /// app-written current config) and the old is LEFT — the updater never
-/// deletes user data; the app-side boot migration
-/// (`ApiConfig::migrate_legacy_name` in src-tauri) owns reconciliation. No
-/// marker/ledger file: the rename is its own completion signal, and any
-/// updater working file must live in `%TEMP%`, never the install.
+/// deletes user data. No marker/ledger file: the rename is its own
+/// completion signal, and any updater working file must live in `%TEMP%`,
+/// never the install.
+///
+/// NO retry path exists (the v0.30.0 clean break deleted the app-side
+/// `ApiConfig::migrate_legacy_name` boot migration): the app reads ONLY
+/// `api.json`, so a rename that fails here (e.g. a locked source) leaves
+/// the user's API profiles stranded under the old name — they re-enter
+/// the config by hand. The window is small by construction (this runs
+/// while the old app is shut down for the swap), but the failure is real
+/// and terminal, which is why it is logged loudly.
 const USER_FILE_RENAMES: &[(&str, &str)] = &[("data/api_config.json", "data/api.json")];
 
 /// Apply every [`USER_FILE_RENAMES`] entry under `target`. Returns the
 /// number of files actually renamed. Best-effort by design — a locked source
-/// logs and moves on (the app-side boot migration retries every boot until
-/// it lands).
+/// logs and moves on (see [`USER_FILE_RENAMES`]: no retry, the stranded
+/// file is only recoverable by hand).
 fn migrate_user_files(target: &Path) -> usize {
     let mut renamed = 0usize;
     for (from, to) in USER_FILE_RENAMES {
@@ -370,7 +377,7 @@ fn migrate_user_files(target: &Path) -> usize {
                 renamed += 1;
             }
             Err(e) => log(format!(
-                "user-file rename {from} → {to} failed ({e}) — the app-side boot migration will retry"
+                "user-file rename {from} → {to} failed ({e}) — NO retry path exists; the app reads only {to}, so this config is stranded until re-entered by hand"
             )),
         }
     }

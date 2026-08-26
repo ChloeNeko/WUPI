@@ -1,30 +1,25 @@
-// Portrait namesake-contract tests (2026-08-19): portraits live as
-// `<Name>.png` / `<Name>.jpg` beside the `<Name>.sim` / `<Name>.player` —
-// NEVER a fixed `portrait.<ext>` (that's the legacy name, folded onto the
-// stem by the boot migration + tolerated at discovery).
+// Portrait namesake-contract tests (2026-08-19; v0.30.0): portraits live
+// as `<Name>.png` / `<Name>.jpg` beside the `<Name>.sim` / `<Name>.player`
+// — the namesake is the ONLY recognized name (the legacy fixed
+// `portrait.<ext>` lane was removed with the v0.30.0 clean break).
 //
 // Plain Node ESM — no test runner. Run: `node tests/portrait-files.test.mjs`.
 // Exits non-zero on any failure so it can gate CI.
 //
 // What this pins (the filesystem contract the frontend's portrait loading
 // stands on — the Rust side of each rule is pinned by the lib.rs unit
-// tests for `find_portrait_sibling` / `rename_legacy_portraits` /
-// `reap_stale_portraits`):
-//   1. Discovery order: namesake png > jpg > jpeg, THEN legacy
-//      `portrait.<ext>` (same ext order) as the read-side fallback.
+// tests for `find_portrait_sibling` / `reap_stale_portraits`):
+//   1. Discovery order: namesake png > jpg > jpeg.
 //   2. Every discovered portrait actually LOADS: readable bytes, magic
 //      signature matches the ext (a truncated/swapped file fails), and the
 //      absolute path survives the URL-encode/decode lane `convertFileSrc`
 //      puts it through (spaces, capitals, accents).
-//   3. The boot-migration fold semantics: `portrait.<ext>` → `<Name>.<ext>`,
-//      namesake wins over a legacy twin, idempotent, drops the derived
-//      legacy `portrait.ico`.
-//   4. A foreign-stem image (`Wrong.png` inside `Liam/`) is NOT discovered —
+//   3. A foreign-stem image (`Wrong.png` inside `Liam/`) is NOT discovered —
 //      and the live-tree scan below FAILS on any it finds, because that's
 //      exactly the "portrait silently missing" bug shape.
 //   5. Live scan: when `apps/fable/cards` / `apps/fable/players` exist,
-//      every image in an entity folder must be namesake or legacy-pending,
-//      and every discovered portrait must pass the load checks from (2).
+//      every image in an entity folder must be namesake, and every
+//      discovered portrait must pass the load checks from (2).
 import { strict as assert } from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -66,34 +61,7 @@ function findPortraitSibling(dir) {
       if (fs.existsSync(path.join(dir, name))) return name;
     }
   }
-  for (const ext of EXTS) {
-    const name = `portrait.${ext}`;
-    if (fs.existsSync(path.join(dir, name))) return name;
-  }
   return null;
-}
-
-// Mirror of the Rust `rename_legacy_portraits` fold (boot migration).
-function renameLegacyPortraits(dir) {
-  const stem = path.basename(dir);
-  if (stem.toLowerCase() === 'portrait') return false; // namesake == legacy on Windows
-  let moved = false;
-  for (const ext of EXTS) {
-    const legacy = path.join(dir, `portrait.${ext}`);
-    if (!fs.existsSync(legacy)) continue;
-    const namesake = path.join(dir, `${stem}.${ext}`);
-    if (fs.existsSync(namesake)) {
-      fs.rmSync(legacy); // the namesake is canonical; the legacy copy is a stale twin
-    } else {
-      fs.renameSync(legacy, namesake);
-      moved = true;
-    }
-  }
-  if (moved) {
-    const ico = path.join(dir, 'portrait.ico');
-    if (fs.existsSync(ico)) fs.rmSync(ico);
-  }
-  return moved;
 }
 
 // The frontend load chain proxy: the backend hands `convertFileSrc` an
@@ -149,14 +117,14 @@ test('discovery: namesake png > jpg > jpeg', () => {
   assert.equal(findPortraitSibling(dir), 'Kael.png');
 });
 
-test('discovery: any namesake beats the legacy name; legacy keeps working alone', () => {
+test('discovery: the legacy portrait.<ext> name is invisible', () => {
   const root = freshDir('legacy');
   const dir = path.join(root, 'Mara');
   fs.mkdirSync(dir);
   fs.writeFileSync(path.join(dir, 'portrait.png'), 'x');
-  assert.equal(findPortraitSibling(dir), 'portrait.png', 'legacy-only folder still resolves');
+  assert.equal(findPortraitSibling(dir), null, 'the legacy name no longer resolves');
   fs.writeFileSync(path.join(dir, 'Mara.jpg'), 'x');
-  assert.equal(findPortraitSibling(dir), 'Mara.jpg', 'namesake jpg beats legacy png');
+  assert.equal(findPortraitSibling(dir), 'Mara.jpg', 'the namesake resolves');
 });
 
 test('discovery: spaces + capitals ride the stem verbatim', () => {
@@ -188,7 +156,7 @@ test('load chain: card + player portraits with REAL image bytes load fine', () =
     const found = findPortraitSibling(dir);
     assert.ok(found, `${dir}: portrait must be discovered`);
     assertLoads(path.join(dir, found));
-    assert.ok(!found.startsWith('portrait.'), 'tree is fully namesake — no legacy lane needed');
+    assert.ok(!found.startsWith('portrait.'), 'discovery only ever returns namesake names');
   }
 });
 
@@ -203,46 +171,7 @@ test('load chain: a corrupted portrait FAILS the magic gate (the gate works)', (
   assert.throws(() => assertLoads(path.join(dir, found)), /magic/);
 });
 
-// ── 3. the boot-migration fold ────────────────────────────────────────────
-
-test('fold: portrait.<ext> → <Name>.<ext>, ico dropped, idempotent, loads after', () => {
-  const root = freshDir('fold');
-  const dir = path.join(root, 'Kael Brightwood');
-  fs.mkdirSync(dir);
-  fs.writeFileSync(path.join(dir, 'Kael Brightwood.player'), '<player/>');
-  fs.writeFileSync(path.join(dir, 'portrait.png'), PNG_BYTES);
-  fs.writeFileSync(path.join(dir, 'portrait.jpg'), JPG_BYTES);
-  fs.writeFileSync(path.join(dir, 'portrait.ico'), 'ico');
-
-  assert.equal(renameLegacyPortraits(dir), true);
-  assert.ok(fs.existsSync(path.join(dir, 'Kael Brightwood.png')));
-  assert.ok(fs.existsSync(path.join(dir, 'Kael Brightwood.jpg')));
-  assert.ok(!fs.existsSync(path.join(dir, 'portrait.png')));
-  assert.ok(!fs.existsSync(path.join(dir, 'portrait.ico')), 'derived legacy icon goes with the fold');
-  assert.equal(renameLegacyPortraits(dir), false, 'second run is a no-op');
-  // Post-fold discovery + load still resolve the same images.
-  assert.equal(findPortraitSibling(dir), 'Kael Brightwood.png');
-  assertLoads(path.join(dir, 'Kael Brightwood.png'));
-  assertLoads(path.join(dir, 'Kael Brightwood.jpg'));
-});
-
-test('fold: namesake of the same ext WINS over the legacy twin', () => {
-  const root = freshDir('twin');
-  const dir = path.join(root, 'Mara');
-  fs.mkdirSync(dir);
-  fs.writeFileSync(path.join(dir, 'Mara.png'), PNG_BYTES);
-  fs.writeFileSync(path.join(dir, 'portrait.png'), 'stale');
-  // A same-ext twin is REAP-only (no move); a different-ext legacy DOES
-  // move — the fold reports action for the latter.
-  fs.writeFileSync(path.join(dir, 'portrait.jpg'), JPG_BYTES);
-  assert.equal(renameLegacyPortraits(dir), true, 'the portrait.jpg fold reports action');
-  assert.equal(fs.readFileSync(path.join(dir, 'Mara.png')).length, PNG_BYTES.length,
-    'the canonical namesake content survives');
-  assert.ok(!fs.existsSync(path.join(dir, 'portrait.png')), 'the stale same-ext twin is reaped');
-  assert.ok(fs.existsSync(path.join(dir, 'Mara.jpg')), 'the other-ext legacy folded onto the stem');
-});
-
-// ── 4. foreign-stem images are invisible to discovery ─────────────────────
+// ── 3. foreign-stem images are invisible to discovery ─────────────────────
 
 test('foreign stem: Wrong.png inside Liam/ is NOT discovered', () => {
   const root = freshDir('foreign');
@@ -278,7 +207,7 @@ function scanLiveTree() {
       );
       for (const img of images) {
         const lower = img.toLowerCase();
-        if (lower === 'portrait.ico') { notes.push(`${label}/${stem}: legacy portrait.ico (regenerated on next shortcut build)`); continue; }
+        if (lower === 'portrait.ico') { notes.push(`${label}/${stem}: leftover portrait.ico (inert — the derived icon is namesake-stemmed now)`); continue; }
         if (img === `${stem}.ico` || /\.(png|jpe?g)$/i.test(img) === false) continue;
         const isNamesake = EXTS.some((ext) => img === `${stem}.${ext}`);
         const isLegacy = EXTS.some((ext) => lower === `portrait.${ext}`);
@@ -289,19 +218,10 @@ function scanLiveTree() {
           } catch (e) {
             problems.push(`${label}/${stem}/${img}: ${e.message}`);
           }
-          // Same-ext legacy twin = invisible cruft (namesake wins) — warn.
-          if (EXTS.some((ext) => img === `${stem}.${ext}` && fs.existsSync(path.join(dir, `portrait.${ext}`)))) {
-            notes.push(`${label}/${stem}: legacy portrait.${img.split('.').pop()} twin of the namesake (boot migration reaps it)`);
-          }
         } else if (isLegacy) {
-          notes.push(`${label}/${stem}/${img}: legacy name, loads via the fallback; boot migration folds it onto ${stem}.${img.split('.').pop()}`);
-          try {
-            assertLoads(path.join(dir, img));
-          } catch (e) {
-            problems.push(`${label}/${stem}/${img}: ${e.message}`);
-          }
+          notes.push(`${label}/${stem}/${img}: leftover legacy portrait name (invisible to discovery since v0.30.0 — safe to delete)`);
         } else {
-          problems.push(`${label}/${stem}/${img}: FOREIGN image name — discovery will never find it (expected <stem>.(png|jpg) or portrait.(png|jpg))`);
+          problems.push(`${label}/${stem}/${img}: FOREIGN image name — discovery will never find it (expected <stem>.(png|jpg))`);
         }
       }
     }

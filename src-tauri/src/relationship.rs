@@ -617,6 +617,110 @@ pub fn apply_transition(state: &mut RelationshipState, outcome: &TransitionOutco
     }
 }
 
+/// (2026-08-23 Playground) The MILESTONE INJECTOR's forced re-evaluation —
+/// the god-tool variant of [`evaluate_transition`]: the TIME FLOORS are
+/// ignored, while the milestone POINTS threshold still gates (injecting the
+/// right events advances, injecting junk doesn't) and both figures are
+/// reported so the tool can show "points 4 / threshold 3". The hostility
+/// short-circuit, the wrong-track rule, the ceiling, and the
+/// Stranger→Acquaintance positive-event gate all apply unchanged. Pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForcedTransition {
+    pub outcome: TransitionOutcome,
+    /// Points accumulated toward the evaluated target tier (0 when no
+    /// affinity target was evaluated — hostility drop, wrong track,
+    /// ceiling, or the neutral hop).
+    pub points: u32,
+    /// The threshold the target tier demands (same 0 convention).
+    pub threshold: u32,
+}
+
+pub fn evaluate_transition_forced(
+    state: &RelationshipState,
+    registry: &MilestoneRegistry,
+    _now_minutes: i64,
+) -> ForcedTransition {
+    // (1) Hostility short-circuit — identical to the gated path.
+    if let Some(worst_drop) = registry.worst_hostility_drop(state) {
+        if worst_drop < state.tier {
+            return ForcedTransition {
+                outcome: TransitionOutcome::Transition {
+                    new_tier: worst_drop,
+                    reason: TransitionReason::HostilityTriggered,
+                },
+                points: 0,
+                threshold: 0,
+            };
+        }
+    }
+    // (2) Hostility track: no upward advance without reconciliation.
+    if state.tier.is_hostility() {
+        return ForcedTransition {
+            outcome: TransitionOutcome::NoTransition {
+                reason: TransitionReason::WrongTrackForAdvance,
+            },
+            points: 0,
+            threshold: 0,
+        };
+    }
+    // (3) Affinity advance — the ONLY divergence from the gated path: the
+    // time floor never blocks; the points threshold still does.
+    let Some(target_tier) = state.tier.next_affinity() else {
+        return ForcedTransition {
+            outcome: TransitionOutcome::NoTransition {
+                reason: TransitionReason::AtCeiling,
+            },
+            points: 0,
+            threshold: 0,
+        };
+    };
+    if !target_tier.is_affinity() {
+        // The neutral hop (Stranger → Acquaintance): the positive-event
+        // gate applies (a forced re-evaluation is not a license to mint
+        // Acquaintances from nothing — inject an event first).
+        let has_positive = state
+            .events
+            .iter()
+            .filter_map(|eid| registry.get(eid))
+            .any(|spec| !spec.hostility_trigger);
+        return ForcedTransition {
+            outcome: if has_positive {
+                TransitionOutcome::Transition {
+                    new_tier: target_tier,
+                    reason: TransitionReason::GatesCleared,
+                }
+            } else {
+                TransitionOutcome::NoTransition {
+                    reason: TransitionReason::MilestoneThresholdNotMet,
+                }
+            },
+            points: 0,
+            threshold: 0,
+        };
+    }
+    let (threshold_points, _base_floor_days) = match target_tier {
+        RelationshipTier::Friendly => (POINTS_THRESHOLD_INTO_FRIENDLY, BASE_TIME_FLOOR_DAYS_INTO_FRIENDLY),
+        RelationshipTier::Trusted => (POINTS_THRESHOLD_INTO_TRUSTED, BASE_TIME_FLOOR_DAYS_INTO_TRUSTED),
+        RelationshipTier::Bonded => (POINTS_THRESHOLD_INTO_BONDED, BASE_TIME_FLOOR_DAYS_INTO_BONDED),
+        _ => unreachable!("target_tier is affinity-track by the check above"),
+    };
+    let points = registry.points_toward(state, target_tier);
+    ForcedTransition {
+        outcome: if points >= threshold_points {
+            TransitionOutcome::Transition {
+                new_tier: target_tier,
+                reason: TransitionReason::GatesCleared,
+            }
+        } else {
+            TransitionOutcome::NoTransition {
+                reason: TransitionReason::MilestoneThresholdNotMet,
+            }
+        },
+        points,
+        threshold: threshold_points,
+    }
+}
+
 /// Build a narrator directive explaining the current relationship stance.
 /// The caller wraps this as `[DIRECTIVE: <npc_id> relationship: <directive>]`
 /// inside `<world_state>`. The narrator obeys; the LLM never sees the
@@ -1085,6 +1189,77 @@ mod tests {
         // Tier unchanged, timestamp unchanged.
         assert_eq!(s.tier, RelationshipTier::Stranger);
         assert_eq!(s.tier_entered_at_minutes, 1000);
+    }
+
+    // ---- (2026-08-23 Playground) forced transition ----
+
+    #[test]
+    fn forced_transition_ignores_time_floor_keeps_points_gate() {
+        // The gated path blocks Acquaintance → Friendly on Day 1 (the
+        // 7-day floor). The FORCED path advances the same state at minute 0
+        // — but only with enough points: 1 point still refuses, 3 clears.
+        let r = registry();
+        let mut one_point = state_at(RelationshipTier::Acquaintance, 0);
+        one_point.record_event("shared_drink");
+        let forced = evaluate_transition_forced(&one_point, &r, 0);
+        assert!(matches!(
+            forced.outcome,
+            TransitionOutcome::NoTransition {
+                reason: TransitionReason::MilestoneThresholdNotMet
+            }
+        ));
+        assert_eq!((forced.points, forced.threshold), (1, 3), "points computed + reported");
+
+        let mut three_points = one_point.clone();
+        three_points.record_event("helped_with_task");
+        let forced = evaluate_transition_forced(&three_points, &r, 0);
+        assert!(matches!(
+            forced.outcome,
+            TransitionOutcome::Transition { new_tier: RelationshipTier::Friendly, .. }
+        ));
+        assert_eq!((forced.points, forced.threshold), (3, 3));
+        // The apply path is the shared one.
+        let mut applied = three_points.clone();
+        apply_transition(&mut applied, &forced.outcome, 0);
+        assert_eq!(applied.tier, RelationshipTier::Friendly);
+    }
+
+    #[test]
+    fn forced_transition_keeps_hostility_and_track_rules() {
+        let r = registry();
+        // A betrayal still short-circuits instantly (no gates to force).
+        let mut betrayed = state_at(RelationshipTier::Trusted, 0);
+        betrayed.record_event("betrayed_trust");
+        let forced = evaluate_transition_forced(&betrayed, &r, 0);
+        assert!(matches!(
+            forced.outcome,
+            TransitionOutcome::Transition { new_tier: RelationshipTier::Hostile, .. }
+        ));
+        assert_eq!((forced.points, forced.threshold), (0, 0));
+        // The hostility track still refuses affinity advances.
+        let rival = state_at(RelationshipTier::Rival, 0);
+        assert!(matches!(
+            evaluate_transition_forced(&rival, &r, 9_999_999).outcome,
+            TransitionOutcome::NoTransition {
+                reason: TransitionReason::WrongTrackForAdvance
+            }
+        ));
+        // Bonded is still the ceiling.
+        let bonded = state_at(RelationshipTier::Bonded, 0);
+        assert!(matches!(
+            evaluate_transition_forced(&bonded, &r, 9_999_999).outcome,
+            TransitionOutcome::NoTransition {
+                reason: TransitionReason::AtCeiling
+            }
+        ));
+        // The neutral hop still needs one positive event.
+        let bare = state_at(RelationshipTier::Stranger, 0);
+        assert!(matches!(
+            evaluate_transition_forced(&bare, &r, 9_999_999).outcome,
+            TransitionOutcome::NoTransition {
+                reason: TransitionReason::MilestoneThresholdNotMet
+            }
+        ));
     }
 
     // ---- Silent-drop validator hook ----

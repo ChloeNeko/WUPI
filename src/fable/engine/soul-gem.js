@@ -136,7 +136,8 @@ const TOGGLE_COOLDOWN_MS = 350;
 // Single source of truth for the #inventory-panel-slot's offset from the
 // backpack. Used by BOTH repositionToBody() (the full measure path) AND
 // repositionSlotOnly() (the cheap panel-only path) so the two can't drift.
-const SLOT_GAP_ABOVE_BACKPACK = 202;  // px the panel climbs above the backpack top
+// (2026-08-24 Chloe) 202 → 162: the panel sat too high above the backpack.
+const SLOT_GAP_ABOVE_BACKPACK = 162;  // px the panel climbs above the backpack top
 const SLOT_RIGHT_MARGIN = 5;          // px from the drawer's right edge (smaller = further right)
 
 // ── DEV TUNER (live nudge calibration) ─────────────────────────────
@@ -288,40 +289,77 @@ export function buildSoulGems(root, backpack, img, gender) {
 // gems snap to their new positions instantly; only bloom/retract animates.
 //
 // LOAD-WAIT: the paperdoll <img> uses width:auto, so before it loads its
-// Clamp the #inventory-panel-slot's height so its TOP edge can never climb
-// past the astrolabe/time-bar header at the top of the drawer. The panel is
-// bottom-anchored (its bottom sits a fixed gap above the backpack) + has a
-// FIXED CSS height (2026-08-19: 376px — it never resizes with its content;
-// the add-an-item growth bug); on shorter viewports this measured cap
-// shrinks it so its top edge doesn't collide with + overlap the time bar.
-// This measures the astrolabe header's bottom edge live, then caps
-// max-height to the vertical space between that + the panel's bottom anchor.
-// When content is taller than the cap, the panel shrinks + its internal
-// scroll viewport takes over (no time-bar overlap). The min-height relax
-// (inline) keeps the old CSS floor from ever forcing the panel past the
-// astrolabe on very short viewports. ASTROLABE_FLOOR_PX is the fallback
-// when the header element can't be measured (matches its CSS box:
-// top:6px + ~64px of font/padding/border ≈ 72px; 80px gives a small breath).
+// ── The inventory panel's vertical law (GROW DOWNWARD, 2026-08-25 Chloe) ──
+// The panel shows its FULL fixed height (the 6-button list) by growing
+// DOWNWARD: its bottom edge normally rests SLOT_GAP_ABOVE_BACKPACK above the
+// backpack, but when that resting gap would push the panel's TOP past the
+// time-UI ceiling (the name plaque + the time scrubber — the panel lives in
+// the right gutter, so the scrubber's Moon endcap is part of that territory),
+// the bottom edge SLIDES DOWN toward the backpack (the gap shrinks, floor
+// SLOT_MIN_GAP_ABOVE_BACKPACK) so the top edge stays under the ceiling and
+// the height never shrinks. The old law (fixed gap + a measured max-height
+// that shrank the panel from the top) left only ~4 visible buttons on
+// shorter viewports. Only when even the minimum gap can't fit the full
+// height (pathological short viewports) does the measured max-height cap
+// shrink the panel — the body's internal scroll then takes over. The
+// min-height relax (inline) keeps the CSS floor from ever forcing the panel
+// past the ceiling. Fallback floors when an element can't be measured:
+// header ≈ top 6 + ~65; scrubber ≈ top clamp floor 48 + ~64 row height.
 const ASTROLABE_FLOOR_PX = 80;
-function clampSlotBelowAstrolabe(slot, rootBox) {
-  if (!slot || !rootBox) return;
-  const header = drawerRoot.querySelector('[data-astrolabe-header]');
-  let astrolabeBottomFromDrawerTop = ASTROLABE_FLOOR_PX;
+const SCRUBBER_FLOOR_PX = 112;
+// The panel's FULL resting height — MUST match the CSS .inventory-panel-slot
+// height (fable.css). Single source of truth for the grow-downward math.
+const SLOT_FULL_HEIGHT_PX = 392;
+// The gap floor: the bottom edge may approach the backpack but never sit ON
+// it (the backpack's hover pop + the bloomed pack gem live in that zone).
+const SLOT_MIN_GAP_ABOVE_BACKPACK = 14;
+
+// Measure the time-UI ceiling (the name plaque + scrubber bottoms, whichever
+// is lower), in drawer-top-relative px. Pure measurement, no writes.
+function measureTimeUiCeiling(rootBox) {
+  let ceiling = ASTROLABE_FLOOR_PX;
+  const header = drawerRoot && drawerRoot.querySelector('[data-astrolabe-header]');
   if (header) {
     const hBox = header.getBoundingClientRect();
-    astrolabeBottomFromDrawerTop = hBox.bottom - rootBox.top;
+    ceiling = Math.max(ceiling, hBox.bottom - rootBox.top);
   }
-  // The slot's bottom edge (from the drawer's top) = drawer height − the
-  // bottom offset we just wrote. Available height for the panel = that bottom
-  // edge − the astrolabe's bottom edge, minus a 6px breath so the panel
-  // doesn't kiss the time bar.
-  const bottomOffset = parseFloat(slot.style.bottom) || 0;
-  const slotBottomFromDrawerTop = rootBox.height - bottomOffset;
-  const available = slotBottomFromDrawerTop - astrolabeBottomFromDrawerTop - 6;
+  const scrubber = drawerRoot && drawerRoot.querySelector('[data-time-scrubber]');
+  if (scrubber) {
+    const sBox = scrubber.getBoundingClientRect();
+    ceiling = Math.max(ceiling, sBox.bottom - rootBox.top);
+  } else {
+    ceiling = Math.max(ceiling, SCRUBBER_FLOOR_PX);
+  }
+  return ceiling;
+}
+
+// Stamp the #inventory-panel-slot's full vertical geometry. Shared by the
+// full reposition (repositionToBody) AND the panel-only path
+// (repositionSlotOnly) so the two can't drift: right-align, the
+// grow-downward bottom anchor, and the last-resort max-height clamp.
+function stampSlotPosition(slot, rootBox, bpTopFromDrawerBottom) {
+  if (!slot || !rootBox) return;
+  slot.style.right = SLOT_RIGHT_MARGIN + 'px';
+  slot.style.left = 'auto';
+  slot.style.top = 'auto';
+  const ceiling = measureTimeUiCeiling(rootBox);
+  const BREATH_PX = 6; // the panel top never kisses the time bar / the Moon
+  // Grow-downward: shrink the gap above the backpack (down to the floor)
+  // until the FULL height fits under the ceiling.
+  const maxGapForFull =
+    rootBox.height - ceiling - BREATH_PX - SLOT_FULL_HEIGHT_PX - bpTopFromDrawerBottom;
+  let gap = SLOT_GAP_ABOVE_BACKPACK;
+  if (gap > maxGapForFull) gap = Math.max(maxGapForFull, SLOT_MIN_GAP_ABOVE_BACKPACK);
+  slot.style.bottom = (bpTopFromDrawerBottom + gap) + 'px';
+  // Last resort (pathologically short viewports): cap max-height so the top
+  // edge still can't cross the ceiling; the body's internal scroll takes
+  // over.
+  const slotBottomFromDrawerTop = rootBox.height - (bpTopFromDrawerBottom + gap);
+  const available = slotBottomFromDrawerTop - ceiling - BREATH_PX;
   if (available > 0) {
     slot.style.maxHeight = available + 'px';
-    // If the CSS min-height (300px) would force the top past the astrolabe,
-    // relax it to the available space so the floor can't override the cap.
+    // If the CSS min-height would force the top past the ceiling, relax it
+    // to the available space so the floor can't override the cap.
     if (available < 300) slot.style.minHeight = available + 'px';
     else slot.style.minHeight = '';
   }
@@ -446,21 +484,17 @@ export function repositionToBody() {
     //     on the backpack X — centering would push half the panel past the
     //     drawer's right boundary → clipped by overflow:hidden). Right-align
     //     keeps it inside the drawer.
-    //   VERTICAL: anchored by its BOTTOM edge above the backpack's top edge
-    //     (NOT by top — top-anchoring lets the slot grow DOWNWARD into the
-    //     backpack when content is injected after the initial measure).
-    //     Bottom-anchoring makes it grow upward.
+    //   VERTICAL: bottom-anchored above the backpack's top edge (NOT by top —
+    //     top-anchoring lets the slot grow DOWNWARD into the backpack when
+    //     content is injected after the initial measure), and GROWS DOWNWARD
+    //     under the time-UI ceiling: when the resting gap can't fit the full
+    //     panel height, the bottom edge slides toward the backpack instead
+    //     of the top edge climbing toward the time bar (stampSlotPosition).
     if (drawerRoot) {
       const slot = drawerRoot.querySelector('#inventory-panel-slot');
       if (slot) {
-        slot.style.right = SLOT_RIGHT_MARGIN + 'px';
-        slot.style.left = 'auto';
-        // Bottom-anchor: distance from the drawer's bottom to the slot's
-        // bottom edge = (drawer height − backpack top) + gap.
         const bpTopFromDrawerBottom = rootBox.bottom - bpBox.top;
-        slot.style.bottom = (bpTopFromDrawerBottom + SLOT_GAP_ABOVE_BACKPACK) + 'px';
-        slot.style.top = 'auto';
-        clampSlotBelowAstrolabe(slot, rootBox);
+        stampSlotPosition(slot, rootBox, bpTopFromDrawerBottom);
         stamps.slot = { right: SLOT_RIGHT_MARGIN + 'px', bottom: slot.style.bottom };
       }
     }
@@ -545,12 +579,10 @@ export function repositionSlotOnly() {
   if (!slot) return;
   const rootBox = drawerRoot.getBoundingClientRect();
   const bpBox = backpackEl.getBoundingClientRect();
-  slot.style.right = SLOT_RIGHT_MARGIN + 'px';
-  slot.style.left = 'auto';
-  const bpTopFromDrawerBottom = rootBox.bottom - bpBox.top;
-  slot.style.bottom = (bpTopFromDrawerBottom + SLOT_GAP_ABOVE_BACKPACK) + 'px';
-  slot.style.top = 'auto';
-  clampSlotBelowAstrolabe(slot, rootBox);
+  // The shared vertical stamp (grow-downward + time-UI ceiling) — the same
+  // geometry repositionToBody writes, so a gem-select reveal can never land
+  // on stale panel anchoring.
+  stampSlotPosition(slot, rootBox, rootBox.bottom - bpBox.top);
 }
 
 // ── The master toggle: bloom ↔ retract ───────────────────────────
@@ -602,8 +634,7 @@ function applyClosed() {
 
 // Open + close entrypoints (for teardown / external control). openSoulGems
 // rides the cooldown-guarded toggle; closeSoulGems is an EXPLICIT COMMAND
-// (Esc via closeDrawer, the stale-edge-lock sweep, the drawer's mouseleave
-// auto-close) and BYPASSES the cooldown (D6a 2026-08-16, Chloe ruling: a
+// (Esc via closeDrawer, the window-exit sweep, the distance-based auto-close) and BYPASSES the cooldown (D6a 2026-08-16, Chloe ruling: a
 // debounce is for hover events, not explicit commands) — a close landing
 // inside the 350ms window used to no-op and leave the gems bloomed behind a
 // just-closed drawer. The `animating` flag stays armed for its full window

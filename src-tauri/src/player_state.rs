@@ -192,6 +192,107 @@ impl Stamina {
             Stamina::Active | Stamina::Fresh => Stamina::Fresh,
         };
     }
+
+    /// (2026-08-22 living-world) The player-side skill-check bonus this
+    /// grade contributes (the 2026-08-22 alignment table: Fresh +4, Active
+    /// +2, Winded 0, Exhausted −2, Depleted −4). The skill-check Referee
+    /// consumes it NEGATED (its DC args are additive-harder-positive) via
+    /// [`vigor_dc_mod`].
+    pub fn dc_bonus(&self) -> i32 {
+        match self {
+            Stamina::Fresh => 4,
+            Stamina::Active => 2,
+            Stamina::Winded => 0,
+            Stamina::Exhausted => -2,
+            Stamina::Depleted => -4,
+        }
+    }
+}
+
+/// (2026-08-22 living-world, the Auto-Harvest Dormancy ruling) The ARCANE
+/// pool — a dormant twin of [`Stamina`] that stays 100% hidden (zero
+/// tokens, no render, no clamps, no recovery) until a card's fiction
+/// actually names an arcane resource ("mana", "biotics", "rage", "ki").
+/// Activation paths: the `[ARCANA <label>]` tracker bracket, or the
+/// cold-start bootstrap harvesting the resource name from the intro. Once
+/// active it rides the SAME rest-recovery curve + fatigue clamps + grade
+/// DC table as stamina:
+///
+/// | Stamina | Mana    | player roll bonus |
+/// |---------|---------|-------------------|
+/// | Fresh   | Surging | +4                |
+/// | Active  | Steady  | +2                |
+/// | Winded  | Strained| 0                 |
+/// | Exhausted| Drained| −2                |
+/// | Depleted| Spent   | −4                |
+///
+/// Ordering mirrors Stamina (worst→best, `as u8` comparisons work).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize, Debug)]
+pub enum Mana {
+    Spent,
+    Drained,
+    Strained,
+    Steady,
+    Surging,
+}
+
+impl Mana {
+    pub fn semantic(&self) -> &'static str {
+        match self {
+            Mana::Surging => "Surging",
+            Mana::Steady => "Steady",
+            Mana::Strained => "Strained",
+            Mana::Drained => "Drained",
+            Mana::Spent => "Spent",
+        }
+    }
+
+    /// Drain one step toward `Spent` (a casting/channeling cost), never
+    /// wrapping past the floor. `[ARCANA -1]` steps this.
+    pub fn drain(&mut self) {
+        *self = match self {
+            Mana::Surging => Mana::Steady,
+            Mana::Steady => Mana::Strained,
+            Mana::Strained => Mana::Drained,
+            Mana::Drained | Mana::Spent => Mana::Spent,
+        };
+    }
+
+    /// Recover one step toward `Surging` — the same rest curve stamina
+    /// rides (`[REST]` + the recovery referee).
+    pub fn recover(&mut self) {
+        *self = match self {
+            Mana::Spent => Mana::Drained,
+            Mana::Drained => Mana::Strained,
+            Mana::Strained => Mana::Steady,
+            Mana::Steady | Mana::Surging => Mana::Surging,
+        };
+    }
+
+    /// The player-side skill-check bonus (the alignment table above).
+    pub fn dc_bonus(&self) -> i32 {
+        match self {
+            Mana::Surging => 4,
+            Mana::Steady => 2,
+            Mana::Strained => 0,
+            Mana::Drained => -2,
+            Mana::Spent => -4,
+        }
+    }
+}
+
+/// (2026-08-22 living-world) The additive DC modifier the skill-check
+/// Referee consumes for the body's current vigor: the WORSE of the stamina
+/// grade and the ACTIVE mana grade (a drained channel drags every skilled
+/// attempt; a dormant pool contributes nothing — gritty westerns pay zero
+/// mechanics, not a penalty). Player-side bonuses NEGATED into
+/// harder-positive DC units, matching `pacing_dc_mod`/`health_dc_mod`.
+pub fn vigor_dc_mod(stamina: Stamina, mana: Option<Mana>) -> i32 {
+    let bonus = match mana {
+        Some(m) => stamina.dc_bonus().min(m.dc_bonus()),
+        None => stamina.dc_bonus(),
+    };
+    -bonus
 }
 
 // ---------------------------------------------------------------------------
@@ -329,50 +430,6 @@ impl BodyPart {
         }
     }
 
-    /// The set of PascalCase serde wire keys the 22 variants serialize as
-    /// (`"LeftUpperArm"`, `"UpperTorso"`, …). Used by the save-load seam
-    /// (`WorldSchema::load_split`) to DROP unknown body keys before
-    /// deserializing `player_state` — the clean-delete safety net. A pre-
-    /// 2026-08-07 save carries the deleted 16-part keys (`Torso`, `LeftBicep`,
-    /// `LeftThigh`, `LeftAnkle`, …); those no longer name a real variant, so
-    /// a raw `serde_json::from_value` would ERROR on them. Filtering the
-    /// `body` object to only these 22 keys first makes the clean delete
-    /// save-safe: dead-part injury data simply vanishes (the part no longer
-    /// exists), no remap, no crash. Built once from `all()` so it can't drift
-    /// from the enum.
-    pub fn wire_keys() -> std::collections::HashSet<&'static str> {
-        let mut set = std::collections::HashSet::with_capacity(22);
-        for part in BodyPart::all() {
-            // serde's default for a unit enum variant is the variant's name
-            // (PascalCase). We avoid re-listing the 22 strings by deriving
-            // each key from the variant via a tiny match — keeps one source.
-            set.insert(match part {
-                BodyPart::Head => "Head",
-                BodyPart::Neck => "Neck",
-                BodyPart::UpperTorso => "UpperTorso",
-                BodyPart::LowerTorso => "LowerTorso",
-                BodyPart::LeftShoulder => "LeftShoulder",
-                BodyPart::RightShoulder => "RightShoulder",
-                BodyPart::LeftUpperArm => "LeftUpperArm",
-                BodyPart::RightUpperArm => "RightUpperArm",
-                BodyPart::LeftElbow => "LeftElbow",
-                BodyPart::RightElbow => "RightElbow",
-                BodyPart::LeftLowerArm => "LeftLowerArm",
-                BodyPart::RightLowerArm => "RightLowerArm",
-                BodyPart::LeftHand => "LeftHand",
-                BodyPart::RightHand => "RightHand",
-                BodyPart::LeftUpperLeg => "LeftUpperLeg",
-                BodyPart::RightUpperLeg => "RightUpperLeg",
-                BodyPart::LeftKnee => "LeftKnee",
-                BodyPart::RightKnee => "RightKnee",
-                BodyPart::LeftLowerLeg => "LeftLowerLeg",
-                BodyPart::RightLowerLeg => "RightLowerLeg",
-                BodyPart::LeftFoot => "LeftFoot",
-                BodyPart::RightFoot => "RightFoot",
-            });
-        }
-        set
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -404,6 +461,20 @@ pub struct PlayerState {
 
     #[serde(default)]
     pub stamina: Stamina,
+
+    /// (2026-08-22 living-world, the Auto-Harvest Dormancy ruling) The
+    /// arcane pool. `None` = DORMANT: the card never named an arcane
+    /// resource, and the field costs zero tokens forever (no render, no
+    /// clamp, no recovery — the economy-dormancy pattern). `Some` once
+    /// `[ARCANA <label>]` or the cold-start bootstrap activates it; rides
+    /// the same rest curves + fatigue floors as stamina thereafter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mana: Option<Mana>,
+
+    /// The diegetic resource name ("mana", "biotics", "rage") — the
+    /// activated pool's render label. Empty while dormant.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub mana_label: String,
 
     /// Coin / gold / credits. Numeric; the UI formats it. Default 0.
     #[serde(default)]
@@ -470,6 +541,17 @@ pub struct PlayerState {
     #[serde(default)]
     pub belt: Vec<equipment::StackItem>,
 
+    /// (2026-08-23 pouch ruling) The POUCH — the player's wallet. Currency,
+    /// coins, keys, ID papers, and small valuables auto-route here at every
+    /// acquisition path (`equipment::pouch_fit` via `stash_target`); the
+    /// retired "pocketing" concept (small items riding pants/belt pockets)
+    /// is replaced by it. UNBOUNDED like the pack. Mutated by the same
+    /// brackets as the pack (`[PACK]`/`[NPC_ITEM player]` route wallet cargo
+    /// here mechanically) + the Soul Gem panel's POUCH action. Rides
+    /// `save_split` → `<card_id>.player.json` for free.
+    #[serde(default)]
+    pub pouch: Vec<equipment::StackItem>,
+
     /// Deep-storage pack — UNBOUNDED bagged inventory (the encumbrance/weight
     /// system was PERMANENTLY REMOVED 2026-08-09: no capacity enforcement, no
     /// fill bar, ever). Mutated by the `[PACK]` bracket OR by the Soul Gem
@@ -494,6 +576,8 @@ impl Default for PlayerState {
             body,
             injury_details: HashMap::new(),
             stamina: Stamina::Fresh,
+            mana: None,
+            mana_label: String::new(),
             wealth: 0,
             reputation: 0,
             lifestyle: crate::economy::Lifestyle::Squatter,
@@ -502,6 +586,7 @@ impl Default for PlayerState {
             current_appearance_deltas: HashMap::new(),
             equipment: HashMap::new(),
             belt: Vec::new(),
+            pouch: Vec::new(),
             pack: Vec::new(),
         }
     }
@@ -516,6 +601,7 @@ impl PlayerState {
     /// the block renders even at full health.
     pub fn is_default(&self) -> bool {
         self.stamina == Stamina::Fresh
+            && self.mana.is_none()
             && self.wealth == 0
             && self.reputation == 0
             && self.lifestyle == crate::economy::Lifestyle::Squatter
@@ -525,6 +611,7 @@ impl PlayerState {
             && self.current_appearance_deltas.is_empty()
             && self.equipment.is_empty()
             && self.belt.is_empty()
+            && self.pouch.is_empty()
             && self.pack.is_empty()
     }
 
@@ -585,6 +672,23 @@ impl PlayerState {
         // Stamina always (when non-default state); the model needs to know
         // fatigue even at full health if injured.
         lines.push(format!("stamina: {}", self.stamina.semantic()));
+
+        // (2026-08-22 living-world) The arcane pool renders DIRECTLY under
+        // stamina — only when ACTIVATED (the Auto-Harvest Dormancy ruling:
+        // a dormant pool renders nothing, ever). One lean line, the
+        // stamina: discipline; the label falls back to "mana" for a
+        // hand-edited Some-with-empty-label save. The label is CLEANED at
+        // the render (the same `clean_free_text` + cap the `[ARCANA]`
+        // parse applies): a hand-edited save must never inject newlines or
+        // oversized prose into `<world_state>`.
+        if let Some(mana) = self.mana {
+            let cleaned = crate::bracket_parser::clean_free_text(
+                self.mana_label.trim(),
+                crate::bracket_parser::ARCANA_LABEL_MAX,
+            );
+            let label: &str = if cleaned.is_empty() { "mana" } else { cleaned.as_str() };
+            lines.push(format!("{label}: {}", mana.semantic()));
+        }
 
         // Injuries: any part not Healthy AND not Amputated, in anatomical order.
         // Each entry carries its per-zone wound history (from injury_details)
@@ -839,6 +943,26 @@ impl AttackerTier {
         }
     }
 
+    /// (2026-08-23 dynamic DCs) Skill-check STAKES modifier — added to every
+    /// skill DC, scaled by the strongest hostile presence in the scene (the
+    /// `combined` tier: on-camera NPC tier max the ACTIVE site map's
+    /// `present_mob_tier`). Persuading a king is not persuading a barkeep;
+    /// sneaking past a legendary is a different universe from slipping a
+    /// minion patrol — and now the DC says so WITHOUT any LLM discretion
+    /// (the tier is Rust-derived, the ladder is a constant). The DELIBERATE
+    /// MIRROR of [`Self::lethality_dc_mod`]: lethality lowers the save DC
+    /// (the player drops easier); stakes RAISE the check DC (the player
+    /// succeeds harder). Same 4-step spacing, opposite sign of effect.
+    pub fn skill_dc_mod(self) -> i32 {
+        match self {
+            AttackerTier::Minion => 0,    // mooks add no pressure
+            AttackerTier::Soldier => 2,
+            AttackerTier::Elite => 4,
+            AttackerTier::Boss => 6,
+            AttackerTier::Legendary => 8, // persuading a legend is near-impossible
+        }
+    }
+
     /// Human-readable label for the lethality directive. The narrator sees
     /// this in the `[DIRECTIVE: Lethal blow (<tier> tier, DC N)...]` line.
     pub fn tag_for_directive(self) -> &'static str {
@@ -945,6 +1069,66 @@ pub(crate) fn combat_triggered(lower_dialogue_stripped: &str) -> bool {
         >= 2
 }
 
+/// (2026-08-22 Chloe ruling — traversal is exertion, damage is
+/// consequence-only) The movement/effort verb families that ride
+/// [`COMBAT_HARD_KEYWORDS`] (scene pacing's kinetic pillar + the shared gate
+/// stay intact — a chase still classifies Combat) but must NEVER mint a
+/// limb injury on their own. Basic traversal drains stamina; damage needs
+/// an explicit hazard ([`HAZARD_KEYWORDS`]) or a violence verb alongside.
+pub(crate) const TRANSIT_VERBS: &[&str] = &[
+    "run", "runs", "running", "ran",
+    "sprint", "sprints", "sprinted", "sprinting",
+    "climb", "climbs", "climbed", "climbing",
+    "jump", "jumps", "jumped", "jumping",
+    "leap", "leaps", "leapt", "leaping", "leaped",
+    "swim", "swims", "swam", "swimming",
+    "vault", "vaults", "vaulted", "vaulting",
+    "scramble", "scrambles", "scrambled", "scrambling",
+    "march", "marches", "marched", "marching",
+];
+
+/// (2026-08-22 Chloe ruling) Hazard markers that RE-ARM the injury roll on
+/// a transit turn — the "failed roll / explicit hazard" half: falls,
+/// slips, traps, heavy impacts, collapses. Paired with any transit verb
+/// these are consequence-worthy (the climb that ends in a fall rolls).
+const HAZARD_KEYWORDS: &[&str] = &[
+    "fall", "falls", "fell", "falling",
+    "slip", "slips", "slipped", "slipping",
+    "trip", "trips", "tripped",
+    "trap", "traps", "trapped",
+    "impact", "impacts", "impacted",
+    "crash", "crashes", "crashed", "crashing",
+    "slam", "slams", "slammed", "slamming",
+    "collapse", "collapses", "collapsed", "collapsing",
+    "tumble", "tumbles", "tumbled", "tumbling",
+];
+
+/// (2026-08-22 Chloe ruling) TRUE when the ONLY hard trigger is traversal:
+/// a transit verb with NO violence verb and NO hazard marker. Such a turn
+/// pays the stamina tax (applied by the caller — one `drain()` step) and
+/// rolls no injury, flips no lethality. Soft keywords (hunt/raid gossip)
+/// never re-arm the roll — they are about-others phrasing, not hazards.
+/// Pure fn over the SAME dialogue-stripped, lowercased text the referee
+/// gate consumes.
+pub(crate) fn transit_only_exertion(lower_dialogue_stripped: &str) -> bool {
+    let transit = TRANSIT_VERBS
+        .iter()
+        .any(|kw| keyword_present(lower_dialogue_stripped, kw));
+    if !transit {
+        return false;
+    }
+    let violence = COMBAT_HARD_KEYWORDS
+        .iter()
+        .filter(|kw| !TRANSIT_VERBS.contains(kw))
+        .any(|kw| keyword_present(lower_dialogue_stripped, kw));
+    if violence {
+        return false;
+    }
+    !HAZARD_KEYWORDS
+        .iter()
+        .any(|kw| keyword_present(lower_dialogue_stripped, kw))
+}
+
 /// (2026-08-15 recovery seam) Rest keywords that trigger the recovery
 /// Referee. Same whole-word, case-insensitive matcher as COMBAT_KEYWORDS.
 /// Deliberately rest-specific: "rest"/"sleep"/"camp" families — the verbs a
@@ -973,6 +1157,18 @@ pub struct RecoveryOutcome {
     /// healable this turn (all healthy, or only amputations). The part maps
     /// to its NEW state; `Healthy` means fully healed (entry removed).
     pub healed: Option<(BodyPart, BodyPartState)>,
+}
+
+/// (2026-08-22 living-world) The rest-fatigue clamp floors: a `weary`
+/// rested-band clamps stamina/mana down to Winded/Strained, the deeper
+/// band to Exhausted/Drained. The clamp ONLY lowers — callers apply
+/// `if current > floor` — so a state already at-or-below its floor
+/// survives untouched.
+pub fn fatigue_floors(band: &str) -> (Stamina, Mana) {
+    match band {
+        "weary" => (Stamina::Winded, Mana::Strained),
+        _ => (Stamina::Exhausted, Mana::Drained),
+    }
 }
 
 /// (2026-08-15 recovery seam) The recovery Referee — the exit from the
@@ -1415,6 +1611,17 @@ pub fn referee_evaluate_with_tier(
     if !triggered {
         return None;
     }
+    // (2026-08-22 Chloe ruling — traversal is exertion, damage is
+    // consequence-only) Transit-only text (climb/sprint/leap… with no
+    // violence verb, no hazard) rolls NO injury here — the caller routes
+    // the turn to the one-step stamina tax instead. Scene pacing still
+    // classifies these turns through the shared `combat_triggered` gate.
+    if transit_only_exertion(&lower) {
+        tracing::debug!(
+            "referee: transit-only exertion — no injury roll (the stamina tax routes at the caller)"
+        );
+        return None;
+    }
 
     // Seed from the text + current injury count so back-to-back identical
     // turns roll differently (the count changes after the first applies).
@@ -1760,6 +1967,14 @@ struct SkillSpec {
     success_seed: &'static str,
     /// Narrator seed when the check fails.
     fail_seed: &'static str,
+    /// (2026-08-23 hazard referees) Entity stems: lowercase substrings
+    /// matched against `skill_*` entity keys (after the `skill_`/`skill.`
+    /// prefix strip) to find the player's declared proficiency — a
+    /// declared rank lowers THIS skill's DC only (the one-directional
+    /// prof bonus; an undeclared skill changes nothing). The panel
+    /// (`skills.js`) reads the same entities, so the bar the player sees
+    /// and the DC mod the referee applies are one source.
+    entity_stems: &'static [&'static str],
 }
 
 /// The skill table. Order matters only for tracing (first match in iteration
@@ -1781,6 +1996,7 @@ const SKILL_TABLE: &[SkillSpec] = &[
         base_dc: 12,
         success_seed: "the lock clicks open",
         fail_seed: "the lock resists; your picks slip",
+        entity_stems: &["lockpick", "locks"],
     },
     SkillSpec {
         name: "sneak",
@@ -1796,6 +2012,7 @@ const SKILL_TABLE: &[SkillSpec] = &[
         base_dc: 12,
         success_seed: "you move unseen",
         fail_seed: "you are noticed",
+        entity_stems: &["sneak", "stealth"],
     },
     SkillSpec {
         name: "persuade",
@@ -1809,6 +2026,7 @@ const SKILL_TABLE: &[SkillSpec] = &[
         base_dc: 14,
         success_seed: "your words land",
         fail_seed: "your words fall flat",
+        entity_stems: &["persuade", "persuasion", "diplomacy", "negotiat"],
     },
     SkillSpec {
         name: "deceive",
@@ -1828,6 +2046,7 @@ const SKILL_TABLE: &[SkillSpec] = &[
         base_dc: 14,
         success_seed: "the lie holds",
         fail_seed: "the lie unravels",
+        entity_stems: &["deceive", "deception", "lie"],
     },
     SkillSpec {
         name: "intimidate",
@@ -1841,6 +2060,7 @@ const SKILL_TABLE: &[SkillSpec] = &[
         base_dc: 13,
         success_seed: "they flinch",
         fail_seed: "they stand firm",
+        entity_stems: &["intimidat"],
     },
 ];
 
@@ -1852,6 +2072,148 @@ const SKILL_TABLE: &[SkillSpec] = &[
 /// even though the matcher no longer differs.
 pub(crate) fn keyword_whole_word(lower: &str, kw: &str) -> bool {
     keyword_present(lower, kw)
+}
+
+/// (2026-08-23 hazard referees) Map a `skill_*` entity's declared value to
+/// the 0–5 proficiency rank, pinning parity with the panel's `toLevel`
+/// ladder (`src/fable/panels/skills.js` — the bar the player sees and the
+/// DC mod the referee applies must agree):
+///
+/// - Keywords (substring, first ladder match wins, mirroring toLevel's
+///   ordered regexes): untrained|none→0, novice|beginner|apprentice→1,
+///   adept|competent|junior→2, skilled|proficient→3,
+///   expert|veteran|senior→4, master|mastery|legendary→5; an unmatched
+///   non-empty value reads as the JS 50%-fallback → 2.
+/// - Numbers: `v ≤ 1` is a fraction (rank `round(v×5)`); `v ≤ 10` is the
+///   0–10 scale (rank `v`); `v > 10` is a percent (rank `round(v/20)`).
+///   Clamped to [0, 5].
+/// - Non-scalar values (objects/arrays/null) read as untrained (0).
+///
+/// Pure.
+pub fn parse_skill_rank(value: &serde_json::Value) -> u8 {
+    let text = match value {
+        serde_json::Value::String(s) => s.trim().to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        _ => return 0,
+    };
+    if text.is_empty() {
+        return 0;
+    }
+    if let Ok(v) = text.parse::<f64>() {
+        let rank = if v <= 1.0 {
+            (v * 5.0).round()
+        } else if v <= 10.0 {
+            v.round()
+        } else {
+            (v / 20.0).round()
+        };
+        return rank.clamp(0.0, 5.0) as u8;
+    }
+    let lower = text.to_lowercase();
+    const LADDER: &[(&str, u8)] = &[
+        ("untrained", 0),
+        ("none", 0),
+        ("novice", 1),
+        ("beginner", 1),
+        ("apprentice", 1),
+        ("adept", 2),
+        ("competent", 2),
+        ("junior", 2),
+        ("skilled", 3),
+        ("proficient", 3),
+        ("expert", 4),
+        ("veteran", 4),
+        ("senior", 4),
+        ("master", 5),
+        ("mastery", 5),
+        ("legendary", 5),
+    ];
+    for (stem, rank) in LADDER {
+        if lower.contains(stem) {
+            return *rank;
+        }
+    }
+    2
+}
+
+/// (2026-08-24 Part II B8) Diff two entity maps' `skill_*`/`skill.` ranks and
+/// return every skill whose parsed rank STRICTLY deepened (`old < new`; a
+/// key absent from `before` counts as rank 0 — a first-time knack is the
+/// biggest jump there is). Demotions/losses and non-skill keys never report.
+/// The display name prettifies the key stem (`skill_lockpicking` →
+/// `Lockpicking`). Pure — the whole surviving surface of the killed
+/// level-up system (ONE toast per advance, no counters, no menus).
+pub fn detect_skill_advances(
+    before: &BTreeMap<String, serde_json::Value>,
+    after: &BTreeMap<String, serde_json::Value>,
+) -> Vec<(String, u32, u32)> {
+    let mut out = Vec::new();
+    for (key, value) in after {
+        if !(key.starts_with("skill_") || key.starts_with("skill.")) {
+            continue;
+        }
+        let new_rank = parse_skill_rank(value);
+        let old_rank = before.get(key).map(parse_skill_rank).unwrap_or(0);
+        if new_rank > old_rank {
+            let stem = key
+                .strip_prefix("skill_")
+                .or_else(|| key.strip_prefix("skill."))
+                .unwrap_or(key);
+            let display: String = stem
+                .split(['_', ' ', '-'])
+                .map(|w| {
+                    let mut cs = w.chars();
+                    match cs.next() {
+                        Some(c) => c.to_uppercase().collect::<String>() + cs.as_str(),
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push((display, old_rank as u32, new_rank as u32));
+        }
+    }
+    out
+}
+
+/// (2026-08-23 hazard referees) The one-directional proficiency DC mod for
+/// one skill: the BEST (highest) declared rank among `skill_*` entities
+/// whose key (post `skill_`/`skill.` prefix strip) contains one of the
+/// spec's stems, mapped 1→0, 2→−1, 3→−2, 4→−3, 5→−4. Rank 0 (explicitly
+/// untrained) and an undeclared skill both change nothing — proficiency
+/// only ever HELPS (the anti-inflation law: the tracker declaring
+/// "skill_sneak: terrible" must not make sneaking harder than never
+/// having said anything). Pure.
+fn skill_prof_dc_mod(
+    spec: &SkillSpec,
+    entities: &BTreeMap<String, serde_json::Value>,
+) -> i32 {
+    let mut best: Option<u8> = None;
+    for (key, value) in entities {
+        // The panel convention: `skill_<name>` keys (a tolerant `skill.`
+        // alias rides along).
+        let Some(rest) = key
+            .strip_prefix("skill_")
+            .or_else(|| key.strip_prefix("skill."))
+        else {
+            continue;
+        };
+        let rest_lower = rest.to_lowercase();
+        if rest_lower.is_empty()
+            || !spec.entity_stems.iter().any(|stem| rest_lower.contains(stem))
+        {
+            continue;
+        }
+        let rank = parse_skill_rank(value);
+        best = Some(match best {
+            Some(b) => b.max(rank),
+            None => rank,
+        });
+    }
+    match best {
+        Some(r) if r >= 2 => -(i32::from(r.min(5)) - 1),
+        _ => 0,
+    }
 }
 
 /// Roll a single d20 (1..=20) using the provided Roller. Exposed so tests can
@@ -1879,6 +2241,27 @@ pub(crate) fn roll_d20(roller: &mut Roller) -> u32 {
 /// `HealthTier::skill_dc_mod`). A Fair-or-worse body, or an active
 /// illness, makes every skilled attempt harder. Pass 0 for a neutral body.
 ///
+/// `vigor_dc_mod`: additive DC modifier from the body's current vigor
+/// (2026-08-22 living-world — [`vigor_dc_mod`], the WORSE of the stamina
+/// grade and the ACTIVE mana grade, player-side bonus negated into DC
+/// units). A fresh body + surging channel lifts every skilled attempt; a
+/// depleted one hardens them. Pass 0 for a neutral Fresh body with a
+/// dormant pool.
+///
+/// `stakes_dc_mod`: additive DC modifier from the scene's STAKES
+/// (2026-08-23 dynamic DCs — [`AttackerTier::skill_dc_mod`] over the
+/// `combined` tier: on-camera NPC tier max the ACTIVE site map's
+/// `present_mob_tier`). Picking a lock under a legend's gaze is a different
+/// DC than picking one in an empty alley — pure Rust, no LLM discretion.
+/// Pass 0 when nothing hostile is present.
+///
+/// `entities` (2026-08-23 hazard referees): the live schema's entity map —
+/// a declared `skill_*` rank lowers ITS skill's DC by the one-directional
+/// proficiency ladder ([`parse_skill_rank`] /
+/// [`skill_prof_dc_mod`]). Pass an empty map when no schema is in scope.
+/// The DICE are unaffected — the proficiency shifts the DC, never the seed
+/// (the modifier-must-not-reseed-the-dice invariant).
+///
 /// Combat keywords are EXCLUDED here — `referee_evaluate` owns those. The
 /// two Referees are disjoint by keyword set; the same turn may fire one
 /// combat roll AND multiple skill rolls (e.g. "I attack the guard then
@@ -1888,10 +2271,75 @@ pub(crate) fn roll_d20(roller: &mut Roller) -> u32 {
 /// (`hash_text(text) + skill_index`), so back-to-back identical turns produce
 /// different rolls (the skill_index offset + the text hash compound). Same
 /// text + same pacing → same outcome (testable).
+///
+/// (2026-08-23 Playground) `auto_pass` is an explicit god-mode INPUT, not a
+/// seed change: when true every triggered skill forces `success: true` and
+/// the directive renders the success seed — the dice + DC still roll + still
+/// report, so the Playground's report line shows exactly what WOULD have
+/// happened. Determinism is untouched (same text + same flags → same
+/// outcome).
+/// (2026-08-24 Part II B3) Display-name aliases for pinned-DC matching: the
+/// Crossroads law declares natural skill names ("— [Lockpicking DC 18]"),
+/// the SKILL_TABLE carries terse ids (`lockpick`). Both directions are
+/// matched case-insensitively + trimmed: exact, alias-equal, or a ≥5-char
+/// contains (short stems like "lie" would false-positive inside unrelated
+/// words, so only the long forms participate in contains).
+const SKILL_PIN_ALIASES: &[(&str, &[&str])] = &[
+    ("lockpick", &["lockpicking", "lock-picking", "locksmithing"]),
+    ("sneak", &["stealth", "sneaking", "skulking"]),
+    ("persuade", &["persuasion", "convince", "convincing", "diplomacy"]),
+    ("deceive", &["deception", "lying", "bluffing", "bluff"]),
+    ("intimidate", &["intimidation", "menace", "threaten", "threatening"]),
+];
+
+fn pinned_skill_matches(pin: &str, spec_name: &str) -> bool {
+    let pin = pin.trim().to_lowercase();
+    if pin.is_empty() {
+        return false;
+    }
+    let spec = spec_name.trim().to_lowercase();
+    let aliases: Vec<&str> = SKILL_PIN_ALIASES
+        .iter()
+        .find(|(name, _)| *name == spec)
+        .map(|(_, a)| a.to_vec())
+        .unwrap_or_default();
+    let mut candidates: Vec<&str> = vec![spec.as_str()];
+    candidates.extend(aliases.iter().copied());
+    candidates.retain(|c| !c.is_empty());
+    if candidates.iter().any(|c| *c == pin) {
+        return true;
+    }
+    // (2026-08-25 fix) Word-level matching — the old bidirectional raw
+    // `contains` let "flying".contains("lying") price the DECEIVE check
+    // with a Crossroads pin declared for a different skill. Words split on
+    // non-alphanumerics; a candidate word matches a pin word on equality or
+    // a ≥5-char PREFIX extension (inflections: "lockpicking" ← "lockpick",
+    // "stealthy" ← "stealth"). Mid-word embeddings never match.
+    let pin_words: Vec<&str> = pin
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .collect();
+    let words_match = |a: &str, b: &str| {
+        a == b
+            || (b.chars().count() >= 5 && a.starts_with(b))
+            || (a.chars().count() >= 5 && b.starts_with(a))
+    };
+    candidates.iter().any(|cand| {
+        cand.split(|ch: char| !ch.is_alphanumeric())
+            .filter(|w| w.chars().count() >= 3)
+            .any(|w| pin_words.iter().any(|pw| words_match(*pw, w)))
+    })
+}
+
 pub fn referee_evaluate_skill_checks(
     text: &str,
     pacing_dc_mod: i32,
     health_dc_mod: i32,
+    vigor_dc_mod: i32,
+    stakes_dc_mod: i32,
+    entities: &BTreeMap<String, serde_json::Value>,
+    auto_pass: bool,
+    pinned_dc: Option<(&str, u32)>,
 ) -> Vec<SkillCheckOutcome> {
     // (P1e) Dialogue-stripped matching: spoken words don't attempt checks.
     let lower = strip_dialogue(text).to_lowercase();
@@ -1909,16 +2357,38 @@ pub fn referee_evaluate_skill_checks(
         // Distinct seed per skill: text hash + skill index. The index offset
         // guarantees "I pick the lock and sneak past" rolls lockpick and
         // sneak with different dice (otherwise the same hash → same roll).
+        // The prof modifier deliberately does NOT enter the seed.
         let seed = text_hash.wrapping_add(idx as u64);
         let mut roller = Roller::new(seed);
         let roll = roll_d20(&mut roller);
-        // Effective DC = base + pacing modifier + health modifier, clamped
-        // to [1, 30]. A d20 roll is 1..=20, so DC ≤ 1 is always-success and
-        // DC ≥ 21 is always-fail; the clamp keeps the math honest without
-        // panicking.
-        let dc = (spec.base_dc as i32 + pacing_dc_mod + health_dc_mod)
-            .clamp(1, 30) as u32;
-        let success = roll >= dc;
+        // (2026-08-24 Part II B3) PINNED DC: a Crossroads option that
+        // declared "— [Skill DC N]" commits its difficulty the moment it is
+        // offered — when the player picks it, the frontend arms this slot
+        // and the NEXT turn's referee uses the declared DC for the matching
+        // skill INSTEAD of the computed one (dice + seeds untouched). This
+        // closes the last sycophancy door: the model cannot soften a check
+        // it already priced. Matching runs through [`pinned_skill_matches`]
+        // (natural names alias onto the terse table ids).
+        let dc = match pinned_dc {
+            Some((pin_name, pin_dc)) if pinned_skill_matches(pin_name, spec.name) => {
+                pin_dc.clamp(1, 30)
+            }
+            _ => {
+                // Effective DC = base + pacing + health + vigor + stakes +
+                // declared proficiency modifiers, clamped to [1, 30]. A d20
+                // roll is 1..=20, so DC ≤ 1 is always-success and DC ≥ 21 is
+                // always-fail; the clamp keeps the math honest without
+                // panicking.
+                (spec.base_dc as i32
+                    + pacing_dc_mod
+                    + health_dc_mod
+                    + vigor_dc_mod
+                    + stakes_dc_mod
+                    + skill_prof_dc_mod(spec, entities))
+                .clamp(1, 30) as u32
+            }
+        };
+        let success = auto_pass || roll >= dc;
         let seed_text = if success { spec.success_seed } else { spec.fail_seed };
         let directive = format!(
             "{} (DC {}): {}. {}.",
@@ -2161,6 +2631,7 @@ pub fn evaluate_disguise_gate(
     present_npc_ids: &[String],
     pacing_dc_mod: i32,
     health_dc_mod: i32,
+    vigor_dc_mod: i32,
     now_minutes: i64,
 ) -> Option<DisguiseDirective> {
     let disguise = find_disguise_tag(tags, now_minutes)?;
@@ -2180,7 +2651,7 @@ pub fn evaluate_disguise_gate(
         let seed = hash_text(text).wrapping_add(0xE117E5);
         let mut roller = Roller::new(seed);
         let roll = roll_d20(&mut roller);
-        let dc = (DECEPTION_BASE_DC as i32 + 3 + pacing_dc_mod + health_dc_mod)
+        let dc = (DECEPTION_BASE_DC as i32 + 3 + pacing_dc_mod + health_dc_mod + vigor_dc_mod)
             .clamp(1, 30) as u32;
         let success = roll >= dc;
         let s = if success {
@@ -2209,7 +2680,8 @@ pub fn evaluate_disguise_gate(
     let seed = hash_text(text).wrapping_add(0xC0FFEE);
     let mut roller = Roller::new(seed);
     let roll = roll_d20(&mut roller);
-    let dc = (DECEPTION_BASE_DC as i32 + pacing_dc_mod + health_dc_mod).clamp(1, 30) as u32;
+    let dc =
+        (DECEPTION_BASE_DC as i32 + pacing_dc_mod + health_dc_mod + vigor_dc_mod).clamp(1, 30) as u32;
     let success = roll >= dc;
     let s = if success { SCRUTINIZED_SUCCESS_SEED } else { SCRUTINIZED_FAIL_SEED };
     Some(DisguiseDirective::Scrutinized {
@@ -2502,30 +2974,6 @@ mod tests {
             BodyPartState::Healthy,
         );
     }
-
-    #[test]
-    fn player_state_serde_drops_legacy_body_keys() {
-        // A pre-2026-08-07 save carries the deleted 16-part keys (Torso,
-        // LeftBicep, LeftThigh, LeftAnkle, ...). The clean-delete contract:
-        // those keys no longer name a real body part, so the load seam in
-        // WorldSchema::load_split filters them out BEFORE deserializing
-        // player_state. This test proves the post-filter JSON deserializes
-        // cleanly with zero injuries from the dead keys (the raw PlayerState
-        // deserializer itself would panic on an unknown variant; the seam is
-        // what makes the clean delete save-safe).
-        let filtered = r#"{"body":{"LeftUpperArm":"Orange"},"stamina":"Active"}"#;
-        let s: PlayerState = serde_json::from_str(filtered).unwrap();
-        assert_eq!(s.body.len(), 1, "only the one known key survived the seam filter");
-        assert_eq!(
-            s.body.get(&BodyPart::LeftUpperArm).copied().unwrap(),
-            BodyPartState::Orange,
-        );
-        // And an unknown legacy key MUST fail raw deserialization (the seam is
-        // the guard, not the deserializer) — this pins why the seam exists.
-        let legacy = r#"{"body":{"LeftBicep":"Red"}}"#;
-        assert!(serde_json::from_str::<PlayerState>(legacy).is_err());
-    }
-
     // --- Referee ---
 
     #[test]
@@ -2687,11 +3135,14 @@ mod tests {
         assert!(!keyword_present("RUNNING", "running"));
     }
 
-    /// (2026-08-16 P2b) The headline regression: a narrator beat describing
-    /// "a runner" used to drain one stamina tier per turn via the combat
-    /// Referee's "run" keyword riding inside the compound. Both the referee
-    /// AND the scene-pacing classifier must stay silent on it, while real
-    /// exertion still fires both.
+    /// (2026-08-16 P2b; amended 2026-08-22 Chloe ruling — traversal is
+    /// exertion, damage is consequence-only) A narrator beat describing
+    /// "a runner" stays silent everywhere (the P2b compound guard). Explicit
+    /// "running" still fires scene-pacing's Combat classification (the
+    /// shared `combat_triggered` gate is UNTOUCHED) but the combat Referee
+    /// itself rolls no injury on transit-only text — the stamina tax routes
+    /// at the caller. A hazard or a violence verb alongside re-arms the
+    /// roll.
     #[test]
     fn runner_does_not_drain_but_running_does() {
         let s = fresh_state();
@@ -2705,13 +3156,64 @@ mod tests {
             crate::schema::SceneMode::Combat,
             "'runner' must not classify Combat"
         );
-        assert!(referee_evaluate("I am running from the guards.", &s).is_some(),
-            "'running' (explicit entry) must fire the combat Referee");
+        // (2026-08-22 ruling) Transit-only: no injury roll — but the scene
+        // still classifies Combat through the shared gate (the chase is
+        // kinetic; world ticks suspend, the DC mods apply).
         assert_eq!(
+            referee_evaluate("I am running from the guards.", &s),
+            None,
+            "'running' alone is traversal — exertion, never a limb injury (2026-08-22 Chloe ruling)"
+        );
+        assert_ne!(
             crate::scene_pacing::evaluate("I am running from the guards.").mode,
             crate::schema::SceneMode::Combat,
-            "'running' must classify Combat"
+            "'running' must still classify Combat (shared gate untouched)"
         );
+        // The playtest's exact case: climbing out of a pit rolled a Yellow
+        // elbow + Depleted — pure traversal now rolls nothing.
+        assert_eq!(
+            referee_evaluate("I start climbing back out of the pit.", &s),
+            None,
+            "a plain climb rolls no injury"
+        );
+        // A hazard re-arms the roll (the failed climb that ends in a fall).
+        assert!(
+            referee_evaluate("I climb out but slip, falling hard back into the pit.", &s)
+                .is_some(),
+            "a fall alongside transit re-arms the injury roll"
+        );
+        // A violence verb alongside re-arms the roll.
+        assert!(
+            referee_evaluate("I run at the goblin and swing my sword.", &s).is_some(),
+            "a violence verb alongside transit re-arms the injury roll"
+        );
+    }
+
+    /// (2026-08-22 Chloe ruling) The pure transit gate: movement alone is
+    /// exertion; violence or hazard markers flip it off. Dialogue-stripped,
+    /// lowercased input (the referee-gate contract).
+    #[test]
+    fn transit_only_exertion_gate() {
+        let t = |s: &str| {
+            let lower = strip_dialogue(s).to_lowercase();
+            transit_only_exertion(&lower)
+        };
+        // Pure traversal.
+        assert!(t("I climb out of the pit"));
+        assert!(t("I sprint across the field and leap the fence"));
+        assert!(t("swimming back to the shore"));
+        // Violence re-arms.
+        assert!(!t("I climb out and punch the goblin"));
+        assert!(!t("I leap at the bugbear, swinging the polearm"));
+        // Hazards re-arm.
+        assert!(!t("I climb out but slip and fall back down"));
+        assert!(!t("the ledge collapses under me mid-climb"));
+        assert!(!t("I jump the gap and crash into the far wall"));
+        // No transit verb at all → false (not this gate's business).
+        assert!(!t("I attack the goblin"));
+        assert!(!t("I offer the elf some water"));
+        // Dialogue is stripped before the gate: quoted speech never routes.
+        assert!(t("*I climb* \"You should see me running up there\" — I keep climbing"));
     }
 
     /// (2026-08-16 P2b) The recovery Referee's rest keywords under the
@@ -3111,7 +3613,7 @@ mod tests {
 
     #[test]
     fn skill_check_lockpick_triggers_on_keyword() {
-        let outcomes = referee_evaluate_skill_checks("I pick the lock on the chest.", 0, 0);
+        let outcomes = referee_evaluate_skill_checks("I pick the lock on the chest.", 0, 0, 0, 0, &BTreeMap::new(), false, None);
         assert_eq!(outcomes.len(), 1, "lockpick keyword must fire exactly one check");
         assert_eq!(outcomes[0].skill, "lockpick");
         assert_eq!(outcomes[0].dc, 12, "base DC for lockpick with no pacing mod");
@@ -3131,15 +3633,15 @@ mod tests {
         // The canonical false-positive guard: walking/chatting/looking never
         // triggers a skill check (mirrors referee_combat_keyword behavior).
         assert!(
-            referee_evaluate_skill_checks("I walk to the bar and order an ale.", 0, 0).is_empty(),
+            referee_evaluate_skill_checks("I walk to the bar and order an ale.", 0, 0, 0, 0, &BTreeMap::new(), false, None).is_empty(),
             "neutral text must not trigger any skill check"
         );
         assert!(
-            referee_evaluate_skill_checks("Hello, nice weather today.", 0, 0).is_empty(),
+            referee_evaluate_skill_checks("Hello, nice weather today.", 0, 0, 0, 0, &BTreeMap::new(), false, None).is_empty(),
             "smalltalk must not trigger any skill check"
         );
         assert!(
-            referee_evaluate_skill_checks("I look at the painting.", 0, 0).is_empty(),
+            referee_evaluate_skill_checks("I look at the painting.", 0, 0, 0, 0, &BTreeMap::new(), false, None).is_empty(),
             "looking must not trigger any skill check"
         );
     }
@@ -3147,8 +3649,8 @@ mod tests {
     #[test]
     fn skill_check_keyword_match_is_case_insensitive() {
         // Mixed case must still trigger (the evaluator lowercases the text).
-        let upper = referee_evaluate_skill_checks("I PICK THE LOCK.", 0, 0);
-        let mixed = referee_evaluate_skill_checks("I Persuade the guard.", 0, 0);
+        let upper = referee_evaluate_skill_checks("I PICK THE LOCK.", 0, 0, 0, 0, &BTreeMap::new(), false, None);
+        let mixed = referee_evaluate_skill_checks("I Persuade the guard.", 0, 0, 0, 0, &BTreeMap::new(), false, None);
         assert_eq!(upper.len(), 1);
         assert_eq!(mixed.len(), 1);
     }
@@ -3158,11 +3660,11 @@ mod tests {
         // Same text + same pacing modifier → same outcomes (RNG is seeded
         // from the text + skill index, so the result is reproducible). This
         // is what makes the Referee testable AND what makes replays stable.
-        let a = referee_evaluate_skill_checks("I try to pick the lock.", 0, 0);
-        let b = referee_evaluate_skill_checks("I try to pick the lock.", 0, 0);
+        let a = referee_evaluate_skill_checks("I try to pick the lock.", 0, 0, 0, 0, &BTreeMap::new(), false, None);
+        let b = referee_evaluate_skill_checks("I try to pick the lock.", 0, 0, 0, 0, &BTreeMap::new(), false, None);
         assert_eq!(a, b, "same text + pacing must produce identical outcomes");
         // Different text → different roll (almost certainly; the hash shifts).
-        let c = referee_evaluate_skill_checks("I try to pick the lock again.", 0, 0);
+        let c = referee_evaluate_skill_checks("I try to pick the lock again.", 0, 0, 0, 0, &BTreeMap::new(), false, None);
         assert_ne!(a[0].roll, c[0].roll, "different text must produce different rolls");
     }
 
@@ -3173,6 +3675,11 @@ mod tests {
             "I pick the lock, then sneak past the guard.",
             0,
             0,
+            0,
+            0,
+            &BTreeMap::new(),
+            false,
+            None,
         );
         let skills: Vec<&str> = outcomes.iter().map(|o| o.skill).collect();
         assert!(skills.contains(&"lockpick"), "lockpick must fire: {skills:?}");
@@ -3185,12 +3692,126 @@ mod tests {
         let _ = outcomes; // already checked
     }
 
+    /// (2026-08-23 dynamic DCs) The STAKES ladder: every tier step adds +2
+    /// to the skill DC, mirroring `lethality_dc_mod`'s spacing (opposite
+    /// sign of effect), and the ladder composes into the DC sum + clamp
+    /// exactly like pacing/health/vigor.
+    #[test]
+    fn skill_dc_mod_ladder_and_stakes_composition() {
+        use AttackerTier::*;
+        assert_eq!(Minion.skill_dc_mod(), 0);
+        assert_eq!(Soldier.skill_dc_mod(), 2);
+        assert_eq!(Elite.skill_dc_mod(), 4);
+        assert_eq!(Boss.skill_dc_mod(), 6);
+        assert_eq!(Legendary.skill_dc_mod(), 8);
+        // Composition: persuade (base 14) under a Boss's gaze (+6) → 20;
+        // a Legendary (+8) in Combat pacing (+2) clamps toward 30 territory
+        // but a plain +8 → 22 stays un-clamped.
+        let neutral = referee_evaluate_skill_checks("I persuade the guard.", 0, 0, 0, 0, &BTreeMap::new(), false, None);
+        let boss = referee_evaluate_skill_checks("I persuade the guard.", 0, 0, 0, Boss.skill_dc_mod(), &BTreeMap::new(), false, None);
+        let legend_combat =
+            referee_evaluate_skill_checks("I persuade the guard.", 2, 0, 0, Legendary.skill_dc_mod(), &BTreeMap::new(), false, None);
+        assert_eq!(neutral[0].dc, 14, "persuade base DC");
+        assert_eq!(boss[0].dc, 20, "boss stakes +6");
+        assert_eq!(legend_combat[0].dc, 24, "legendary +8 stacks with combat +2");
+        // The roll never moves — the ladder shifts the DC, not the die
+        // (the model never sees a number to nudge).
+        assert_eq!(neutral[0].roll, boss[0].roll);
+        assert_eq!(neutral[0].roll, legend_combat[0].roll);
+    }
+
+    /// (2026-08-23 hazard referees) `parse_skill_rank` parity pins — every
+    /// value the panel's `toLevel` ladder produces must map to the same
+    /// rank the referee applies (the bar the player sees and the DC mod
+    /// are one source).
+    #[test]
+    fn parse_skill_rank_ladder_parity_with_skills_js() {
+        use serde_json::Value;
+        let v = |s: &str| Value::String(s.to_string());
+        // Keyword ladder.
+        assert_eq!(parse_skill_rank(&v("untrained")), 0);
+        assert_eq!(parse_skill_rank(&v("none")), 0);
+        assert_eq!(parse_skill_rank(&v("novice")), 1);
+        assert_eq!(parse_skill_rank(&v("beginner")), 1);
+        assert_eq!(parse_skill_rank(&v("apprentice")), 1);
+        assert_eq!(parse_skill_rank(&v("adept")), 2);
+        assert_eq!(parse_skill_rank(&v("competent")), 2);
+        assert_eq!(parse_skill_rank(&v("junior")), 2);
+        assert_eq!(parse_skill_rank(&v("skilled")), 3);
+        assert_eq!(parse_skill_rank(&v("proficient")), 3);
+        assert_eq!(parse_skill_rank(&v("expert")), 4);
+        assert_eq!(parse_skill_rank(&v("veteran")), 4);
+        assert_eq!(parse_skill_rank(&v("senior")), 4);
+        assert_eq!(parse_skill_rank(&v("master")), 5);
+        assert_eq!(parse_skill_rank(&v("mastery")), 5);
+        assert_eq!(parse_skill_rank(&v("legendary")), 5);
+        // Unmatched non-empty reads as the JS 50% fallback → 2.
+        assert_eq!(parse_skill_rank(&v("quite good")), 2);
+        // Numbers: fraction / 0-10 scale / percent.
+        assert_eq!(parse_skill_rank(&Value::Number(serde_json::Number::from(3))), 3);
+        assert_eq!(parse_skill_rank(&v("3")), 3);
+        assert_eq!(parse_skill_rank(&v("0.8")), 4); // 80% → round(4)
+        assert_eq!(parse_skill_rank(&v("10")), 5); // scale top, clamped
+        assert_eq!(parse_skill_rank(&v("80")), 4); // percent → round(4)
+        assert_eq!(parse_skill_rank(&v("100")), 5);
+        assert_eq!(parse_skill_rank(&v("0")), 0);
+        // Non-scalars read as untrained.
+        assert_eq!(parse_skill_rank(&Value::Null), 0);
+        assert_eq!(parse_skill_rank(&v("  ")), 0);
+    }
+
+    /// (2026-08-23 hazard referees) The prof mod: stem→entity matching +
+    /// the one-directional ladder + the dice-never-reseed invariant.
+    #[test]
+    fn skill_prof_dc_mod_stem_matching_and_dc_threading() {
+        use serde_json::Value;
+        // A declared master lockpick lowers the lockpick DC by 4…
+        let mut entities = BTreeMap::new();
+        entities.insert("skill_lockpick".to_string(), Value::String("master".into()));
+        let base = referee_evaluate_skill_checks("I pick the lock.", 0, 0, 0, 0, &BTreeMap::new(), false, None);
+        let prof = referee_evaluate_skill_checks("I pick the lock.", 0, 0, 0, 0, &entities, false);
+        assert_eq!(prof[0].dc, base[0].dc - 4, "master → −4");
+        assert_eq!(prof[0].roll, base[0].roll, "the prof mod must NOT reseed the dice");
+        // …and leaves OTHER skills untouched (stem matching is per-skill).
+        let sneak = referee_evaluate_skill_checks("I sneak past the guard.", 0, 0, 0, 0, &entities, false);
+        let sneak_base =
+            referee_evaluate_skill_checks("I sneak past the guard.", 0, 0, 0, 0, &BTreeMap::new(), false, None);
+        assert_eq!(sneak[0].dc, sneak_base[0].dc, "a lockpick rank must not touch sneak");
+        // Synonym keys match through the stems: skill_stealth lowers sneak.
+        let mut stealth_entities = BTreeMap::new();
+        stealth_entities.insert("skill_stealth".to_string(), Value::String("expert".into()));
+        let stealth = referee_evaluate_skill_checks("I sneak past the guard.", 0, 0, 0, 0, &stealth_entities, false);
+        assert_eq!(stealth[0].dc, sneak_base[0].dc - 3, "skill_stealth expert → −3");
+        // Explicitly untrained changes NOTHING (one-directional — a hostile
+        // "skill_sneak: terrible" must not raise the DC above undeclared).
+        let mut untrained = BTreeMap::new();
+        untrained.insert("skill_sneak".to_string(), Value::String("untrained".into()));
+        let same = referee_evaluate_skill_checks("I sneak past the guard.", 0, 0, 0, 0, &untrained, false);
+        assert_eq!(same[0].dc, sneak_base[0].dc, "untrained → no mod");
+        // The BEST rank wins among multiple matching entities.
+        let mut two = BTreeMap::new();
+        two.insert("skill_locks".to_string(), Value::String("apprentice".into()));
+        two.insert("skill_lockpicking".to_string(), Value::String("veteran".into()));
+        let best = referee_evaluate_skill_checks("I pick the lock.", 0, 0, 0, 0, &two, false);
+        assert_eq!(best[0].dc, base[0].dc - 3, "best of {1, 4} → −3");
+        // Unrelated skill_* entities never match.
+        let mut other = BTreeMap::new();
+        other.insert("skill_cooking".to_string(), Value::String("master".into()));
+        let untouched = referee_evaluate_skill_checks("I pick the lock.", 0, 0, 0, 0, &other, false);
+        assert_eq!(untouched[0].dc, base[0].dc);
+        // Non-skill entities never match.
+        let mut npc = BTreeMap::new();
+        npc.insert("npc.guard.tier".to_string(), Value::String("legendary".into()));
+        let clean = referee_evaluate_skill_checks("I pick the lock.", 0, 0, 0, 0, &npc, false);
+        assert_eq!(clean[0].dc, base[0].dc);
+    }
+
     #[test]
     fn skill_check_pacing_dc_mod_applies() {
         // +2 pacing mod raises the effective DC by 2; -2 lowers it by 2.
-        let neutral = referee_evaluate_skill_checks("I intimidate the thug.", 0, 0);
-        let combat = referee_evaluate_skill_checks("I intimidate the thug.", 2, 0);
-        let downtime = referee_evaluate_skill_checks("I intimidate the thug.", -2, 0);
+        let neutral = referee_evaluate_skill_checks("I intimidate the thug.", 0, 0, 0, 0, &BTreeMap::new(), false, None);
+        let combat = referee_evaluate_skill_checks("I intimidate the thug.", 2, 0, 0, 0, &BTreeMap::new(), false, None);
+        let downtime = referee_evaluate_skill_checks("I intimidate the thug.", -2, 0, 0, 0, &BTreeMap::new(), false, None);
         assert_eq!(neutral.len(), 1);
         assert_eq!(combat.len(), 1);
         assert_eq!(downtime.len(), 1);
@@ -3211,8 +3832,8 @@ mod tests {
         // (2026-08-20) The derived health tier feeds an additive DC modifier
         // exactly like pacing: a Poor body (+2) hardens every attempt, and
         // the modifier must not reseed the dice.
-        let neutral = referee_evaluate_skill_checks("I intimidate the thug.", 0, 0);
-        let hurt = referee_evaluate_skill_checks("I intimidate the thug.", 0, 2);
+        let neutral = referee_evaluate_skill_checks("I intimidate the thug.", 0, 0, 0, 0, &BTreeMap::new(), false, None);
+        let hurt = referee_evaluate_skill_checks("I intimidate the thug.", 0, 2, 0, 0, &BTreeMap::new(), false, None);
         assert_eq!(neutral[0].dc, 13, "intimidate base DC");
         assert_eq!(hurt[0].dc, 15, "health +2 raises DC like pacing +2");
         assert_eq!(neutral[0].roll, hurt[0].roll, "modifier must not reseed the dice");
@@ -3221,8 +3842,8 @@ mod tests {
     #[test]
     fn skill_check_dc_clamps_at_1_and_30() {
         // A pathological pacing modifier can't push DC out of [1, 30].
-        let low = referee_evaluate_skill_checks("I pick the lock.", -100, 0);
-        let high = referee_evaluate_skill_checks("I pick the lock.", 100, 0);
+        let low = referee_evaluate_skill_checks("I pick the lock.", -100, 0, 0, 0, &BTreeMap::new(), false, None);
+        let high = referee_evaluate_skill_checks("I pick the lock.", 100, 0, 0, 0, &BTreeMap::new(), false, None);
         assert_eq!(low[0].dc, 1, "DC must clamp at 1");
         assert_eq!(high[0].dc, 30, "DC must clamp at 30");
         // DC 1 with d20 (1..=20) → only a natural 1 fails. Almost always succeeds.
@@ -3234,7 +3855,7 @@ mod tests {
     fn skill_check_excludes_combat_keywords() {
         // "I attack" is a combat keyword — the skill Referee must NOT fire on it.
         // The combat Referee (referee_evaluate) owns that action.
-        let skill_outcomes = referee_evaluate_skill_checks("I attack the goblin with my sword.", 0, 0);
+        let skill_outcomes = referee_evaluate_skill_checks("I attack the goblin with my sword.", 0, 0, 0, 0, &BTreeMap::new(), false, None);
         assert!(
             skill_outcomes.is_empty(),
             "skill Referee must not fire on combat keywords (combat Referee owns them): {skill_outcomes:?}"
@@ -3242,6 +3863,102 @@ mod tests {
         // Sanity: the combat Referee DOES fire on the same text.
         let combat = referee_evaluate("I attack the goblin with my sword.", &fresh_state());
         assert!(combat.is_some(), "combat Referee must fire on combat keyword");
+    }
+
+    #[test]
+    fn skill_check_auto_pass_forces_success_with_success_seed() {
+        // (2026-08-23 Playground) God-mode auto-pass: every triggered skill
+        // forces SUCCESS + the success seed, while the dice + DC still roll
+        // (the report shows what WOULD have happened). A DC-30 clamp (an
+        // always-fail without the flag) pins the override: forced SUCCESS
+        // despite the unreachable DC. Determinism doc-pin: the flag is an
+        // explicit input, not a seed change — same text + same flag repeats.
+        let forced = referee_evaluate_skill_checks(
+            "I pick the lock.",
+            100, // DC clamp → 30 (always-fail without god mode)
+            0,
+            0,
+            0,
+            &BTreeMap::new(),
+            true,
+            None,
+        );
+        assert!(!forced.is_empty(), "the check must still fire under auto-pass");
+        assert_eq!(forced[0].dc, 30);
+        assert!(forced[0].success, "auto-pass forces success even past DC 30");
+        assert!(
+            forced[0].directive.contains("SUCCESS"),
+            "directive renders the forced outcome: {}",
+            forced[0].directive
+        );
+        assert!(
+            forced[0].directive.contains("the lock clicks open"),
+            "directive carries the SUCCESS seed under auto-pass: {}",
+            forced[0].directive
+        );
+        let repeat = referee_evaluate_skill_checks("I pick the lock.", 100, 0, 0, 0, &BTreeMap::new(), true, None);
+        assert_eq!(forced[0].roll, repeat[0].roll, "auto-pass is an input, not a seed change");
+        // Without the flag the same text + DC stays an honest fail.
+        let honest = referee_evaluate_skill_checks("I pick the lock.", 100, 0, 0, 0, &BTreeMap::new(), false, None);
+        assert!(!honest[0].success, "DC 30 still fails without the god flag");
+    }
+
+    /// (2026-08-24 Part II B3) A Crossroads-declared DC ("— [Lockpicking
+    /// DC 18]") is COMMITTED at offer time — the next turn's referee uses it
+    /// verbatim for the matching skill (dice + seeds untouched), and a
+    /// different skill's check computes its DC normally.
+    #[test]
+    fn pinned_dc_overrides_matching_skill_only() {
+        let computed = referee_evaluate_skill_checks(
+            "I pick the lock on the chest.",
+            0, 0, 0, 0,
+            &BTreeMap::new(),
+            false,
+            None,
+        );
+        let pinned = referee_evaluate_skill_checks(
+            "I pick the lock on the chest.",
+            0, 0, 0, 0,
+            &BTreeMap::new(),
+            false,
+            Some(("Lockpicking", 18)),
+        );
+        assert_eq!(pinned[0].dc, 18, "the declared DC wins verbatim");
+        assert_ne!(computed[0].dc, 18, "fixture sanity: computed DC differs");
+        assert_eq!(pinned[0].roll, computed[0].roll, "dice + seeds untouched");
+        // A pin for a DIFFERENT skill never touches this check's DC.
+        let bystander = referee_evaluate_skill_checks(
+            "I pick the lock on the chest.",
+            0, 0, 0, 0,
+            &BTreeMap::new(),
+            false,
+            Some(("Persuasion", 5)),
+        );
+        assert_eq!(bystander[0].dc, computed[0].dc);
+        // The directive line reports the pinned DC.
+        assert!(pinned[0].directive.contains("(DC 18)"), "{}", pinned[0].directive);
+    }
+
+    /// (2026-08-24 Part II B8) The rank-advance diff: strictly-deepened
+    /// skills report with prettified names; demotions, unchanged ranks, and
+    /// non-skill keys never do. A new key counts as 0 → n (a knack roots).
+    #[test]
+    fn detect_skill_advances_reports_only_deepened_ranks() {
+        use serde_json::Value;
+        let mut before = BTreeMap::new();
+        before.insert("skill_lockpicking".to_string(), Value::String("novice".into()));
+        before.insert("skill_sneak".to_string(), Value::String("expert".into()));
+        before.insert("char.mira.trust".to_string(), Value::String("wary".into()));
+        let mut after = before.clone();
+        after.insert("skill_lockpicking".to_string(), Value::String("adept".into()));
+        after.insert("skill_sneak".to_string(), Value::String("skilled".into())); // demotion
+        after.insert("skill_intimidation".to_string(), Value::String("apprentice".into())); // new
+        let advances = detect_skill_advances(&before, &after);
+        assert_eq!(advances.len(), 2, "{advances:?}");
+        assert!(advances.contains(&("Lockpicking".to_string(), 1, 2)));
+        assert!(advances.contains(&("Intimidation".to_string(), 0, 1)));
+        // No non-skill key ever reports.
+        assert!(!advances.iter().any(|(s, _, _)| s.contains("mira")));
     }
 
     #[test]
@@ -3592,7 +4309,7 @@ mod tests {
         // No disguise tag → nothing to gate, regardless of tier or behavior.
         let entities = entities_with_tier("soldier");
         let present = vec!["guard1".to_string()];
-        assert!(evaluate_disguise_gate("I walk past the guard", &[generic_tag("Blessed")], &entities, &present, 0, 0, 0).is_none());
+        assert!(evaluate_disguise_gate("I walk past the guard", &[generic_tag("Blessed")], &entities, &present, 0, 0, 0, 0).is_none());
     }
 
     #[test]
@@ -3606,6 +4323,7 @@ mod tests {
             &[disguise_tag("city guard uniform")],
             &entities,
             &[],
+            0,
             0,
             0,
             0
@@ -3622,6 +4340,7 @@ mod tests {
             &[disguise_tag("city guard uniform")],
             &entities,
             &present,
+            0,
             0,
             0,
             0,
@@ -3649,6 +4368,7 @@ mod tests {
             0,
             0,
             0,
+            0,
         ).expect("soldier + confident → AutoPass");
         assert!(matches!(out, DisguiseDirective::AutoPass { tier_tag: "soldier", .. }));
     }
@@ -3666,6 +4386,7 @@ mod tests {
             &[disguise_tag("city guard uniform")],
             &entities,
             &present,
+            0,
             0,
             0,
             0,
@@ -3689,6 +4410,7 @@ mod tests {
             0,
             0,
             0,
+            0,
         ).expect("Legendary + disguise -> Scrutinized (rolled here)");
         assert!(matches!(out, DisguiseDirective::Scrutinized { .. }));
     }
@@ -3703,6 +4425,7 @@ mod tests {
             &[disguise_tag("city guard uniform")],
             &entities,
             &present,
+            0,
             0,
             0,
             0,
@@ -3730,6 +4453,7 @@ mod tests {
             0,
             0,
             0,
+            0,
         ).expect("soldier + suspicious → Scrutinized");
         assert!(matches!(out, DisguiseDirective::Scrutinized { .. }));
     }
@@ -3745,6 +4469,7 @@ mod tests {
             &[disguise_tag("city guard uniform")],
             &entities,
             &present,
+            0,
             0,
             0,
             0,
@@ -3769,6 +4494,7 @@ mod tests {
             2,
             0,
             0,
+            0,
         ).unwrap();
         let downtime = evaluate_disguise_gate(
             "I sweat and stammer.",
@@ -3776,6 +4502,7 @@ mod tests {
             &entities,
             &present,
             -2,
+            0,
             0,
             0,
         ).unwrap();
@@ -3804,6 +4531,7 @@ mod tests {
             0,
             4,
             0,
+            0,
         ).unwrap();
         match out {
             DisguiseDirective::Scrutinized { dc, .. } => {
@@ -3819,6 +4547,7 @@ mod tests {
             &present,
             0,
             4,
+            0,
             0,
         ).unwrap();
         match out {
@@ -3851,6 +4580,7 @@ mod tests {
                 &present,
                 0,
                 0,
+                0,
                 100
             )
             .is_none(),
@@ -3863,6 +4593,7 @@ mod tests {
                 &[expired],
                 &entities,
                 &present,
+                0,
                 0,
                 0,
                 99
@@ -3956,6 +4687,25 @@ mod tests {
 
     // --- Recovery Referee (2026-08-15 recovery-seam pins) ---
 
+    /// (2026-08-22 living-world) Pin the rest-fatigue clamp mapping: the
+    /// floors per band + the only-lowers contract (each floor sits strictly
+    /// below the fresh states it may clamp, and the deeper band floors
+    /// strictly below the weary one — `if current > floor` at the call site
+    /// then never raises a state).
+    #[test]
+    fn fatigue_floors_pin_the_rest_clamp_mapping() {
+        let (weary_s, weary_m) = fatigue_floors("weary");
+        assert_eq!(weary_s, Stamina::Winded);
+        assert_eq!(weary_m, Mana::Strained);
+        let (deep_s, deep_m) = fatigue_floors("exhausted");
+        assert_eq!(deep_s, Stamina::Exhausted);
+        assert_eq!(deep_m, Mana::Drained);
+        assert!(Stamina::Fresh > weary_s, "only-lowers: Fresh sits above the weary floor");
+        assert!(Mana::Steady > weary_m, "only-lowers: Steady sits above the weary floor");
+        assert!(Stamina::Winded > deep_s, "the deeper band floors below the weary floor");
+        assert!(Mana::Strained > deep_m, "the deeper band floors below the weary floor");
+    }
+
     /// Downtime-gating: no rest keyword or no Downtime classification → the
     /// referee stays silent (healing is an active choice, not a default).
     #[test]
@@ -4021,5 +4771,79 @@ mod tests {
         assert!(out.stamina_recovered);
         apply_recovery(&mut s, &out);
         assert_eq!(s.stamina, Stamina::Exhausted, "Depleted recovers to Exhausted, never further");
+    }
+
+    // ---- (2026-08-22 living-world) the arcane pool + vigor DC -----------
+
+    #[test]
+    fn mana_mirrors_stamina_ladder() {
+        let mut m = Mana::Surging;
+        for _ in 0..6 {
+            m.drain();
+        }
+        assert_eq!(m, Mana::Spent, "drain stops at the floor");
+        for _ in 0..6 {
+            m.recover();
+        }
+        assert_eq!(m, Mana::Surging, "recover stops at the ceiling");
+        // The alignment table's bonuses.
+        assert_eq!(Mana::Surging.dc_bonus(), 4);
+        assert_eq!(Mana::Steady.dc_bonus(), 2);
+        assert_eq!(Mana::Strained.dc_bonus(), 0);
+        assert_eq!(Mana::Drained.dc_bonus(), -2);
+        assert_eq!(Mana::Spent.dc_bonus(), -4);
+        assert_eq!(Stamina::Fresh.dc_bonus(), 4);
+        assert_eq!(Stamina::Winded.dc_bonus(), 0);
+        assert_eq!(Stamina::Depleted.dc_bonus(), -4);
+    }
+
+    #[test]
+    fn dormant_mana_renders_nothing_active_renders_under_stamina() {
+        // Dormant: the default state renders no line even when the block is
+        // up (an injury forces the block) — the zero-token invariant.
+        let mut s = fresh_state();
+        s.body.insert(BodyPart::Neck, BodyPartState::Yellow);
+        let block = s.render_for_prompt("").expect("block renders");
+        assert!(!block.contains("mana"), "dormant pool is invisible: {block}");
+
+        // Activated: the label line renders directly under stamina.
+        s.mana = Some(Mana::Strained);
+        s.mana_label = "biotics".into();
+        let block = s.render_for_prompt("").expect("block renders");
+        let stamina_at = block.find("stamina: Fresh").expect("stamina line");
+        let mana_at = block.find("biotics: Strained").expect("mana line");
+        assert!(mana_at > stamina_at, "mana renders under stamina: {block}");
+        // A Some-with-empty-label save falls back to "mana".
+        s.mana_label = String::new();
+        let block = s.render_for_prompt("").expect("block renders");
+        assert!(block.contains("mana: Strained"), "label fallback: {block}");
+        // An active pool makes the state non-default (the block renders
+        // even at full health — the tracker needs to see the pool).
+        let mut clean = fresh_state();
+        assert!(clean.is_default());
+        clean.mana = Some(Mana::Surging);
+        assert!(!clean.is_default(), "active pool renders the block");
+    }
+
+    #[test]
+    fn vigor_dc_mod_takes_the_worse_pool() {
+        // Dormant pool: stamina alone.
+        assert_eq!(vigor_dc_mod(Stamina::Fresh, None), -4);
+        assert_eq!(vigor_dc_mod(Stamina::Winded, None), 0);
+        assert_eq!(vigor_dc_mod(Stamina::Depleted, None), 4);
+        // Active pool: the worse of the two grades (player bonus negated
+        // into harder-positive DC units).
+        assert_eq!(vigor_dc_mod(Stamina::Fresh, Some(Mana::Strained)), 0);
+        assert_eq!(vigor_dc_mod(Stamina::Exhausted, Some(Mana::Surging)), 2);
+        assert_eq!(vigor_dc_mod(Stamina::Fresh, Some(Mana::Spent)), 4);
+    }
+
+    #[test]
+    fn skill_check_dc_threads_vigor_modifier() {
+        // Same text + pacing: a Depleted body hardens the DC by 4 vs Fresh.
+        let fresh = referee_evaluate_skill_checks("I intimidate the thug.", 0, 0, 0, 0, &BTreeMap::new(), false, None);
+        let spent = referee_evaluate_skill_checks("I intimidate the thug.", 0, 0, 4, 0, &BTreeMap::new(), false, None);
+        assert_eq!(fresh[0].dc + 4, spent[0].dc, "vigor threads like pacing/health");
+        assert_eq!(fresh[0].roll, spent[0].roll, "the modifier never reseeds the dice");
     }
 }

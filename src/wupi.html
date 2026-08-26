@@ -12,10 +12,14 @@
     <!-- Fredoka: thick bubbly font for the boot loading screen. Graceful
          fallback if offline: the loading-text CSS specifies Fredoka first
          then a thick-weight system stack, so it still reads chunky even
-         before the webfont caches. -->
+         before the webfont caches.
+         (2026-08-24 fix) Cinzel is on the link too — it is the primary
+         engraved serif at ~26 Fable surfaces (--fable-font-serif) but was
+         never in any font link or @font-face, so every "engraved Cinzel"
+         surface silently rendered Times New Roman. -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Uncial+Antiqua&family=Almendra:wght@700;800&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Cinzel:wght@400;500;600;700;900&family=Uncial+Antiqua&family=Almendra:wght@700;800&display=swap" rel="stylesheet">
     <!-- fable.exe entry splash. The main window is built HIDDEN for fable.exe
          (lib.rs setup: .visible(false)) because the WebView2 native surface
          flashes a purple/system cast for the first frame(s) before ANY HTML can
@@ -365,7 +369,13 @@
         <div class="app-window-body chat-body">
             <div class="chat-messages" id="chatMessages"></div>
             <div class="chat-input-area">
-                <textarea id="chatInput" class="chat-input" rows="2" placeholder="Message Wupi…  (Enter to send, Shift+Enter for newline)"></textarea>
+                <!-- Line-lock wrapper (2026-08-24): the box owns the vertical
+                     inset + chrome; the textarea is chromeless with pure
+                     line-math height (3 lines max, whole-line scrolling —
+                     same law as the Fable composers). -->
+                <div class="chat-input-box">
+                    <textarea id="chatInput" class="chat-input" rows="1" placeholder="Message Wupi…  (Enter to send, Shift+Enter for newline)"></textarea>
+                </div>
             </div>
         </div>
     </div>

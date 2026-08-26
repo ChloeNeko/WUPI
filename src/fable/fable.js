@@ -29,7 +29,10 @@
 //              card is preset, so the player step launches straight into the
 //              world (flowAfterPlayer — no SIM pair, no Codex pair).
 //   Continue → resume the freshest save (resumeSave).
-//   Load     → two-level picker: worlds.js → saves popup → resume.
+//   Load     → the three-way LOAD split (PLAYER / SIM / CODEX pyramid,
+//              2026-08-23): SIM → the worlds grid (sessions/saves/edit),
+//              PLAYER → the picker then the SIM pair (player step skipped),
+//              CODEX → the library browser (link/edit/delete, no launch).
 // The working stage + gameplay engine (stage.js, engine/*, fx/*, panels/*)
 // are the destination of every flow.
 // =============================================================
@@ -52,6 +55,7 @@ import { extractLorebookEntries } from './engine/creator-engine.js';
 import { playBurnTransition, playReverseSpawn } from './engine/burn-transition.js';
 import { tileCaptionHTML } from './engine/tile-caption.js';
 import { buildWorlds, renderWorlds, refreshCardModal } from './screens/worlds.js';
+import { buildCodexLibrary, renderCodexLibrary } from './screens/codex-library.js';
 import { openSavesModal } from './screens/saves.js';
 import { openSessionsModal } from './screens/sessions.js';
 import { listSaves } from './engine/saves-io.js';
@@ -90,6 +94,7 @@ let flowChrome = null;
 let flowState = {
   step: null,
   slideOneHasBack: false, // whether slide 1 (Player pair) shows ‹ (Load-menu entry only)
+  loadFlow: false,        // entered via the title's LOAD (the three-way split flow, 2026-08-23)
   selectedCardId: null,   // the sim card built by the sim wizard (rides to codex/launch)
   selectedPlayerId: null, // the chosen SavedPlayer (rides to fable_start)
   playerDraft: null,      // the player wizard's draft (starting conditions for fable_start)
@@ -98,12 +103,12 @@ let flowState = {
 };
 // The blank flowState every full reset stamps (exitFlowToTitle + closeFable).
 // A surviving state would resume a stale step on the next flow entry.
-// (2026-08-18) pendingSimIntro is GONE: an import's greetings now ride into a
+// (2026-08-18) pendingSimIntro is GONE: an import's greetings now ride into an
 // SIM wizard ONLY via that wizard's own IMPORT tile (flowCreateSim's direct
 // presetIntro param) — a player-side import can never leak its greeting into
 // an unrelated fresh world's <intro>.
 function freshFlowState() {
-  return { step: null, slideOneHasBack: false, selectedCardId: null, selectedPlayerId: null, playerDraft: null, simDraft: null, pendingImport: null };
+  return { step: null, slideOneHasBack: false, loadFlow: false, selectedCardId: null, selectedPlayerId: null, playerDraft: null, simDraft: null, pendingImport: null };
 }
 
 // Start/stop the persistent New Game / Load flow ambiance (deep void +
@@ -351,9 +356,13 @@ let engineStarted = false;
 // are included (the per-turn checkpoint is "where you left off"). The stashed
 // target carries both card_id + save_id, so this is a one-shot resume.
 //
-// LOAD: a two-level picker — choose a world (screens/worlds.js), then choose
-// a save in that world via the centered saves POPUP (screens/saves.js — the
-// screen page is retired, 2026-08-20). Both feed into resumeSave.
+// LOAD (2026-08-23 rework): a THREE-WAY split first — the LOAD pyramid
+// (PLAYER top / SIM bottom-left / CODEX bottom-right) in the same tile
+// language as New Game. SIM opens the worlds grid (choose a world via
+// screens/worlds.js, then a session/save via the centered popups); PLAYER
+// opens the Player Picker, then continues at the SIM pair with the player
+// already decided; CODEX opens the library browser (codex-library.js) —
+// link/edit/delete, no launch. All game resumes feed into resumeSave.
 //
 // NEW GAME: reveals the cinematic creator flow shell — background + music +
 // the ‹ / ⌂ flow-chrome buttons (see onNewGameClicked / revealNewGameShell),
@@ -389,19 +398,17 @@ async function resumeSave(cardId, sessionId, saveId, opts = {}) {
   // generation first — a no-op on the normal cold path).
   await endFableSession();
 
-  let openingScene = null;
   let loadMessages = null;
   try {
     // (2026-08-22 session decoupling) The owning session rides the resume —
-    // the backend resolves a missing session id (latest session / bare-save
-    // legacy search), but every UI path knows it.
+    // every UI path knows it; the backend only falls back for the .lnk
+    // `--card` direct boot.
     const result = await invoke('fable_start', {
       cardId,
       sessionId: sessionId ?? null,
       saveId: saveId ?? null,
     });
     engineStarted = true;
-    if (result && result.intro) openingScene = result.intro;
     if (result && Array.isArray(result.messages) && result.messages.length) {
       loadMessages = result.messages;
     }
@@ -432,14 +439,14 @@ async function resumeSave(cardId, sessionId, saveId, opts = {}) {
   if (opts && opts.viaTransition) {
     playMagicalTransition({
       blackHoldMs: 1150,
-      onMidpoint: () => enterStageViaTransition(openingScene, loadMessages, opts),
+      onMidpoint: () => enterStageViaTransition(loadMessages, opts),
     }).catch((e) => {
       console.error('[fable] Continue transition failed, jumping to the stage', e);
-      enterStageViaTransition(openingScene, loadMessages, opts);
+      enterStageViaTransition(loadMessages, opts);
     });
     return;
   }
-  enterStageViaTransition(openingScene, loadMessages, opts);
+  enterStageViaTransition(loadMessages, opts);
 }
 
 // CONTINUE button handler: resume the stashed continue target. The target is
@@ -459,59 +466,183 @@ function onContinueClicked() {
   resumeSave(target.card_id, target.session_id || null, target.save_id, { viaTransition: true });
 }
 
-// LOAD button handler: show the world picker (the "Load Game" grid) +
-// populate it. The worlds screen mirrors the Player Picker exactly — same
-// embers + grid + mini-cards, no ‹ Back header — and uses the flow-chrome ⌂
-// home button (top-right) to return to the title. Selecting a world card
-// opens a modal (NEW / LOAD / EDIT / DELETE) via worldHandlers().
+// LOAD button handler (2026-08-23 Chloe rework): LOAD is now a THREE-WAY
+// chooser — the LOAD split, a pyramid of the SAME newgame-split tile slabs
+// New Game uses (PLAYER on top, SIM bottom-left, CODEX bottom-right) under
+// the same embers + newgame.mp3 ambience. No ‹ on the chooser itself (⌂ is
+// the exit); every sub-screen shows ‹ routing back to the split:
+//   • SIM    → the worlds grid (the classic "load game" area — the card
+//     modal's NEW / LOAD / EDIT / DELETE unchanged).
+//   • PLAYER → the Player Picker. Its LOAD decides the character up front,
+//     then the flow continues at the SIM pair (the player portion is
+//     skipped, exactly the mirror of loading a sim card skipping the sim
+//     portion — advanceAfterPlayer → flowAfterPlayer → flowSimPair).
+//   • CODEX  → the codex library browser (screens/codex-library.js).
 //
-// Transition: wrap the title → worlds swap in the black magical transition +
-// stop the title ambient at click (matches New Game). The title
-// theme fades out at click; the SAME newgame.mp3 + fire.mp3 ambience as New
-// Game blooms in at the transition midpoint. On exit (⌂ → exitLoadToTitle)
-// the ambience stops + the title theme restarts. NB: this owns its OWN
-// transition, so title.js must call it directly (NOT wrapped in a second
-// playMagicalTransition — that double-fades; see title.js).
+// Transition: wrap the title → split swap in the black magical transition +
+// stop the title ambient at click (matches New Game). The title theme fades
+// out at click; the SAME newgame.mp3 + fire.mp3 ambience as New Game blooms
+// in at the transition midpoint, and the pyramid tiles reverse-spawn as the
+// black clears. On exit (⌂ → exitLoadToTitle) the ambience stops + the
+// title theme restarts. NB: this owns its OWN transition, so title.js must
+// call it directly (NOT wrapped in a second playMagicalTransition — that
+// double-fades; see title.js).
 function onLoadClicked() {
   withFlowBusy(() => {
     // (2026-08-21, Chloe) NOTE: the title ambient (grass + particles) is NOT
-    // stopped here — showScreen('worlds') at the transition midpoint stops it
-    // under full black, exactly like New Game (stopping at click killed the
-    // grass instantly under a still-visible title — the same regression
+    // stopped here — showScreen at the transition midpoint stops it under
+    // full black, exactly like New Game (stopping at click killed the grass
+    // instantly under a still-visible title — the same regression
     // onNewGameClicked's comment documents).
+    // Fresh flow state EVERY entry (the revealNewGameShell discipline): a
+    // stale selectedCardId from an earlier run would hijack the PLAYER
+    // branch's post-player routing straight into the old world
+    // (flowAfterPlayer launches the moment a card is established).
+    flowState = freshFlowState();
+    flowState.loadFlow = true;
     // Fade the title theme out — the Load menu gets the SAME newgame.mp3 +
     // fire.mp3 ambience as New Game (Chloe 2026-08-05). The pair fades in at
     // the transition midpoint, mirroring onNewGameClicked.
     fadeOutThemeMusic(fableRoot);
     // The reveal is factored out so the transition's catch fallback (below)
-    // mounts the home button + music too, not just the happy path.
-    const revealWorlds = () => {
+    // mounts the chrome + music too, not just the happy path.
+    const revealLoadSplit = () => {
       startFlowAmbiance();
-      showScreen('worlds');
-      renderWorlds(screens.worlds, worldHandlers());
-      // Mount the flow chrome (⌂ home, top-right) — mirrors the Player Picker.
-      // No ‹ Back here (the worlds grid is the top of the Load flow); ⌂ returns
-      // to the title. Hidden for 2.5s so it doesn't spawn the instant the
-      // screen reveals (matches the New Game flow's delayHome feel).
       if (!flowChrome) flowChrome = mountFlowChrome(fableRoot);
       if (flowChrome) {
         flowChrome.setVariant('newgame');
-        flowChrome.hideBack();
-        flowChrome.delayHome(2500);
+        // ‹ stays hidden on the chooser itself (setFlowStep('load-split')
+        // enforces it via syncFlowBack); ⌂ returns to the title, hidden for
+        // 2.5s so it doesn't spawn the instant the split reveals.
+        flowChrome.onBack(() => flowBack());
         flowChrome.onHome(() => exitLoadToTitle());
+        flowChrome.delayHome(2500);
       }
-      // Bloom the music + fire as the worlds screen reveals (same hand-off
-      // feel as New Game).
+      buildLoadSplitTiles();
+      showScreen('newgame-split');
+      setFlowStep('load-split');
       startNewGameMusic(fableRoot, { fadeIn: true });
     };
     return playMagicalTransition({
       blackHoldMs: 1150,
-      onMidpoint: revealWorlds,
+      onMidpoint: revealLoadSplit,
+    }).then(() => {
+      // AFTER the black fully clears: reverse-spawn the pyramid tiles
+      // (visible scene first, then UI — the same hand-off New Game uses).
+      // (2026-08-23 audit) The reverse-spawn's own rejection is swallowed —
+      // the outer catch is for TRANSITION failures and used to re-run
+      // revealLoadSplit (rebuilding tiles mid-animation) when only the
+      // cosmetic spawn glitched.
+      const tiles = screens['newgame-split'].querySelectorAll('.fable-flow-spawn');
+      if (tiles.length) return playReverseSpawn(Array.from(tiles)).catch(() => {});
     }).catch((e) => {
-      console.error('[fable] Load transition failed, jumping to worlds', e);
-      revealWorlds();
+      console.error('[fable] Load transition failed, jumping to the load split', e);
+      revealLoadSplit();
+      const tiles = screens['newgame-split'].querySelectorAll('.fable-flow-spawn');
+      if (tiles.length) {
+        try { playReverseSpawn(Array.from(tiles)).catch(() => {}); } catch (_) {}
+      }
     });
   });
+}
+
+// === THE LOAD SPLIT — the PLAYER / SIM / CODEX pyramid (2026-08-23) =======
+//
+// The three-way chooser lives in the SAME newgame-split tile host New Game
+// uses (same slabs, same burn-on-click, same reverse-spawn), arranged as a
+// pyramid: PLAYER centered on top, SIM + CODEX on the bottom row. Every
+// click burns the other two tiles (siblingTilesExcept walks the host, so
+// the pyramid rows resolve as siblings for the burn engine).
+
+function buildLoadSplitTiles() {
+  const split = screens['newgame-split'];
+  // Clear any leftover cinematic launch fade (same guard as
+  // buildFlowPairTiles — launchGame stamps .is-launching on the host).
+  split.classList.remove('is-launching');
+  const host = split.querySelector('.fable-newgame-tiles');
+  const defs = [
+    { caption: 'PLAYER', act: 'load-player', row: 'top', next: () => renderLoadPlayerStep() },
+    { caption: 'SIM', act: 'load-sim', row: 'bottom', next: () => renderLoadSimStep() },
+    { caption: 'CODEX', act: 'load-codex', row: 'bottom', next: () => renderCodexLibraryStep() },
+  ];
+  const btn = (d) => `
+    <button class="fable-newgame-tile fable-flow-spawn" type="button" data-act="${d.act}">
+      <span class="fable-newgame-tile-caption">${tileCaptionHTML(d.caption)}</span>
+    </button>`;
+  host.innerHTML = `
+    <div class="fable-load-split">
+      <div class="fable-newgame-tile-row fable-load-split-row--top">${btn(defs[0])}</div>
+      <div class="fable-newgame-tile-row fable-load-split-row--bottom">${btn(defs[1])}${btn(defs[2])}</div>
+    </div>`;
+  for (const d of defs) {
+    const el = host.querySelector(`[data-act="${d.act}"]`);
+    if (el) el.addEventListener('click', (e) => burnPairTile(e.currentTarget, d.next));
+  }
+  return Array.from(host.querySelectorAll('.fable-newgame-tile'));
+}
+
+// Re-show the three-way chooser (every LOAD sub-screen's ‹ lands here):
+// rebuild the pyramid, swap the screen, re-spawn the tiles. Re-asserts
+// loadFlow — a card-modal NEW detour resets the flow state
+// (revealNewGameShell's freshFlowState), but the split IS the load flow, so
+// deeper steps (e.g. ‹ from a SIM pair reached via PLAYER) must keep routing
+// through it. The flow state otherwise keeps what the sub-screens
+// established (a picked player survives a CODEX detour — the flow is a
+// chooser, not a wizard chain).
+function showLoadSplit() {
+  flowState.loadFlow = true;
+  buildLoadSplitTiles();
+  showScreen('newgame-split');
+  setFlowStep('load-split');
+  if (flowChrome) flowChrome.onBack(() => flowBack());
+  spawnFlowTiles();
+}
+
+// LOAD → SIM: the classic "load game" area — the worlds grid with its
+// NEW / LOAD / EDIT / DELETE card modal. ‹ routes to the split (step
+// 'load-sim' → showLoadSplit in flowBack).
+function renderLoadSimStep() {
+  showScreen('worlds');
+  setFlowStep('load-sim');
+  if (flowChrome) flowChrome.onBack(() => flowBack());
+  renderWorlds(screens.worlds, worldHandlers());
+}
+
+// LOAD → PLAYER: the Player Picker (the same screen New Game's LOAD PLAYER
+// tile shows). The modal's LOAD picks the character up front, then the flow
+// continues at the SIM pair — the player portion is skipped, the mirror of
+// loading a sim card skipping the sim portion (advanceAfterPlayer →
+// flowAfterPlayer → flowSimPair; the codex pair + launch follow as usual).
+function renderLoadPlayerStep() {
+  // Re-assert loadFlow (a card-modal NEW detour resets it — see
+  // showLoadSplit): ‹ from the SIM pair this picker feeds must route back
+  // HERE, not to the New Game player pair.
+  flowState.loadFlow = true;
+  // The PLAYER branch resolves its target INDEPENDENTLY of the shared
+  // selection: any card established earlier in this chooser (an abandoned
+  // per-card NEW detour that left its preset behind, or a card picked at
+  // the sim step then backed out of) must NOT ride `selectedCardId` into
+  // flowAfterPlayer's launch shortcut — a player picked HERE continues at
+  // the SIM pair (this branch's contract above), never a leaked world.
+  flowState.selectedCardId = null;
+  flowState.simDraft = null;
+  showScreen('player-picker');
+  setFlowStep('load-player');
+  if (flowChrome) flowChrome.onBack(() => flowBack());
+  renderPlayerPicker(screens['player-picker'], {
+    onSelect: (player) => advanceAfterPlayer(player.id),
+    onEdit: (player) => flowEditPlayer(player),
+  });
+}
+
+// LOAD → CODEX: the universal library browser (screens/codex-library.js) —
+// tiles of codex files with their linked cards, LINK / EDIT / DELETE per
+// codex. Pure management: nothing here launches a game.
+function renderCodexLibraryStep() {
+  showScreen('codex-library');
+  setFlowStep('load-codex');
+  if (flowChrome) flowChrome.onBack(() => flowBack());
+  renderCodexLibrary(screens['codex-library']);
 }
 
 // The Load menu's card-modal handlers (2026-08-05). The modal surfaces four
@@ -550,13 +681,30 @@ function beginNewGameFromCard(card) {
     return revealNewGameShell({
       presetCard: card,
       onBack: () => {
-        // Back to the worlds grid (where this entry came from). The Load-menu
-        // ambience keeps playing — it's the same track the shell was using.
-        if (flowChrome) { flowChrome.hideBack(); flowChrome.hideHome(); }
-        showScreen('worlds');
-        renderWorlds(screens.worlds, worldHandlers());
+        // Back to the worlds grid (where this entry came from). The grid is
+        // a LOAD-flow step now — renderLoadSimStep re-shows it with ‹
+        // routing to the three-way split (the old hideBack left it as the
+        // top of the flow, 2026-08-23 rework). The Load-menu ambience keeps
+        // playing — it's the same track the shell was using.
+        // The detour is ABANDONED here — drop the preset card (the same
+        // stale-card hijack revealNewGameShell's freshFlowState guards the
+        // title-exit path against): a surviving selectedCardId would send
+        // the LOAD flow's later PLAYER branch straight into this abandoned
+        // world via flowAfterPlayer's shortcut instead of the SIM pair.
+        flowState.selectedCardId = null;
+        flowState.simDraft = null;
+        if (flowChrome) flowChrome.showBack();
+        renderLoadSimStep();
       },
-      onHome: () => exitLoadToTitle(),
+      // ⌂ is the OTHER abandonment path: drop the preset here too (the ‹
+      // path above does the same). exitLoadToTitle leaves flowState alive,
+      // and a surviving selectedCardId would hijack a later PLAYER-branch
+      // pick into this abandoned world via flowAfterPlayer's shortcut.
+      onHome: () => {
+        flowState.selectedCardId = null;
+        flowState.simDraft = null;
+        exitLoadToTitle();
+      },
     });
   });
 }
@@ -1437,9 +1585,22 @@ function flowCodexPair(cardId, { afterCodex } = {}) {
 // row is top priority) and enters the game. Rows are draggable-free: the
 // full ordering UI lives in the right-drawer Codex tab (mid-game); this
 // picker's order follows the library list.
+// (2026-08-24 review fix) The flow picker's sanctioned closer — the
+// npc-dossier pattern. The old one-at-a-time sweep bare-removed the overlay
+// (document-wide, a class shared with the LOAD→CODEX library popup) without
+// running its teardown — the document-capture Esc guard survived and stole
+// a later Escape. Full teardown runs first; the element sweep only catches
+// animation remnants.
+let activeCodexLinkClose = null;
+
 async function openCodexLinkPopup(cardId, done) {
   const host = screens['newgame-split'];
-  // One popup at a time.
+  // One popup at a time: run the live popup's full teardown first.
+  if (activeCodexLinkClose) {
+    const close = activeCodexLinkClose;
+    activeCodexLinkClose = null;
+    close();
+  }
   document.querySelectorAll('.fable-codex-link-overlay').forEach((n) => n.remove());
   let library = [];
   let linked = [];
@@ -1468,10 +1629,12 @@ async function openCodexLinkPopup(cardId, done) {
     if (ev.key === 'Escape') { ev.stopPropagation(); close(); }
   };
   const close = () => {
+    if (activeCodexLinkClose === close) activeCodexLinkClose = null;
     document.removeEventListener('keydown', escGuard, true);
     overlay.remove();
     if (!completed) flowCodexPair(cardId, { afterCodex: done });
   };
+  activeCodexLinkClose = close;
   overlay.innerHTML = `
     <div class="fable-codex-link-modal" role="dialog" aria-label="Link codex files">
       <div class="fable-codex-link-head">
@@ -1594,11 +1757,14 @@ async function flowImportCodexPair(selectedBtn, cardId, afterCodex) {
 // Sync the flow-chrome ‹ button to the current step. Slide 1 (the Player
 // pair, step === 'player') hides ‹ unless the entry had a meaningful back
 // destination (flowState.slideOneHasBack — the Load-menu entry's worlds-grid
-// return); every deeper slide shows ‹. Called by setFlowStep at every
-// transition + by revealNewGameShell on entry.
+// return); the LOAD three-way chooser (step === 'load-split') hides ‹ too —
+// ⌂ is its only exit; every deeper slide shows ‹. Called by setFlowStep at
+// every transition + by revealNewGameShell on entry.
 function syncFlowBack() {
   if (!flowChrome) return;
-  if (flowState.step === 'player') {
+  if (flowState.step === 'load-split') {
+    flowChrome.hideBack();
+  } else if (flowState.step === 'player') {
     if (flowState.slideOneHasBack) flowChrome.showBack(); else flowChrome.hideBack();
   } else {
     flowChrome.showBack();
@@ -1634,11 +1800,21 @@ function flowBack(onBack) {
     case 'player-picker':       // Player picker → Player pair (slide 1)
       returnToPlayerPair();
       break;
+    case 'load-sim':            // LOAD → SIM grid → the three-way split
+    case 'load-player':         // LOAD → PLAYER picker → the three-way split
+    case 'load-codex':          // LOAD → CODEX browser → the three-way split
+      showLoadSplit();
+      break;
+    case 'load-split':          // no ‹ on the chooser — defensive no-op
+      break;
     case 'sim-picker':          // LOAD SIM CARD grid → SIM pair
       flowSimPair();
       break;
-    case 'sim-pair':            // SIM pair → Player pair (slide 1)
-      returnToPlayerPair();
+    case 'sim-pair':            // SIM pair → Player step (slide 1 or the
+      // LOAD → PLAYER picker — the LOAD entry skipped the player pair, so
+      // ‹ returns to the picker that fed this pair)
+      if (flowState.loadFlow) renderLoadPlayerStep();
+      else returnToPlayerPair();
       break;
     case 'codex-pair':          // Codex pair → SIM pair
       flowSimPair();
@@ -1684,7 +1860,6 @@ async function launchGame(cardId) {
   // exit that outran its unwind window is cleared here instead of erroring
   // "a game is already running".
   await endFableSession();
-  let openingScene = null;
   let loadMessages = null;
   try {
     const result = await invoke('fable_start', {
@@ -1696,7 +1871,6 @@ async function launchGame(cardId) {
       playerId: flowState.selectedPlayerId,
     });
     engineStarted = true;
-    if (result && result.intro) openingScene = result.intro;
     if (result && Array.isArray(result.messages) && result.messages.length) {
       loadMessages = result.messages;
     }
@@ -1721,13 +1895,13 @@ async function launchGame(cardId) {
   // HERE (after the schema-capture wait) so the stage opens in silence.
   fadeOutThemeMusic(fableRoot);
   stopNewGameMusic(fableRoot);
-  enterStageViaTransition(openingScene, loadMessages);
+  enterStageViaTransition(loadMessages);
 }
 
 
 // The shared "play the magical transition + swap to stage + wire it" tail.
 // Used by every start/resume path.
-function enterStageViaTransition(openingScene, loadMessages, opts = {}) {
+function enterStageViaTransition(loadMessages, opts = {}) {
   // Leaving the New Game flow for the stage — hide the flow chrome entirely
   // so ‹ / ⌂ don't linger over the stage (the Wupi top bar owns stage nav).
   if (flowChrome) { flowChrome.hideBack(); flowChrome.hideHome(); }
@@ -1772,7 +1946,6 @@ function enterStageViaTransition(openingScene, loadMessages, opts = {}) {
               }
             });
           },
-          openingScene,
           loadMessages,
         });
       }
@@ -1817,6 +1990,14 @@ async function endFableSession() {
   try { await invoke('fable_stop'); } catch (_) {}
   try { await invoke('fable_slice_stop'); } catch (_) {}
   try { await invoke('chat_stop'); } catch (_) {}
+  // (2026-08-24) Leaving Fable exits the Wupi chat surface too: reset the
+  // chat conversation history so the next sitting (any surface) starts clean.
+  // chat_reset re-signals the chat cancel slot itself while unwinding, so a
+  // still-streaming drawer turn settles before the clear. Visual cache reset
+  // is the stage teardown's job (resetWupiDrawer).
+  try { await invoke('chat_reset'); } catch (e) {
+    console.warn('[fable] chat_reset failed', e);
+  }
   for (let i = 0; ; i++) {
     try {
       await invoke('fable_end');
@@ -1932,7 +2113,7 @@ function devPreviewEnter() {
       timestamp: now - 1000 * 60,
     },
   ];
-  enterStageViaTransition(null, loadMessages);
+  enterStageViaTransition(loadMessages);
 }
 
 function openFable() {
@@ -2370,8 +2551,9 @@ export function initFable(extHooks = {}) {
     // CONTINUE: resume the freshest New Game save (autosave-inclusive).
     // Target stashed by title._refreshTitleGate.
     continue: () => onContinueClicked(),
-    // LOAD: two-level picker — worlds screen → card modal → saves popup →
-    // resumeSave (the saves screen page is retired, 2026-08-20).
+    // LOAD: the three-way LOAD split (PLAYER / SIM / CODEX pyramid) — SIM
+    // routes to the worlds grid → card modal → sessions/saves popups →
+    // resumeSave (2026-08-23 rework).
     load: () => onLoadClicked(),
     // ONLINE: opens the in-Fable API connection window (Fable-styled twin of
     // the WUPI-home AI panel). Never disabled — it's the path to connect an
@@ -2389,6 +2571,9 @@ export function initFable(extHooks = {}) {
   // The Player Picker (LOAD PLAYER) — built once; rendered on entry from
   // flowLoadPlayer. Surfaces LOAD/EDIT/DELETE per player via its modal.
   screens['player-picker'] = buildPlayerPicker();
+  // The codex library browser (title LOAD → CODEX, 2026-08-23) — built once;
+  // rendered on entry from renderCodexLibraryStep.
+  screens['codex-library'] = buildCodexLibrary();
   // The GLM-driven Creator Chat — the reusable conversational screen for the
   // player/sim/codex/intro wizards (Phases 3-5). Built once; rendered on entry.
   screens['creator-chat'] = buildCreatorChat();

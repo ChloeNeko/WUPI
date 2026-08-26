@@ -44,13 +44,19 @@ import * as vn from '../engine/vn-interactions.js';
 // message → floating brass pencil → click regenerates only that span in
 // place. Self-contained + removable (mirrors vn: returns { teardown }).
 import { initSliceRegen } from '../engine/slice-regen.js';
-// isActionPopupOpen feeds the left drawer's mouseleave guard: the action popup
-// is appended to document.body, so reaching for CONSUME/EQUIP/etc. would
-// otherwise fire the drawer's mouseleave + yank it in mid-click. See
-// left-drawer.js setActionPopupProbe.
+// isActionPopupOpen feeds the drawer close guards: the action popup is
+// appended to document.body, so reaching for CONSUME/EQUIP/etc. moves the
+// mouse past the left drawer's close distance — both the distance auto-close
+// + the window-exit sweep hold while it is open (see inventory-panel.js).
 import { isActionPopupOpen } from '../engine/inventory-panel.js';
 import { buildTabRail, renderActive, resetTabRail } from '../engine/tab-rail.js';
+import { buildPlayground, initPlayground, resetPlayground, isWandOn, togglePlayground } from '../engine/playground.js';
 import { buildRawEditor, onEsc as rawEditorEsc, resetRawEditor, isOpen as rawEditorOpen } from '../engine/raw-editor.js';
+// (2026-08-26) The edit-affordance refusal feedback: a ✎/dblclick on a
+// mid-history AI beat is refused by the backend contract — surfacing it as a
+// transient notice instead of a silent dead click (the "buttons don't work"
+// report). Unknown kinds render with the neutral chrome.
+import { showTurnNotice } from '../engine/turn-notices.js';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 // playFX + clearFX were the weather-render hooks pre-stripping; weather is
 // gone now (file header), so only initFX + clearAllFX remain used. The two
@@ -80,6 +86,8 @@ import * as soulGems from '../engine/soul-gem.js';
 // swap provider/model mid-roleplay without leaving the stage.
 import { buildOnlinePanel } from './online.js';
 import { initPanelManager, summon as summonPanel, dismissPanel, isActive as panelActive } from '../panels/manager.js';
+import { openChroniclePanel, closeChroniclePanel } from '../panels/chronicle.js';
+import { closeNpcDossier } from '../engine/npc-dossier.js';
 import { setMapTheme } from '../panels/map.js';
 // DEV PREVIEW (?dev=preview): pure-frontend layout preview with no backend.
 // Portraits render empty in preview — production resolves them via
@@ -137,11 +145,18 @@ let activePlayerName = '';  // protagonist name (card.player_name) → user-beat
 // Each is already a convertFileSrc-ready asset:// URL (or '' when absent).
 let activeCardPortrait = '';  // the card/narrator portrait (NPC fallback too)
 let activePlayerPortrait = '';  // the active saved player's portrait
-let npcNameMap = new Map();  // npc_id → display name (from the card's <cast>)
 let cornerTrigger = null;   // the right-edge hover zone (Wupi drawer)
 let cornerDwellTimer = null; // 300ms arm-before-open timer (right edge)
 let leftCornerTrigger = null;   // the left-edge hover zone (Card / Tracker drawer)
 let leftCornerDwellTimer = null; // 300ms arm-before-open timer (left edge)
+// (2026-08-25 lock redesign) The drawer-tab sync watchers — one per drawer,
+// observing the drawer element's `class` so EVERY open/close/lock path (the
+// internal close button, Esc, the distance auto-close, tab clicks, module
+// resets) keeps the tab's ride state + chevron/padlock truthful without
+// callbacks in the drawer modules. Disconnected in teardownStage,
+// re-created per wireStage.
+let wupiTabObserver = null;
+let leftTabObserver = null;
 let saveModalClose = null;  // fn: close the save modal (set in wireStage, called by Esc)
 // (2026-08-19) Cascade-delete confirm: the doomed run's target index while
 // the confirm modal is open (-1 = closed). The Confirm button reads this —
@@ -207,6 +222,22 @@ export function buildStage() {
       <div class="fable-typing-indicator" data-typing-indicator aria-hidden="true">
         <span class="fable-typing-indicator__text" data-typing-text></span>
       </div>
+      <!-- JUMP-TO-LATEST arrow (2026-08-25, Chloe): a small centered down-
+           arrow pinned directly above the input box while the feed is
+           scrolled up in history; one click returns to the newest beat
+           (beats.scrollDown). Same mounting discipline as the typing
+           indicator — INSIDE the input-row form + anchored bottom:100%, so
+           it rides the form's top edge at every composer height. While the
+           typing indicator is up (form .has-typing) the arrow rides ABOVE
+           it so the two never overlap. Visibility is scroll-driven (wired
+           in wireStage); tabindex -1 keeps it out of the Tab order. -->
+      <button class="fable-jump-bottom" data-jump-bottom type="button"
+              aria-label="Jump to latest message" tabindex="-1">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 4.5v13.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          <path d="M6.2 12.7l5.8 5.8 5.8-5.8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
       <!-- The input is a single centered, max-width text box. The send button
            is GONE (2026-07-27): generation is fired by pressing Enter on a
            non-empty field, and stopped by pressing Enter on an EMPTY field
@@ -214,21 +245,21 @@ export function buildStage() {
       <div class="fable-input-group">
         <div class="fable-input-box">
           <textarea class="fable-input" data-input rows="1" placeholder="Type a message..."></textarea>
-        </div>
-        <!-- TURN AIDS (2026-08-22): two small icons directly right of the
-             input text — the GHOST (Ghost Writer: guided swipe / continue /
-             impersonate) then the OCTAGON-X (Crossroads: the options deck).
-             Flex siblings of the box (not overlays): the field shrinks a
-             hair, its centered placeholder + text layout stay untouched,
-             and long text can never run under the icons. Both menus anchor
-             to this cluster. -->
-        <div class="fable-input-aids" data-input-aids>
-          <button class="fable-aid-icon" data-ghost-aid type="button" aria-label="Ghost Writer">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a7 7 0 0 0-7 7v10l2.4-2 2.3 2 2.3-2 2.3 2 2.3-2 2.4 2V10a7 7 0 0 0-7-7z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><circle cx="9.6" cy="10.6" r="1.05" fill="currentColor"/><circle cx="14.4" cy="10.6" r="1.05" fill="currentColor"/></svg>
-          </button>
-          <button class="fable-aid-icon" data-crossroads-aid type="button" aria-label="Crossroads">
-              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8.2 3h7.6L21 8.2v7.6L15.8 21H8.2L3 15.8V8.2L8.2 3z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M8.2 8.2l7.6 7.6M15.8 8.2l-7.6 7.6" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
-          </button>
+          <!-- TURN AIDS (2026-08-22, overlayed 2026-08-24): two small icons
+               over the input's right end — the PENCIL (Ghost Writer: guided
+               swipe / continue / impersonate) then the OPEN BOOK (Crossroads:
+               the options deck). Absolutely positioned INSIDE the box: the
+               field keeps its full width, and the input's right padding
+               reserves the icon strip so long text never runs under them.
+               Both menus anchor to this cluster. -->
+          <div class="fable-input-aids" data-input-aids>
+            <button class="fable-aid-icon" data-ghost-aid type="button" aria-label="Ghost Writer">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20l1-4L16.5 4.5a2.1 2.1 0 0 1 3 3L8 19l-4 1z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round" stroke-linecap="round"/><path d="M14.5 6.5l3 3" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            </button>
+            <button class="fable-aid-icon" data-crossroads-aid type="button" aria-label="Crossroads">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 6.5C10.6 4.9 8.4 4 5.5 4c-.8 0-1.5.07-2.5.2V19c1-.13 1.7-.2 2.5-.2 2.9 0 5.1.9 6.5 2.5 1.4-1.6 3.6-2.5 6.5-2.5.8 0 1.5.07 2.5.2V4.2c-1-.13-1.7-.2-2.5-.2-2.9 0-5.1.9-6.5 2.5z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/><path d="M12 6.5v15" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+            </button>
+          </div>
         </div>
       </div>
     </form>
@@ -241,17 +272,20 @@ export function buildStage() {
          listener MUST be unwired or it leaks across game restarts). -->
     <div class="fable-corner-trigger" data-corner-trigger aria-hidden="true"></div>
 
-    <!-- RIGHT-edge LOCK BAR — standalone super-thin strip at the absolute
-         right edge. INVISIBLE by default; only visible when the Wupi drawer
-         is open AND the mouse touches the complete edge. Click toggles the
-         lock (color change only). Mirrors the left-edge lock bar. -->
-    <div class="fable-edge-lock fable-edge-lock--right" data-wupi-edge-lock aria-hidden="true"></div>
-
-    <!-- LEFT-edge LOCK BAR — standalone super-thin strip at the absolute
-         left edge. INVISIBLE by default; only visible when the left drawer
-         is open AND the mouse touches the complete edge. Click toggles the
-         lock (color change only). Exact mirror of the right-edge lock bar. -->
-    <div class="fable-edge-lock fable-edge-lock--left" data-left-edge-lock aria-hidden="true"></div>
+    <!-- (2026-08-25 lock redesign v2, Chloe) RIGHT DRAWER TAB — the lock
+         affordance PHYSICALLY ATTACHED to the drawer: a slim glass tab on
+         the drawer's inner edge that rides with it. Closed, the tab parks
+         at the screen edge as the drawer's visible tip — a wide-angle "<"
+         pointing the way the drawer pulls inward; open, it travels in with
+         the panel and sits at its lip, so locking needs no trip back to
+         the screen edge. Click toggles the lock (a click on a closed
+         drawer opens it first); the chevron becomes a tiny padlock while
+         locked. Hovering it arms the same 300ms dwell as the trigger
+         strip beneath. -->
+    <button class="fable-drawer-tab fable-drawer-tab--right" data-wupi-tab
+            type="button" aria-label="Lock the Wupi drawer open">
+      <span class="fable-drawer-tab-glyph" data-glyph></span>
+    </button>
 
     <!-- Invisible LEFT-edge hover zone — the mirror of the right-edge
          fable-corner-trigger. A 300ms dwell arms on mouseenter → opens the
@@ -261,15 +295,46 @@ export function buildStage() {
     <!-- LEFT drawer mount point (Card / Tracker tabs). The element is built
          by engine/left-drawer.js and injected here in buildStage. Slides in
          from the left (exact mirror of the right Wupi drawer: hover-to-open
-         + edge-lock, no visible handle). -->
-    <div class="fable-left-drawer-mount" data-left-mount></div>
+         + drawer tab). The LEFT TAB is parked in here as a SIBLING of the
+         injected drawer: the drawer itself is overflow:hidden (it clips the
+         scrubber glows), so a child tab would be clipped — the tab mirrors
+         the drawer's slide instead (same transform + transition, .is-open
+         flipped in lockstep by the class observer; DOM order irrelevant). -->
+    <div class="fable-left-drawer-mount" data-left-mount>
+      <button class="fable-drawer-tab fable-drawer-tab--left" data-left-tab
+              type="button" aria-label="Lock the left drawer open">
+        <span class="fable-drawer-tab-glyph" data-glyph></span>
+      </button>
+    </div>
 
     <aside class="fable-wupi-drawer" data-wupi-drawer>
       <!-- Chloe 2026-07-26: replaced the 🐾 avatar + "Wupi / Game Master"
            sublabel with a single centered, large, bold, glowy "WUPI"
            wordmark. The drawer's identity IS the brand. -->
+      <!-- (2026-08-23 Playground) The wand lives in the header too —
+           ABSOLUTELY positioned right so the centered brand never shifts.
+           Toggling it reveals the [ PLAYGROUND ACTIVE ] strip over the tab
+           rail (see engine/playground.js). -->
       <header class="fable-wupi-header">
         <div class="fable-wupi-brand">WUPI</div>
+        <!-- (2026-08-25) The Chronicle book — a twin of the wand tile pinned
+             directly LEFT of it (right:46px = the wand's 10px + 30px tile +
+             6px gap; both absolute so the centered brand never shifts).
+             Replaces the 6th foot tool removed the same day — the foot row
+             is back to five. Book glyph stamped INTO the metal like the
+             wand's imprint. -->
+        <button class="fable-chronicle-book" data-chronicle-book type="button" aria-label="Chronicle">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/><path d="M9 2v8.5l2.5-1.8 2.5 1.8V2" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/><path d="M17 2v5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></svg>
+        </button>
+        <button class="fable-playground-wand" data-playground-wand type="button" aria-pressed="false" aria-label="Playground">
+          <!-- Cast-imprint wand (2026-08-24): a bronze square tile with the
+               wand glyph stamped INTO the metal (darker bronze fill + inset
+               shading lives in the CSS). Geometry law: the star is the
+               DOMINANT element, centered ON the rod's axis past its tip —
+               an off-axis star or a star much smaller than the rod reads
+               as a bare slash at header size. -->
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3.6 20.4L15.4 8.6" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"/><path d="M17.2-0.6l1.2 6 6 1.2-6 1.2-1.2 6-1.2-6-6-1.2 6-1.2z" fill="currentColor"/><path d="M21 11.7l.7 3 3 .7-3 .7-.7 3-.7-3-3-.7 3-.7z" fill="currentColor"/></svg>
+        </button>
       </header>
       <!-- The tracked-stat tab rail (Player / Sim Card / Codex / World / NPC).
            Built by engine/tab-rail.js + injected here in buildStage. Sits
@@ -279,7 +344,9 @@ export function buildStage() {
       <div class="fable-tab-rail-mount" data-tab-rail-mount></div>
       <div class="fable-wupi-messages" data-wupi-messages></div>
       <form class="fable-wupi-input-row" data-wupi-form>
-        <textarea class="fable-wupi-input" data-wupi-input rows="1" placeholder="Ask WUPI anything…"></textarea>
+        <div class="fable-wupi-input-box">
+          <textarea class="fable-wupi-input" data-wupi-input rows="1" placeholder="Ask WUPI anything…"></textarea>
+        </div>
       </form>
       <!-- Drawer footer: the stage's save/load/home controls as ICON
            buttons. Phase 2: the native emoji glyphs (💾 📂 🏠) were replaced
@@ -372,7 +439,17 @@ export function buildStage() {
   // Inject the tab rail into the Wupi drawer (between brand + messages) + the
   // raw-editor overlay onto the stage. Both built once, reused across entries.
   const railMount = root.querySelector('[data-tab-rail-mount]');
-  if (railMount) railMount.appendChild(buildTabRail());
+  const railWrap = railMount ? buildTabRail() : null;
+  if (railMount) {
+    railMount.appendChild(railWrap);
+    // (2026-08-23 Playground) The Playground mounts AFTER the rail wrap —
+    // its strip covers the rail zone while the wand is on; the wand button
+    // in the brand header + the covered rail wrap are handed to the module.
+    const railEl = railMount.querySelector('.fable-tab-rail-wrap') || railWrap;
+    railMount.appendChild(buildPlayground());
+    const wandBtn = root.querySelector('[data-playground-wand]');
+    initPlayground({ wandBtn, railWrap: railEl });
+  }
   root.appendChild(buildRawEditor());
   return root;
 }
@@ -400,6 +477,36 @@ export async function wireStage(root, hooks) {
   // surface; hand it the element so its builders can append cards.
   const feedEl = root.querySelector('[data-feed]');
   beats.initBeats(feedEl);
+  // JUMP-TO-LATEST arrow (2026-08-25, Chloe): while the feed is scrolled up
+  // in history, the centered down-arrow above the input box reveals; one
+  // click goes all the way back to the newest beat. Visibility is
+  // scroll-driven (a passive listener on the feed — the same scroll events
+  // beats.js already reads for the paged-history loader; every scrollTop
+  // change funnels through here, including beats.scrollDown's programmatic
+  // jump + the page-prepend anchoring). Suppressed while an entrance tween
+  // owns scrollTop: the 1s push-up sweep passes through "scrolled up"
+  // territory on its way to the bottom, and the arrow would flash mid-tween
+  // for a turn the reader is already following. Routed through `on()` so
+  // teardownStage unwinds both bindings on stage exit.
+  const jumpBtn = root.querySelector('[data-jump-bottom]');
+  if (jumpBtn) {
+    const JUMP_REVEAL_PX = 120; // below this the newest beat is effectively in view
+    const updateJumpArrow = () => {
+      if (!feedEl) return;
+      if (beats.isEntranceScrolling()) {
+        jumpBtn.classList.remove('is-visible');
+        return;
+      }
+      const fromBottom = feedEl.scrollHeight - feedEl.scrollTop - feedEl.clientHeight;
+      jumpBtn.classList.toggle('is-visible', fromBottom > JUMP_REVEAL_PX);
+    };
+    on(feedEl, 'scroll', updateJumpArrow, { passive: true });
+    on(jumpBtn, 'click', (e) => {
+      e.preventDefault();
+      jumpBtn.classList.remove('is-visible');
+      beats.scrollDown();
+    });
+  }
   // HOVER TOOLRAIL click routing (2026-08-14): one delegated listener on
   // the feed routes [data-drawer-act] button clicks to the narrator.js
   // mutation wrappers. vn-interactions already short-circuits its
@@ -488,10 +595,15 @@ export async function wireStage(root, hooks) {
       // the backend edit_message contract — any USER beat, or the TRAILING
       // assistant beat. A mid-history AI edit is refused server-side; the old
       // optimistic editor left the beat blank on the failed save.
+      // (2026-08-26) The refusal is no longer SILENT — a dead-feeling click
+      // with no feedback read as "the edit button is broken".
       if (!beats.canEditMessage({
         role,
         isLastAssistant: beats.isTrailingAssistant(beat),
-      })) return;
+      })) {
+        showTurnNotice('hint', 'Only the latest AI beat can be edited — rewind or delete to change an earlier one.');
+        return;
+      }
       beats.enterEditMode(beat, {
         onSave: (text) => {
           // Player → rewind + branch + regen ("I changed what I did");
@@ -519,7 +631,17 @@ export async function wireStage(root, hooks) {
       }
     } else if (act === 'prev') {
       const active = Number.parseInt(beat.dataset.variantActive || '0', 10);
-      if (active > 0) narrator.swipeVariant(index, active - 1);
+      // Same click-time authority as › (#84 pattern + the swipe lock): ‹
+      // steps variants ONLY on the trailing assistant beat — the backend
+      // locks swipes once turns start, so a mid-history ‹ (however many
+      // variants the beat carries) is a guaranteed error.
+      const { canPrev } = beats.computeDrawerState({
+        role,
+        count: Number.parseInt(beat.dataset.variantCount || '1', 10) || 1,
+        active,
+        isLastAssistant: beats.isTrailingAssistant(beat),
+      });
+      if (canPrev) narrator.swipeVariant(index, active - 1);
     } else if (act === 'next') {
       const count = Number.parseInt(beat.dataset.variantCount || '1', 10);
       const active = Number.parseInt(beat.dataset.variantActive || '0', 10);
@@ -575,11 +697,15 @@ export async function wireStage(root, hooks) {
       if (index < 0) return; // unindexed beat — not a backend message
       const isUser = beat.dataset.role === 'user';
       // (P2b) The ✎-button gate applies to the dblclick path too — a
-      // mid-history AI beat must never open a doomed editor.
+      // mid-history AI beat must never open a doomed editor. (2026-08-26)
+      // Same non-silent refusal as the ✎ click: feedback, not a dead click.
       if (!beats.canEditMessage({
         role: isUser ? 'user' : 'assistant',
         isLastAssistant: beats.isTrailingAssistant(beat),
-      })) return;
+      })) {
+        showTurnNotice('hint', 'Only the latest AI beat can be edited — rewind or delete to change an earlier one.');
+        return;
+      }
       beats.enterEditMode(beat, {
         onSave: (text) => {
           // Player → rewind + branch + regen ("I changed what I did"); AI
@@ -641,7 +767,6 @@ export async function wireStage(root, hooks) {
       // UI re-enable above must not block on IPC latency).
       leftDrawer.refreshAll();
     },
-    npcPretty: hooks.npcPretty || ((id) => npcNameMap.get(id) || null),
     // (2026-08-21) Tracker-skip visibility: the whole 2026-08-21 playtest
     // ran with world-state tracking silently dead (over-budget tracker
     // prompt, skipped every turn — the log was the only witness). One
@@ -651,13 +776,14 @@ export async function wireStage(root, hooks) {
     },
     cardName: activeCardName,
     playerName: activePlayerName,
-    // Phase 2 portrait bridge: pass the resolved asset:// URLs + the npc name
-    // map into the narrator, which forwards them to beats.setIdentity for the
-    // VN renderer. npcPortraits is deferred (empty) — NPCs fall back to the
-    // card portrait until per-NPC portrait storage exists.
+    // Phase 2 portrait bridge: pass the resolved asset:// URLs into the
+    // narrator, which forwards them to beats.setIdentity for the VN
+    // renderer. npcPortraits is deferred (empty) — NPCs fall back to the
+    // card portrait until per-NPC portrait storage exists. (The old
+    // always-empty npcNameMap/npcPretty plumbing is gone — the narrator's
+    // default id→name prettifier is the single path.)
     cardPortrait: activeCardPortrait,
     playerPortrait: activePlayerPortrait,
-    npcNames: npcNameMap,
     // Chat-side schema patch hook (2026-08-11): when the operator asks WUPI
     // via chat to fable_schema_patch the active session, the backend emits
     // `fable-session-changed` kind=schema; narrator forwards the merged_keys
@@ -792,11 +918,20 @@ export async function wireStage(root, hooks) {
     }
     lastSendAt = Date.now(); // (audit #26) the double-Enter debounce anchor
     lastSentTurnText = text; // (2026-08-15) the api_lost retry affordance's source
+    // (2026-08-24) The Crossroads one-shot DC pin commits HERE — the moment
+    // the expanded fork is actually sent (an abandoned expand never armed
+    // it, and a replaced composer text never matches it). AWAITS so the
+    // backend slot is armed before this same turn's fable_send consumes it.
+    await crossroads.consumePendingDcPin(text);
     narrator.sendFableTurn(text);
   });
   on(input, 'keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
+      // (2026-08-24) Centered-popup gate: the saves popup / session manager /
+      // chronicle sit over the stage without moving focus — a stale composer
+      // focus must not submit (or stop) a turn invisibly under the modal.
+      if (beats.centeredPopupOpen(root)) return;
       // API-locked composer (2026-08-07): Enter re-checks the connection. If
       // the API is back, unlock + re-send the pending turn; otherwise re-toast.
       if (composerLocked) {
@@ -822,6 +957,26 @@ export async function wireStage(root, hooks) {
     }
   });
   on(input, 'input', () => autoGrow(input));
+  // Line-locked scrolling (2026-08-24, Chloe): one wheel click = exactly
+  // ONE line, always landing on the whole-line grid — 6 total lines / 3
+  // visible = 3 clicks bottom-to-top. The browser default (~3 arbitrary
+  // px per tick) cut lines mid-flight. Trackpads/keyboard/scrollbar get
+  // snapped onto the same grid by the scroll listener.
+  on(input, 'wheel', (e) => {
+    if (input.style.overflow !== 'auto') return; // 1-3 lines: nothing to scroll
+    e.preventDefault();
+    const m = inputMetrics(input);
+    const dir = e.deltaY > 0 ? 1 : e.deltaY < 0 ? -1 : 0;
+    if (!dir) return;
+    input.scrollTop = snapScrollToLineGrid(input, m, input.scrollTop + dir * m.lineHeight);
+  }, { passive: false });
+  on(input, 'scroll', () => {
+    // Re-quantize foreign scroll sources onto the grid (idempotent — the
+    // assignment only fires another scroll when the value actually moves).
+    const m = inputMetrics(input);
+    const snapped = snapScrollToLineGrid(input, m, input.scrollTop);
+    if (snapped !== input.scrollTop) input.scrollTop = snapped;
+  });
   setGenerating(false);
 
   // TURN AIDS (2026-08-22): wire the ghost + octagon icons. Both menus are
@@ -869,173 +1024,179 @@ export async function wireStage(root, hooks) {
   // rerollLastTurn / rewindAndEditUser); the pure decision logic lives in
   // engine/drawer-logic.js.
 
-  // Wupi trigger: invisible right-edge strip with a 300ms dwell.
-  // No visible button (decision 1). The strip element is sized/positioned
-  // in CSS (tall, thin, right:0); here we just arm the dwell timer on
-  // enter + cancel on leave. Pattern mirrors script.js dock hover-reveal
-  // (grace timer) + chrome.js edge peek. Tracked via on() so re-wireStage
-  // doesn't double-bind.
+  // ── DRAWERS (2026-08-25 redesign v2, Chloe): dwell-open + drawer-tab
+  //    lock + distance auto-close ─────────────────────────────────────────
+  // The invisible edge-lock bars are GONE. In their place:
+  //   • DRAWER TABS — slim glass tabs riding each drawer's inner edge (a
+  //     wide-angle chevron while closed at the screen edge — the drawer's
+  //     visible tip — traveling in with the panel so the lock sits at the
+  //     lip, no trip back to the screen edge). Click toggles the lock; a
+  //     click on a closed drawer opens it first (locking implies open);
+  //     locked swaps the chevron for a tiny padlock.
+  //   • LENIENT auto-close: an unlocked drawer closes only after the
+  //     pointer travels DRAWER_CLOSE_GRACE_PX past the drawer's inner
+  //     edge — a graze across the boundary no longer slams it shut.
+  // The stuck-screen invariant is untouched by all of this: nothing here
+  // focuses anything (openDrawer's own timer is preventScroll + canceled on
+  // close) and the app root is overflow:clip — unscrollable by construction.
   cornerTrigger = root.querySelector('[data-corner-trigger]');
   on(cornerTrigger, 'mouseenter', armCornerDwell);
   on(cornerTrigger, 'mouseleave', cancelCornerDwell);
 
-  // Auto-pull-in: when the mouse fully exits the Wupi drawer, it slides
-  // back in UNLESS locked. The lock is toggled by a separate super-thin
-  // EDGE bar (see below), NOT a button on the drawer — the drawer itself
-  // has no visible lock UI.
   const wupiDrawerEl = root.querySelector('[data-wupi-drawer]');
-  on(wupiDrawerEl, 'mouseleave', () => wupiDrawer.onDrawerMouseLeave());
+  const wupiTab = root.querySelector('[data-wupi-tab]');
+  // Closed, the tab covers the trigger strip's outermost 12px (z:50 over
+  // z:30), so a pointer landing on it never reaches the strip below it —
+  // the tab arms/cancels the SAME dwell, keeping "hover the edge to open"
+  // true all the way to the pixel edge.
+  on(wupiTab, 'mouseenter', armCornerDwell);
+  on(wupiTab, 'mouseleave', cancelCornerDwell);
 
-  // EDGE LOCK BAR — a super-thin strip at the absolute right screen edge.
-  // INVISIBLE by default. It becomes visible ONLY when:
-  //   (a) the Wupi drawer is open, AND
-  //   (b) the mouse is touching the complete right edge (within EDGE_HIT_PX).
-  // Moving away from the edge hides the bar; the drawer stays if locked.
-  // Click toggles the lock — color change only (brass = unlocked, magenta =
-  // locked), no glyph. The pop-out zone (wider, ~2 inches) is separate;
-  // the UI always pops out FIRST, the edge lock only appears at the very
-  // edge afterward.
-  // How close to the absolute edge counts as "touching" the lock bar. Widened
-  // 2026-08-10 (6 → 14) alongside the bar itself (2px → 10px) so the wider bar
-  // is easy to summon + click without pixel-precise aiming. Both edges share it.
-  const EDGE_HIT_PX = 14;
-  const wupiEdgeLock = root.querySelector('[data-wupi-edge-lock]');
+  // The wide-angle chevrons (v2): taller + less acute than ASCII arrows —
+  // a ~93° spread reads as a graceful bracket, not a sharp wedge. Left
+  // points "pulls in from the right"; right points "pushes out".
+  // (v7 gap fix) The viewBox CROPS TO THE INK (a hair of margin against
+  // stroke clipping) instead of the old square 16×24 frame: the chevron's
+  // ink sat off-center inside that frame, so flex-centering the box left a
+  // one-sided margin (point side vs arm side — the gap you saw flip
+  // between the drawers). Cropped + rendered at 10px, the ink is centered
+  // BY CONSTRUCTION and runs flush to the bronze frame's inner edges on
+  // both sides. The PATH is untouched — same shape, same angle.
+  const CHEVRON_LEFT_SVG = '<svg viewBox="3.15 2.58 10.82 18.84" width="10" height="17.4" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="butt" stroke-linejoin="miter" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M13 3.5 L5 12 L13 20.5"/></svg>';
+  const CHEVRON_RIGHT_SVG = '<svg viewBox="2.13 2.58 10.82 18.84" width="10" height="17.4" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="butt" stroke-linejoin="miter" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M3 3.5 L11 12 L3 20.5"/></svg>';
+  // The padlock stamped into a tab while locked — line-art to match the
+  // dock-icon family (currentColor, butt/miter caps, outline only). Same
+  // v7 treatment: the viewBox hugs the ink, so at 10px wide the lock's
+  // body fills the tab edge-to-edge inside its bronze frame.
+  const LOCK_SVG = '<svg viewBox="4.45 3.2 15.1 17.85" width="10" height="11.8" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="butt" stroke-linejoin="miter" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><rect x="5.5" y="10.5" width="13" height="9.5" rx="1.5"/><path d="M8.5 10.5V7.75a3.5 3.5 0 0 1 7 0v2.75"/></svg>';
 
-  // Wire the edge-lock visibility probe into the wupi drawer module. Its
-  // onDrawerMouseLeave checks this probe: if the edge lock is visible, the
-  // auto-close is suppressed so the user can move onto the lock to click it
-  // without the drawer phasing out (the lock is a separate element on top of
-  // the drawer — reaching for it fires mouseleave on the drawer).
-  wupiDrawer.setEdgeLockProbe(() => wupiEdgeLock && wupiEdgeLock.classList.contains('visible'));
-
-  // Reflect the current lock state onto the edge bar's color. Called after
-  // every toggle + on initial show.
-  function syncWupiEdgeLockColor() {
-    if (wupiEdgeLock) wupiEdgeLock.classList.toggle('locked', wupiDrawer.isLocked());
+  // Paint the right tab from live drawer state. `.is-open` drives the tab's
+  // slide (it mirrors the drawer's own transform + transition — see the
+  // .fable-drawer-tab CSS); `.locked` drives the emerald treatment. Locked
+  // wins over open/closed (the padlock IS the state); otherwise the chevron
+  // points the way the drawer moves next: "<" pulls in from the right
+  // (closed), ">" pushes out (open).
+  function syncWupiTab() {
+    if (!wupiTab) return;
+    const isOpenNow = wupiDrawer.isOpen();
+    const lockedNow = wupiDrawer.isLocked();
+    wupiTab.classList.toggle('is-open', isOpenNow);
+    wupiTab.classList.toggle('locked', lockedNow);
+    const glyph = wupiTab.querySelector('[data-glyph]');
+    if (!glyph) return;
+    if (lockedNow) glyph.innerHTML = LOCK_SVG;
+    else glyph.innerHTML = isOpenNow ? CHEVRON_RIGHT_SVG : CHEVRON_LEFT_SVG;
   }
 
-  // The mousemove handler watches the pointer's distance from the right edge.
-  // When within EDGE_HIT_PX of the right edge AND the wupi drawer is open,
-  // show the edge bar; otherwise hide it. One listener so it stays cheap +
-  // tear-down is one removeEventListener.
-  // (The left-edge branch was removed 2026-07-25 with the left UI.)
-  function onStageMouseMove(e) {
-    const rect = root.getBoundingClientRect();
-    const fromRight = rect.right - e.clientX;
-    if (wupiEdgeLock) {
-      const show = fromRight <= EDGE_HIT_PX && wupiDrawer.isOpen();
-      wupiEdgeLock.classList.toggle('visible', show);
-    }
-  }
-  on(root, 'mousemove', onStageMouseMove);
-
-  // Click toggles the wupi lock. The color sync runs after toggle so the bar
-  // reflects the new state immediately (stays visible until the mouse leaves
-  // the edge).
-  on(wupiEdgeLock, 'click', (e) => {
+  // Click toggles the lock. On a closed drawer, open FIRST (a locked-closed
+  // drawer is meaningless — lock means "stay open"), mirroring the dwell
+  // path's renderActive so the tab panel isn't stale.
+  on(wupiTab, 'click', (e) => {
     e.stopPropagation();
+    if (!wupiDrawer.isOpen()) {
+      wupiDrawer.openDrawer();
+      renderActive();
+    }
     wupiDrawer.toggleLock();
-    syncWupiEdgeLockColor();
+    syncWupiTab();
   });
 
-  // ── LEFT DRAWER (Card / Tracker) — exact mirror of the right Wupi drawer.
-  // Invisible left-edge hover strip with a 300ms dwell, a left edge-lock bar,
-  // and mouseleave auto-close (suppressed when locked). No visible handle.
+  // ── LEFT DRAWER (Card / Tracker) — the exact mirror ────────────────────
   leftCornerTrigger = root.querySelector('[data-left-corner-trigger]');
   on(leftCornerTrigger, 'mouseenter', armLeftCornerDwell);
   on(leftCornerTrigger, 'mouseleave', cancelLeftCornerDwell);
 
   const leftDrawerEl = root.querySelector('[data-left-drawer]');
-  on(leftDrawerEl, 'mouseleave', () => leftDrawer.onDrawerMouseLeave());
+  const leftTab = root.querySelector('[data-left-tab]');
+  on(leftTab, 'mouseenter', armLeftCornerDwell);
+  on(leftTab, 'mouseleave', cancelLeftCornerDwell);
 
-  const leftEdgeLock = root.querySelector('[data-left-edge-lock]');
-  leftDrawer.setEdgeLockProbe(() => leftEdgeLock && leftEdgeLock.classList.contains('visible'));
-  // While the inventory action popup is open, the unlocked drawer must NOT
-  // auto-close on mouseleave (the popup lives on document.body, so the mouse
-  // crosses the drawer boundary reaching for it). Mirrors the edge-lock probe.
-  leftDrawer.setActionPopupProbe(() => isActionPopupOpen());
-
-  function syncLeftEdgeLockColor() {
-    if (leftEdgeLock) leftEdgeLock.classList.toggle('locked', leftDrawer.isLocked());
+  function syncLeftTab() {
+    if (!leftTab) return;
+    const isOpenNow = leftDrawer.isOpenState();
+    const lockedNow = leftDrawer.isLocked();
+    leftTab.classList.toggle('is-open', isOpenNow);
+    leftTab.classList.toggle('locked', lockedNow);
+    const glyph = leftTab.querySelector('[data-glyph]');
+    if (!glyph) return;
+    if (lockedNow) glyph.innerHTML = LOCK_SVG;
+    else glyph.innerHTML = isOpenNow ? CHEVRON_LEFT_SVG : CHEVRON_RIGHT_SVG;
   }
 
-  // Extend the stage mousemove handler to also drive the LEFT edge-lock bar.
-  // (The existing onStageMouseMove above handles the right edge; this branch
-  // mirrors it for the left edge.)
-  function onStageMouseMoveLeft(e) {
-    const rect = root.getBoundingClientRect();
-    const fromLeft = e.clientX - rect.left;
-    if (leftEdgeLock) {
-      const show = fromLeft <= EDGE_HIT_PX && leftDrawer.isOpenState();
-      leftEdgeLock.classList.toggle('visible', show);
-    }
-  }
-  on(root, 'mousemove', onStageMouseMoveLeft);
-
-  on(leftEdgeLock, 'click', (e) => {
+  on(leftTab, 'click', (e) => {
     e.stopPropagation();
+    if (!leftDrawer.isOpenState()) {
+      leftDrawer.openDrawer();
+      leftDrawer.refreshAll();
+    }
     leftDrawer.toggleLock();
-    syncLeftEdgeLockColor();
+    syncLeftTab();
   });
 
-  // ── Edge-lock "stuck visible" guard (Chloe 2026-08-06) ────────────────
-  // The edge-lock bars are shown/hidden ONLY by onStageMouseMove (it toggles
-  // `.visible` based on the pointer's distance from the screen edge). That
-  // handler only runs while the mouse is MOVING over the stage. Three cases
-  // leave a bar stuck `.visible` with no further mousemove to clear it:
-  //   1. The pointer leaves the window entirely (alt-tab, clicking another
-  //      monitor, a fullscreen hand-off). The last mousemove armed the bar;
-  //      nothing fires to disarm it.
-  //   2. A viewport RESIZE — fullscreen toggle, display-resolution change,
-  //      DPR shift, dock auto-hide. The stage rect changes size, so the
-  //      pointer's stored screen position is suddenly "at the edge" relative
-  //      to the NEW (smaller) rect, but no mousemove arrives to recompute.
-  //   3. The window loses focus (blur) mid-hover.
-  // A stuck `.visible` edge lock permanently suppresses the drawer's
-  // mouseleave auto-close (onDrawerMouseLeave's `edgeLockVisible()` probe
-  // returns true forever) → the drawer is stuck OPEN, which the user
-  // experiences as "the right drawer stays infinitely open / the left drawer
-  // breaks / the text box looks pushed left" (the open drawer overlaps the
-  // centered input). Toggling the lock doesn't help because the bar is still
-  // `.visible`; only a hard refresh cleared it.
-  // FIX: dismiss BOTH edge-lock bars whenever the pointer leaves the window,
-  // the window blurs, or the viewport resizes — AND close any un-locked
-  // drawer that was held open only by the now-cleared lock (its mouseleave
-  // auto-close was suppressed by the stale `.visible` state, so without this
-  // it would stay open until the next manual interaction). A resize while
-  // genuinely hovering the edge re-arms the bar on the very next mousemove
-  // (the mousemove handler is authoritative for the visible state), so this
-  // only ever clears STALE state — never a live hover. Tracked via on() so it
-  // tears down with the stage.
-  function dismissStaleEdgeLocks() {
-    if (wupiEdgeLock) wupiEdgeLock.classList.remove('visible');
-    if (leftEdgeLock) leftEdgeLock.classList.remove('visible');
-    // Close any drawer held open only by the stale lock. Locked drawers stay
-    // (the user pinned them deliberately); generating drawers stay (don't
-    // yank mid-stream). This mirrors onDrawerMouseLeave's own guards.
+  // ── Lenient distance-based auto-close ──────────────────────────────────
+  // Replaces the old mouseleave-on-the-drawer trigger: the pointer must
+  // travel this far PAST the drawer's inner edge before an unlocked drawer
+  // slides away. Hovering the drawer, its side bar, or the near field keeps
+  // it open; a genuine swipe across the screen still closes it. The wupi
+  // drawer holds while generating; the left drawer holds while the inventory
+  // action popup is open (the popup lives on document.body — the mouse
+  // crosses the drawer boundary reaching for it).
+  const DRAWER_CLOSE_GRACE_PX = 120;
+  function onStageMouseMove(e) {
+    if (wupiDrawer.isOpen() && !wupiDrawer.isLocked() && !wupiDrawer.isGenerating()) {
+      const r = wupiDrawerEl.getBoundingClientRect();
+      if (e.clientX < r.left - DRAWER_CLOSE_GRACE_PX) wupiDrawer.closeDrawer();
+    }
+    if (leftDrawer.isOpenState() && !leftDrawer.isLocked() && !isActionPopupOpen()) {
+      const r = leftDrawerEl.getBoundingClientRect();
+      if (e.clientX > r.right + DRAWER_CLOSE_GRACE_PX) leftDrawer.closeDrawer();
+    }
+  }
+  on(root, 'mousemove', onStageMouseMove);
+
+  // ── Glyph + ride sync: ONE class watcher per drawer ────────────────────
+  // Every open/close/lock path flips a class on the drawer element itself
+  // (the internal close button, Esc, the distance close above, tab clicks,
+  // module resets), so observing `class` catches them all — and the same
+  // callback flips the TAB's .is-open in the same frame, so the tab's slide
+  // starts together with the drawer's (same transition → they stay glued).
+  // Sync is idempotent + cheap. Re-created per wireStage; torn down with
+  // the stage.
+  if (wupiTabObserver) wupiTabObserver.disconnect();
+  wupiTabObserver = new MutationObserver(syncWupiTab);
+  wupiTabObserver.observe(wupiDrawerEl, { attributes: true, attributeFilter: ['class'] });
+  if (leftTabObserver) leftTabObserver.disconnect();
+  leftTabObserver = new MutationObserver(syncLeftTab);
+  leftTabObserver.observe(leftDrawerEl, { attributes: true, attributeFilter: ['class'] });
+  syncWupiTab();
+  syncLeftTab();
+
+  // ── Window-exit close (successor of the 2026-08-06 stale-edge-lock sweep)
+  // With no visibility-cached lock bars left to go stale, all this guards is
+  // a drawer left hovering when the pointer leaves the window or the window
+  // blurs/resizes: close the UNLOCKED ones. Locked drawers were pinned
+  // deliberately (they now survive alt-tab — that is the lock's whole job);
+  // generating drawers + an open inventory action popup hold.
+  function closeUnlockedDrawers() {
     if (wupiDrawer.isOpen() && !wupiDrawer.isLocked() && !wupiDrawer.isGenerating()) {
       wupiDrawer.closeDrawer();
     }
-    if (leftDrawer.isOpenState() && !leftDrawer.isLocked()) {
-      // (2026-08-15 audit fix) An open inventory action popup (mid-EQUIP
-      // destination sub-menu) survives the alt-tab/blur: force-closing the
-      // drawer here killed the in-progress item action. Mirrors
-      // onDrawerMouseLeave's own actionPopupOpen guard.
-      if (!isActionPopupOpen()) leftDrawer.closeDrawer();
+    if (leftDrawer.isOpenState() && !leftDrawer.isLocked() && !isActionPopupOpen()) {
+      leftDrawer.closeDrawer();
     }
   }
   // mouseout on document with no relatedTarget = pointer left the viewport
   // (the robust cross-browser "mouse exited window" signal). window blur
   // covers the focus-loss case.
   on(document, 'mouseout', (e) => {
-    if (!e.relatedTarget && !e.toElement) dismissStaleEdgeLocks();
+    if (!e.relatedTarget && !e.toElement) closeUnlockedDrawers();
   });
-  on(window, 'blur', dismissStaleEdgeLocks);
-  on(window, 'resize', dismissStaleEdgeLocks);
+  on(window, 'blur', closeUnlockedDrawers);
+  on(window, 'resize', closeUnlockedDrawers);
   // visibilitychange (tab hidden / window minimized via Win+D) covers cases
   // resize+blur miss on some Windows builds.
   on(document, 'visibilitychange', () => {
-    if (document.hidden) dismissStaleEdgeLocks();
+    if (document.hidden) closeUnlockedDrawers();
   });
 
   // Drawer footer actions. Three ICON buttons (no worded labels):
@@ -1054,6 +1215,7 @@ export async function wireStage(root, hooks) {
   const footSave = root.querySelector('[data-foot-save]');
   const footLoad = root.querySelector('[data-foot-load]');
   const footApi = root.querySelector('[data-foot-api]');
+  const chronicleBook = root.querySelector('[data-chronicle-book]');
   const footHome = root.querySelector('[data-foot-home]');
 
   // (P2c, 2026-08-17 E4B shakedown) Foot-button cooldown: every foot action
@@ -1200,11 +1362,34 @@ export async function wireStage(root, hooks) {
     openStageOnlinePanel();
   });
 
+  // (2026-08-25) Chronicle — moved from the (removed) 6th foot tool to the
+  // brand-header book tile left of the playground wand; the foot row is back
+  // to five. Same open as before: the drawer closes, then the pin/rollback
+  // overlay rises over the stage (z:46 over the drawer's 40 — the
+  // backgrounds pattern). No foot cooldown — the tile sits in the header,
+  // outside the footer whose close-slide motivated the stale-click guard.
+  on(chronicleBook, 'click', () => {
+    wupiDrawer.closeDrawer();
+    openChroniclePanel(root);
+  });
+
   // Esc: dismiss panel → close wupi.
   // (2026-08-15 audit fix) Routed through on() (capture preserved) — the raw
   // document.addEventListener re-ran on every stage entry and NEVER tore
   // down, so N sessions meant N Esc handlers firing per keypress.
   on(document, 'keydown', onKeyDown, { capture: true });
+
+  // (2026-08-25 Playground) Click-off-screen kills the Playground — but ONLY
+  // while the drawer is OPEN (the user is looking at the strip). Once the
+  // drawer has pulled in, the Playground STAYS ACTIVE behind it: stage
+  // clicks must not silently deselect the domain. setWand(false) is what
+  // deselects the pressed domain button. Routed through on() so re-entries
+  // never stack handlers.
+  on(document, 'click', (ev) => {
+    if (!isWandOn() || !wupiDrawer.isOpen()) return;
+    if (!(ev.target instanceof Element)) return;
+    if (!ev.target.closest('.fable-wupi-drawer')) togglePlayground();
+  });
 
   // Paint the dialogue feed on entry. Two paths feed it:
   //   - hooks.loadMessages: the session's full history (the backend already
@@ -1213,17 +1398,11 @@ export async function wireStage(root, hooks) {
   //     a fresh game's `<intro>` is seeded as session message 0 backend-side,
   //     so index 0 in the feed is index 0 in the conversation and the beat
   //     survives rebuilds/resumes like any other message.
-  //   - hooks.openingScene: legacy fallback for a backend that still surfaces
-  //     `FableLoadResult.intro` (rendered DOM-only). Dead under the current
-  //     backend — kept as a one-shot guard.
-  // A cold start has neither — the first fable_send turn
-  // streams the opening beat live.
+  // A cold start has none — the first fable_send turn streams the opening
+  // beat live.
   beats.clearFeed();
   if (Array.isArray(hooks.loadMessages) && hooks.loadMessages.length) {
     beats.rebuildFromMessages(hooks.loadMessages);
-  } else if (typeof hooks.openingScene === 'string' && hooks.openingScene.trim()) {
-    const opening = beats.startNarratorBeat({ name: activeCardName });
-    beats.finalizeBeat(opening, hooks.openingScene);
   }
   beats.scrollDown();
 
@@ -1322,8 +1501,13 @@ function escText(s) {
 }
 function autoGrow(el) {
   const m = inputMetrics(el);
-  // Border-box caps: base = the tuned 1-line resting box (54px), max =
-  // exactly INPUT_MAX_LINES whole lines of text + padding + border.
+  // The field is CHROMELESS (2026-08-24): all vertical inset + border live
+  // on .fable-input-box, so the textarea's own pad/border metrics are 0 and
+  // these caps are PURE line math — base = 1 line, max = exactly
+  // INPUT_MAX_LINES whole lines. The scroll viewport is therefore always a
+  // whole number of 26px lines: no mid-line cuts, no 3½-line windows (the
+  // old chrome-on-textarea layout framed a sliver of a 4th line at the
+  // bottom). The box composes the visual total (26→54px resting).
   const base = Math.ceil(m.lineHeight + m.padTop + m.padBottom + m.borderY);
   const max = Math.ceil(m.lineHeight * INPUT_MAX_LINES + m.padTop + m.padBottom + m.borderY);
   const mirror = ensureInputMirror(el, m);
@@ -1339,20 +1523,30 @@ function autoGrow(el) {
   const caretTop = marker ? (marker.offsetTop - m.padTop) : 0;
   el.style.height = Math.min(Math.max(full, base), max) + 'px';
   if (full > max + 1) {
-    // Over the cap: internal scroll ON, 4th+ lines cut at line boundaries.
-    // Follow the caret ONLY when its line leaves the window (stable view
-    // otherwise), and quantize to whole lines — no half-line slivers.
+    // Over the cap: internal scroll ON. Line-locked scroll (2026-08-24):
+    // every scroll position frames whole lines only — scrollTop lives on
+    // the grid {0} ∪ {padTop + k·lineHeight}, so the viewport always shows
+    // exactly 3 complete lines (never a sliver, never a 4th).
     el.style.overflow = 'auto';
     const viewH = m.lineHeight * INPUT_MAX_LINES;
     let st = el.scrollTop;
     if (caretTop + m.lineHeight > st + viewH) st = caretTop - (viewH - m.lineHeight);
     else if (caretTop < st) st = caretTop;
-    st = Math.max(0, Math.round(st / m.lineHeight) * m.lineHeight);
-    el.scrollTop = st;
+    el.scrollTop = snapScrollToLineGrid(el, m, st);
   } else {
     el.style.overflow = 'hidden';
     el.scrollTop = 0;
   }
+}
+
+// Quantize a content-space scroll offset onto the composer's line grid.
+// The chromeless field has no vertical padding, so the grid is plain
+// lineHeight multiples — every scroll window frames whole lines only.
+function snapScrollToLineGrid(el, m, target) {
+  const L = m.lineHeight;
+  const raw = Math.round((target - m.padTop) / L) * L + m.padTop;
+  const maxScroll = el.scrollHeight - el.clientHeight;
+  return Math.max(0, Math.min(raw, maxScroll));
 }
 
 // Track a stage-element listener so teardownStage can remove it (prevents
@@ -1375,9 +1569,8 @@ let wireEpoch = 0;
 // The typing indicator's label (2026-08-19, subtype-aware): an npc-subtype
 // card IS the character, so the card name reads as them typing; a scenario/
 // world card narrates through an unseen voice → "Narrator is currently
-// thinking...". Unknown/legacy subtypes (no <subtype> in the file, the
-// legacy plain-string IPC shape, dev preview) fall into the npc lane — the
-// named-persona reading. "Game Master" is the no-name fallback.
+// thinking...". Unknown subtypes (dev preview) fall into the npc lane —
+// the named-persona reading. "Game Master" is the no-name fallback.
 function typingLabel() {
   if (activeCardSubtype === 'scenario' || activeCardSubtype === 'world') {
     return 'Narrator is currently thinking...';
@@ -1389,11 +1582,12 @@ function typingLabel() {
 // Generation state reflection (2026-07-27, no send button): the send/stop
 // toggle button + its SVG icons are GONE. The UI feedback for a turn in
 // flight is the typing indicator above the input row (subtype-aware label,
-// 2026-08-19) + the in-card streaming caret (the .streaming class on the
-// narrator beat, see fable.css). The input stays ENABLED so the empty-Enter-
-// to-stop affordance (wired above in wireStage) works: pressing Enter on an
-// empty field while generating stops the turn. The placeholder flips to hint
-// the stop affordance so the user learns the gesture.
+// 2026-08-19). The .streaming class on the narrator beat remains a state
+// hook only (its blinking block caret was removed 2026-08-25). The input
+// stays ENABLED so the empty-Enter-to-stop affordance (wired above in
+// wireStage) works: pressing Enter on an empty field while generating stops
+// the turn. The placeholder flips to hint the stop affordance so the user
+// learns the gesture.
 // Show the typing indicator. Fired from the narrator's onNarratorActive
 // hook (first REAL narrator output — stream chunk / character_turn line),
 // NOT at turn start: Stage 1 is the hidden local tracker, which runs
@@ -1408,16 +1602,27 @@ function showTypingIndicator() {
   const label = stageRoot.querySelector('[data-typing-text]');
   if (label) label.textContent = typingLabel();
   indicator.classList.add('is-visible');
+  // (2026-08-25) Flag the form so the jump-to-latest arrow rides ABOVE the
+  // indicator's stratum while it's up (the two share the above-the-box
+  // zone — see .fable-input-row.has-typing in fable.css).
+  const form = indicator.closest('[data-input-form]');
+  if (form) form.classList.add('has-typing');
 }
 
 function setGenerating(on) {
   const input = stageRoot && stageRoot.querySelector('[data-input]');
   if (!input) return;
   // The typing indicator: hidden here on turn END only — its SHOW path is
-  // showTypingIndicator via onNarratorActive (see above).
+  // showTypingIndicator via onNarratorActive (see above). Dropping the
+  // form's has-typing flag returns the jump-to-latest arrow to its
+  // flush-above-the-box stratum.
   if (!on) {
     const indicator = stageRoot.querySelector('[data-typing-indicator]');
-    if (indicator) indicator.classList.remove('is-visible');
+    if (indicator) {
+      indicator.classList.remove('is-visible');
+      const form = indicator.closest('[data-input-form]');
+      if (form) form.classList.remove('has-typing');
+    }
   }
   if (on) {
     // Idempotent stash: reroll / rewind-edit fire onTurnStart, then
@@ -1607,6 +1812,10 @@ function onVariantArrowKey(e) {
   if (deleteOverlay && !deleteOverlay.hidden) return;
   if (backgrounds.isOpen()) return;
   if (panelActive()) return;
+  // (2026-08-24) The centered popups gate (saves popup / session manager /
+  // chronicle): they sit above the feed without stealing focus, so the
+  // arrows must no-op rather than swipe/reroll invisibly under a modal.
+  if (beats.centeredPopupOpen(stageRoot)) return;
   if (beats.openEditingBeat()) return;
   if (narrator.isSliceRegenerating()) return;
   if (wupiDrawer.isOpen() || leftDrawer.isOpenState()) return;
@@ -1648,8 +1857,17 @@ function onVariantArrowKey(e) {
     if (action.kind === 'swipe') narrator.swipeVariant(index, action.variantIdx);
     else narrator.rerollLastTurn();
   } else {
-    // ← with no earlier variant does nothing.
-    if (active <= 0) return;
+    // ← does nothing with no earlier variant — or off a NON-TRAILING beat:
+    // the same swipe lock the ‹ chevron click enforces (computeDrawerState
+    // canPrev). The backend refuses a swipe on any beat with a later
+    // message; the old bare `active > 0` check let the arrow fire it.
+    const { canPrev } = beats.computeDrawerState({
+      role: 'assistant',
+      count,
+      active,
+      isLastAssistant: beats.isTrailingAssistant(beat),
+    });
+    if (!canPrev) return;
     e.preventDefault();
     narrator.swipeVariant(index, active - 1);
   }
@@ -1691,6 +1909,19 @@ function onKeyDown(e) {
   // Backgrounds gallery modal — same z-tier as the save modal, so it dismisses
   // right after it (before the drawer/panel surfaces below).
   if (backgrounds.isOpen()) { backgrounds.closeBackgroundsPanel(); e.preventDefault(); e.stopPropagation(); return; }
+  // (2026-08-25) The centered popups gate (saves popup / session manager /
+  // chronicle / NPC dossier): each owns its Esc on its OWN document-capture
+  // listener, so while one is open the stage must act on NOTHING beneath
+  // it — the surfaces below used to dismiss on the same keypress (an
+  // edge-locked left drawer closed together with the chronicle overlay; a
+  // summoned panel closed together with the dossier over it: one Esc, two
+  // surfaces — the audit #26 class). Bail untouched; the popup's own
+  // handler closes it. The gate sits ABOVE the panel branch because the
+  // dossier opens OVER its parent panel: this listener runs capture-phase
+  // on document BEFORE the dossier's own capture handler (registration
+  // order), and stopPropagation cannot stop a later same-element listener —
+  // only bailing untouched lets the dossier close alone, panel intact.
+  if (beats.centeredPopupOpen(stageRoot)) return;
   if (panelActive()) { dismissPanel(); e.preventDefault(); e.stopPropagation(); return; }
   // (2026-08-16 audit fix #26) The inline beat editor + an in-flight slice
   // regen own Esc BEFORE any drawer: this listener runs CAPTURE-phase, so a
@@ -1830,23 +2061,14 @@ async function refreshActiveCardName(root) {
     activePlayerName = 'Wanderer';
     activeCardPortrait = '';
     activePlayerPortrait = '';
-    npcNameMap = new Map();
     return;
   }
   try {
     const res = await invoke('fable_active_card_get');
-    if (typeof res === 'string') {
-      // Legacy plain-string shape (older backend): just the card name.
-      activeCardName = res;
-      activeCardSubtype = '';
-      activePlayerName = '';
-      activeCardPortrait = '';
-      activePlayerPortrait = '';
-      npcNameMap = new Map();
-    } else if (res && typeof res === 'object') {
+    if (res && typeof res === 'object') {
       activeCardName = typeof res.name === 'string' ? res.name : '';
       // The wizard subtype ("npc" | "scenario" | "world") — drives the typing
-      // label's voice. Null/absent (legacy card) reads as the npc lane.
+      // label's voice. Null/absent reads as the npc lane.
       activeCardSubtype = typeof res.subtype === 'string' ? res.subtype : '';
       activePlayerName = typeof res.player_name === 'string' ? res.player_name : '';
       // Portrait paths arrive as absolute filesystem paths; convertFileSrc
@@ -1855,31 +2077,19 @@ async function refreshActiveCardName(root) {
         ? convertFileSrc(res.card_portrait_url) : '';
       activePlayerPortrait = typeof res.player_portrait_url === 'string' && res.player_portrait_url
         ? convertFileSrc(res.player_portrait_url) : '';
-      // Build the npc_id → display-name map from the cast summary. Real NPC
-      // speaker labels on character beats (replaces the slug-title fallback).
-      npcNameMap = new Map();
-      if (Array.isArray(res.npc_names)) {
-        for (const n of res.npc_names) {
-          if (n && typeof n.id === 'string' && typeof n.name === 'string') {
-            npcNameMap.set(n.id, n.name);
-          }
-        }
-      }
-    } else {
+      } else {
       activeCardName = '';
       activeCardSubtype = '';
       activePlayerName = '';
       activeCardPortrait = '';
       activePlayerPortrait = '';
-      npcNameMap = new Map();
-    }
+      }
   } catch (_) {
     activeCardName = '';
     activeCardSubtype = '';
     activePlayerName = '';
     activeCardPortrait = '';
     activePlayerPortrait = '';
-    npcNameMap = new Map();
   }
 }
 
@@ -1915,6 +2125,11 @@ export function teardownStage() {
   // could start with the left drawer stuck open.
   cancelLeftCornerDwell();
   leftCornerTrigger = null;
+  // (2026-08-25) Drawer-tab sync observers — release with the stage so a
+  // re-wireStage re-creates them fresh + reset-time class flips can't sync
+  // into a torn-down stage.
+  if (wupiTabObserver) { wupiTabObserver.disconnect(); wupiTabObserver = null; }
+  if (leftTabObserver) { leftTabObserver.disconnect(); leftTabObserver = null; }
   saveModalClose = null;
   // (2026-08-19) Cascade-delete confirm state: a close mid-confirm must not
   // leave the modal ref alive (Esc on the next session would call a stale
@@ -1929,6 +2144,13 @@ export function teardownStage() {
   // re-entry starts clean (their transient listeners go with them).
   ghost.teardownGhostWriter();
   crossroads.teardownCrossroads();
+  // (2026-08-24 review P1) Sweep the centered popups that own DOCUMENT-level
+  // capture Esc handlers — the chronicle overlay (stage-appended, invisible
+  // to every other sweep) and the NPC dossier (panel-overlay-appended).
+  // Without this, a stage exit with one open re-appeared over the next
+  // session with a live Esc handler stealing Escape from other modals.
+  closeChroniclePanel();
+  closeNpcDossier();
   // Clear the toast timer so it can't fire into a torn-down element after
   // close (was a residual-state gap — harmless but not clean).
   if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
@@ -1953,8 +2175,16 @@ export function teardownStage() {
   // Hide the typing indicator: the epoch guard can block a mid-exit turn's
   // late finishTurn (→ setGenerating(false)), and the reused stage DOM would
   // otherwise carry the visible label into the next session's first paint.
+  // (2026-08-25) Same rule for the jump-to-latest arrow + the form's
+  // has-typing flag (the arrow's above-the-indicator offset): a stage exit
+  // while scrolled up in history must not resurrect the arrow over the next
+  // session's fresh, bottom-pinned feed.
   const staleIndicator = stageRoot && stageRoot.querySelector('[data-typing-indicator]');
   if (staleIndicator) staleIndicator.classList.remove('is-visible');
+  const staleForm = stageRoot && stageRoot.querySelector('[data-input-form]');
+  if (staleForm) staleForm.classList.remove('has-typing');
+  const staleJump = stageRoot && stageRoot.querySelector('[data-jump-bottom]');
+  if (staleJump) staleJump.classList.remove('is-visible');
   // Reset the engine module state so a close mid-turn can't leave a stuck
   // `generating` (would no-op the next session's first send) or a dangling
   // activeBeat, and so the Wupi drawer starts fresh next entry.
@@ -1975,6 +2205,9 @@ export function teardownStage() {
   // Alt+F4). The raw editor's atomic-write backend means the file on disk is
   // always the last successfully-saved state regardless.
   resetTabRail();
+  // (2026-08-23 Playground) Same teardown rule: the strip collapses + the
+  // wand unpresses (the domain selection is retained by design).
+  resetPlayground();
   resetRawEditor();
   // Selection popup teardown: the golden-pencil slice-regen layer (sliceApi
   // above) owns its own document-level listeners + the floating pencil element

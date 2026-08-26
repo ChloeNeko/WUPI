@@ -76,12 +76,12 @@ test('buildIdCard: player drops empty cells + empty extra sections', () => {
 test('buildIdCard: player surfaces distinctive, inventory, custom tags', () => {
   const m = buildIdCard('player', {
     name: 'Nyx', race: 'tiefling', horn: 'curled', ears: 'pointed',
-    gear: ['compass', 'rope'], equipped: ['dagger'], accessories: 'silver locket',
+    stored: ['compass', 'rope'], equipped: ['dagger'], accessories: 'silver locket',
     custom_tags: { curse: 'moon-bound', faction: 'thieves guild' },
   });
   const e = byTitle(m);
   assert.deepEqual(e.Distinctive, [['Ears', 'pointed'], ['Horn', 'curled']]);
-  // v2: one Inventory extra — Equipped/Accessories/Stored rows (legacy gear
+  // v2: one Inventory extra — Equipped/Accessories/Stored rows (flat draft
   // folds to Stored).
   assert.deepEqual(e.Inventory, [
     ['Equipped', 'dagger'],
@@ -102,7 +102,7 @@ test('buildIdCard: sim npc = player layout (NAME header — no NPC chip, 2026-08
     hair_color: 'auburn', eye_color: 'brown', height: "5'6\"", weight: '130 lb',
     personality: 'warm', flaws: 'curious', likes: 'songs', dislikes: 'nobles',
     dialogue_style: 'cheery', backstory: 'exile', goal: 'buy the tavern', tone: 'cozy',
-    gear: ['compass'], accessories: ['silver locket'],
+    stored: ['compass'], accessories: ['silver locket'],
     date: 'Day 1', time: '09:00', weather: 'clear', location: 'Tavern',
   });
   assert.equal(m.variant, 'player');
@@ -124,7 +124,7 @@ test('buildIdCard: sim npc = player layout (NAME header — no NPC chip, 2026-08
   assert.ok(e['World'] && e['World'].find(([l]) => l === 'Weather'));
   assert.ok(e['World'].find(([l]) => l === 'Location'));
   assert.ok(e['World'].find(([l]) => l === 'Tone'));
-  // The inventory answers surface as the Inventory extra (legacy gear →
+  // The inventory answers surface as the Inventory extra (flat draft
   // Stored, accessories their own row).
   assert.ok(e.Inventory && e.Inventory.find(([l]) => l === 'Stored'));
   assert.ok(e.Inventory.find(([l]) => l === 'Accessories'));

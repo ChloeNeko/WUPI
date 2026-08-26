@@ -387,6 +387,31 @@ pub fn resolve_expired_tasks(tasks: &[OffScreenTask], now_minutes: i64) -> Vec<T
         .collect()
 }
 
+/// (2026-08-24 reaped-owner fix) The live-owner gate over
+/// [`resolve_expired_tasks`]: every task whose NPC the reaper has archived
+/// (`npc_interior.archived` stub set) — or whose registry entry was evicted
+/// outright — is STALE and drops from the queue WITHOUT resolving or
+/// narrating. The ungated path resolved + narrated due tasks for gone
+/// NPCs, resurrecting dead characters in `[DIRECTIVE]` lines ("Marcus
+/// returns from his scouting mission" about an NPC the world archived
+/// days ago). The reaper itself refuses to archive open-task holders
+/// (`reaper_protection_reason` → `open-task`), so this is the backstop for
+/// the residual leaks: a `[TASK]` logged AFTER the archive (the tracker
+/// narrating a ghost — logging never un-archives), evicted interiors, and
+/// hand-edited saves. Mirrors [`select_focus`]'s player-bubble exclusion
+/// set in shape. Pure; the caller derives the set (schema lock held) and
+/// owns the post-resolution drain ([`remove_resolved_tasks`]).
+pub fn resolve_expired_tasks_gated(
+    tasks: &mut Vec<OffScreenTask>,
+    now_minutes: i64,
+    stale_owners: &std::collections::HashSet<String>,
+) -> Vec<TaskResolution> {
+    if !stale_owners.is_empty() {
+        tasks.retain(|t| !stale_owners.contains(&t.npc_id));
+    }
+    resolve_expired_tasks(tasks, now_minutes)
+}
+
 /// Remove the tasks a tick's resolutions consumed, in place (the tick's
 /// queue-drain step). One removal slot per resolution, keyed on the
 /// (npc_id, description, DC) tuple.
@@ -889,6 +914,63 @@ mod tests {
         }];
         let resolutions = resolve_expired_tasks(&tasks, 5000);
         assert!(resolutions.is_empty(), "resolved tasks must not re-roll");
+    }
+
+    // ---- resolve_expired_tasks_gated (the reaped-owner fix, 2026-08-24) ----
+
+    /// A due task owned by a REAPED (archived) NPC must neither resolve nor
+    /// narrate — it drops from the queue as stale. A due task owned by a
+    /// live NPC resolves normally through the same call.
+    #[test]
+    fn gated_resolution_drops_reaped_owner_tasks() {
+        let mut tasks = vec![
+            task("marcus", "scout the pass", 1000), // owner live — resolves
+            task("ghost", "deliver the letter", 1000), // owner reaped — drops
+        ];
+        let mut stale = HashSet::new();
+        stale.insert("ghost".to_string());
+        let resolutions = resolve_expired_tasks_gated(&mut tasks, 2000, &stale);
+        assert_eq!(resolutions.len(), 1, "only the live owner's task resolves");
+        assert_eq!(resolutions[0].npc_id, "marcus");
+        // The reaped owner's task is GONE from the queue — no future tick
+        // may resurrect it.
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].npc_id, "marcus");
+        // And the surviving task drains through the normal path.
+        remove_resolved_tasks(&mut tasks, &resolutions, 2000);
+        assert!(tasks.is_empty());
+    }
+
+    /// A not-yet-due task owned by a reaped NPC drops too — the owner is
+    /// gone from the world; waiting for the ETA would only defer the
+    /// resurrection.
+    #[test]
+    fn gated_resolution_drops_future_tasks_of_reaped_owners() {
+        let mut tasks = vec![
+            task("ghost", "deliver the letter", 9000), // due later
+            task("mira", "negotiate", 1000),           // live, due now
+        ];
+        let mut stale = HashSet::new();
+        stale.insert("ghost".to_string());
+        let resolutions = resolve_expired_tasks_gated(&mut tasks, 2000, &stale);
+        assert_eq!(resolutions.len(), 1);
+        assert_eq!(resolutions[0].npc_id, "mira");
+        assert!(tasks.iter().all(|t| t.npc_id != "ghost"));
+    }
+
+    /// An empty stale set behaves exactly like the ungated fn (the no-op
+    /// fast path — every tick where nobody was reaped).
+    #[test]
+    fn gated_resolution_empty_set_matches_ungated() {
+        let mut tasks = vec![
+            task("marcus", "scout the pass", 1000),
+            task("mira", "negotiate", 5000),
+        ];
+        let gated = resolve_expired_tasks_gated(&mut tasks, 2000, &HashSet::new());
+        let ungated = resolve_expired_tasks(&tasks, 2000);
+        assert_eq!(gated.len(), ungated.len());
+        assert_eq!(gated[0].npc_id, ungated[0].npc_id);
+        assert_eq!(tasks.len(), 2, "nothing dropped when nobody is stale");
     }
 
     // ---- remove_resolved_tasks (the tick's queue drain, yellow W2) ----

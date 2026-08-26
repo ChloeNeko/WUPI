@@ -77,8 +77,11 @@ function dismiss(el) {
 }
 
 /**
- * Show one turn-notice bubble. `kind` ∈ { 'injury', 'inventory' } —
- * anything else renders with the neutral inventory chrome.
+ * Show one turn-notice bubble. `kind` ∈ { 'injury', 'inventory', 'rest',
+ * 'skill' } — anything else renders with the neutral inventory chrome
+ * ('rest' is the 2026-08-23 rest-interruption bubble — a troubled sleep, not
+ * a wound; 'skill' is the 2026-08-24 rank-advance toast — mastery deepens,
+ * the level-up system's one surviving surface).
  * Silently no-ops when no stage screen is mounted.
  */
 export function showTurnNotice(kind, text) {
@@ -94,7 +97,10 @@ export function showTurnNotice(kind, text) {
   const kids = [...root.children];
   const tops = kids.map((k) => k.getBoundingClientRect().top);
   const el = document.createElement('div');
-  el.className = 'fable-turn-notice' + (kind === 'injury' ? ' is-injury' : '');
+  el.className = 'fable-turn-notice'
+    + (kind === 'injury' ? ' is-injury' : '')
+    + (kind === 'rest' ? ' is-rest' : '')
+    + (kind === 'skill' ? ' is-skill' : '');
   el.textContent = String(text); // textContent — never HTML
   root.insertBefore(el, root.firstChild);
   flip(kids, tops);

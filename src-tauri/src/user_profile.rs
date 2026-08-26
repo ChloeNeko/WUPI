@@ -117,12 +117,11 @@ fn indent(block: &str) -> String {
 /// live edits take effect on the very next `chat_send` (no watcher, no cache -
 /// see the module docs for why per-turn re-read is the right call).
 ///
-/// - `None` path → `None` (no Operator.xml resolved at startup; Wupi runs
+/// - `None` path → `None` (no user.xml resolved at startup; Wupi runs
 ///   without a profile: the common case until the operator authors one).
 /// - `Some(path)` missing or malformed → `None`, debug-logged. Debug (not
 ///   warn) because this fires every turn when the file is absent, and a warn
-///   per turn would spam the log. The startup resolution already logged the
-///   one-time "no Operator.xml" notice.
+///   per turn would spam the log.
 /// - `Some(path)` valid → `Some(UserProfile)`.
 ///
 /// This single function implements hot-reload + graceful degradation in one
@@ -142,7 +141,7 @@ pub fn load(path: Option<&Path>) -> Option<UserProfile> {
     }
 }
 
-/// Serialize a profile back to `Operator.xml` and write it atomically.
+/// Serialize a profile back to `data/user.xml` and write it atomically.
 ///
 /// The inverse of [`load`]: renders both fields as `<user_profile>` XML
 /// with every field CDATA-wrapped (so prose containing quotes, angle brackets,
@@ -152,7 +151,7 @@ pub fn load(path: Option<&Path>) -> Option<UserProfile> {
 /// §2F guard.
 ///
 /// **Atomic write** (temp file → fsync → rename over the target) so a crash or
-/// power loss mid-write can never truncate `Operator.xml`: mirrors the atomic
+/// power loss mid-write can never truncate the profile file: mirrors the atomic
 /// pattern in `session.rs` (AGENTS.md §2E). The temp lives next to the target
 /// (same volume → `rename` is atomic; on Windows it uses
 /// `MOVEFILE_REPLACE_EXISTING`).
@@ -212,7 +211,7 @@ fn render_xml(profile: &UserProfile) -> String {
     )
 }
 
-/// Parse a `Operator.xml` profile from its XML text. Separated from `load` so
+/// Parse a `user.xml` profile from its XML text. Separated from `load` so
 /// the unit tests exercise the parser without touching the filesystem. Root
 /// must be `<user_profile>`; the two child tags are both optional and default
 /// to empty strings. CDATA is already merged into `.text()` by roxmltree, so
@@ -222,7 +221,7 @@ fn render_xml(profile: &UserProfile) -> String {
 /// **Backward compat (2026-07-17 simplification):** the old 4-field format
 /// (name/role/background/dynamics) is silently tolerated: `role` is dropped,
 /// and `background` + `dynamics` (if present) are concatenated into
-/// `description` so an old Operator.xml isn't lost on first load. The next
+/// `description` so an old 4-field profile isn't lost on first load. The next
 /// save rewrites it in the new 2-field shape.
 fn parse(xml: &str) -> anyhow::Result<UserProfile> {
     let doc = roxmltree::Document::parse(xml)
@@ -377,9 +376,9 @@ partner, not a yes-man. Build WUPI alongside her.
     #[test]
     fn load_returns_none_for_missing_file() {
         // A path that doesn't exist → None (graceful, not an error). This is
-        // the hot-reload deletion case: deleting Operator.xml mid-chat silently
+        // the hot-reload deletion case: deleting user.xml mid-chat silently
         // suppresses the section on the next turn.
-        let bogus = Path::new("/this/does/not/exist/Operator.xml");
+        let bogus = Path::new("/this/does/not/exist/user.xml");
         assert!(load(Some(bogus)).is_none());
     }
 
@@ -398,34 +397,30 @@ partner, not a yes-man. Build WUPI alongside her.
     }
 
     #[test]
-    fn shipped_operator_xml_parses_and_renders() {
-        // Integration check against the REAL seed profile shipped in the repo.
-        // Guards against hand-edits to cards/Operator.xml breaking the parse
-        // (a malformed profile silently suppresses the section at runtime -
-        // this test makes a regression visible in CI instead). Locates the file
-        // relative to CARGO_MANIFEST_DIR (src-tauri/).
+    fn shipped_user_xml_parses() {
+        // Integration check against the REAL shipped template (`data/user.xml`
+        // — git-tracked, so a missing file is a packaging regression, not a
+        // skip). Guards against hand-edits breaking the parse: a malformed
+        // profile silently suppresses the <user_profile> section at runtime —
+        // this test makes that regression visible in CI instead. Locates the
+        // file relative to CARGO_MANIFEST_DIR (src-tauri/).
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
-            .join("cards")
-            .join("Operator.xml");
-        let xml = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(_) => {
-                // File is optional in the format contract; skip rather than
-                // fail if the tree doesn't ship it (e.g. a fresh checkout
-                // before authoring). The parse logic is covered by other tests.
-                eprintln!("Operator.xml not found at {}; skipping", path.display());
-                return;
-            }
-        };
-        let p = parse(&xml).expect("shipped Operator.xml must parse cleanly");
-        let rendered = p.render_for_prompt();
-        assert!(rendered.starts_with("<user_profile>"), "rendered: {rendered}");
-        // The shipped seed ships both fields. CDATA content (description) must
-        // survive: if it were escaped instead of CDATA-wrapped, the prose
-        // wouldn't parse as text.
-        assert!(!p.name.trim().is_empty());
-        assert!(!p.description.trim().is_empty());
-        assert!(rendered.contains("description:"));
+            .join("data")
+            .join("user.xml");
+        let xml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("shipped data/user.xml must exist: {e}"));
+        let p = parse(&xml).expect("shipped user.xml must parse cleanly");
+        // The shipped template is the EMPTY seed (both fields blank CDATA) —
+        // it parses to empty strings and renders to "" (the section stays
+        // suppressed until the operator authors it via the User Editor).
+        // An authored file must keep working too: whatever the content, the
+        // parse never fails and the render contract holds ("" only when both
+        // fields are blank).
+        if p.name.trim().is_empty() && p.description.trim().is_empty() {
+            assert_eq!(p.render_for_prompt(), "");
+        } else {
+            assert!(p.render_for_prompt().starts_with("<user_profile>"));
+        }
     }
 }

@@ -196,3 +196,82 @@ test('codex tab: linking a library file writes the full ordered list back', asyn
   assert.equal(set.args.cardId, 'liam');
   assert.deepEqual(set.args.codices, ['World Lore', 'Monsters']);
 });
+
+// (2026-08-24 race fix) The link manager serializes its writes: while a
+// fable_codex_link_set is in flight, further row-action clicks are no-ops
+// (buttons disabled), and the next accepted click reorders the FRESHEST
+// committed order — rapid double-clicks used to compute two orders off the
+// same stale base and silently drop one.
+test('codex tab: an in-flight link write swallows rapid clicks, then reorders the fresh order', async () => {
+  const card = { name: 'Liam', subtype: 'npc', card_id: 'liam' };
+  const library = [
+    { name: 'World Lore', entry_count: 3 },
+    { name: 'Monsters', entry_count: 5 },
+  ];
+  const { rows, tabButtons } = buildCodexTab({ card, library, links: ['World Lore'] });
+  let liveLinks = ['World Lore'];
+  let release = null;
+  const gate = new Promise((r) => { release = r; });
+  invokeImpl = async (cmd, args) => {
+    if (cmd === 'fable_card_get') return card;
+    if (cmd === 'fable_codex_library_list') return library;
+    if (cmd === 'fable_codex_link_get') return liveLinks;
+    if (cmd === 'fable_codex_link_set') { await gate; liveLinks = args.codices; return null; }
+    return undefined;
+  };
+
+  tabButtons.find((b) => b.dataset.tab === 'codex').dispatch('click');
+  await settle();
+
+  const monsters = rows.find((r) => r.dataset.name === 'Monsters');
+  const linkBtn = monsters.__buttons.find((b) => b.dataset.act === 'link');
+  linkBtn.dispatch('click'); // the write goes in flight (gated)
+  await settle();
+  // Busy visual: the row actions carry the disabled state while pending.
+  assert.equal(linkBtn.disabled, true, 'row buttons disabled while the write is in flight');
+  // A rapid second click during the flight is ignored — no second IPC.
+  linkBtn.dispatch('click');
+  await settle();
+  assert.equal(calls.filter((c) => c.cmd === 'fable_codex_link_set').length, 1);
+
+  release();
+  await settle();
+  const sets = calls.filter((c) => c.cmd === 'fable_codex_link_set');
+  assert.equal(sets.length, 1, 'the swallowed double-click never reached the IPC');
+  assert.deepEqual(sets[0].args.codices, ['World Lore', 'Monsters']);
+  assert.equal(linkBtn.disabled, false, 'buttons re-enable once the write settles');
+
+  // The NEXT accepted click applies to the fresh committed order.
+  const lore = rows.find((r) => r.dataset.name === 'World Lore');
+  lore.__buttons.find((b) => b.dataset.act === 'down').dispatch('click');
+  await settle();
+  const setsAfter = calls.filter((c) => c.cmd === 'fable_codex_link_set');
+  assert.equal(setsAfter.length, 2);
+  assert.deepEqual(setsAfter[1].args.codices, ['Monsters', 'World Lore']);
+});
+
+// (2026-08-22 ruling, wired 2026-08-24) The Player tab's head ✎ HIDES while
+// no SavedPlayer is bound (nothing to edit — the combined editor's read gate
+// fails whole-editor) and returns once fable_active_player_get resolves one.
+test('player tab: the head ✎ hides with no bound SavedPlayer, re-shows when one is bound', async () => {
+  const card = { name: 'Liam', subtype: 'npc', card_id: 'liam' };
+  const { headEditBtn, tabButtons } = buildCodexTab({ card, library: [], links: [] });
+  let attached = null;
+  invokeImpl = async (cmd) => {
+    if (cmd === 'player_state_get') return { body: {} };
+    if (cmd === 'fable_active_player_get') return attached;
+    if (cmd === 'fable_schema_get') return null;
+    return undefined;
+  };
+  const playerTab = tabButtons.find((b) => b.dataset.tab === 'player');
+
+  playerTab.dispatch('click');
+  await settle();
+  assert.equal(headEditBtn.hidden, true, '✎ hidden while no SavedPlayer is bound');
+
+  attached = { id: 'alex', name: 'Alex' };
+  rail.resetTabRail();
+  playerTab.dispatch('click');
+  await settle();
+  assert.equal(headEditBtn.hidden, false, '✎ visible once a SavedPlayer is bound');
+});

@@ -31,9 +31,11 @@
 import { renderMap } from './map.js';
 import { renderActionWheel } from './action-wheel.js';
 import { renderSkills } from './skills.js';
-import { renderParty } from './party.js';
+import { renderParty, wirePartyCards } from './party.js';
 import { renderCodex } from './codex.js';
 import { renderCraft } from './craft.js';
+import { renderChronicle } from './chronicle.js';
+import { closeNpcDossier } from '../engine/npc-dossier.js';
 
 let overlayEl = null;     // #fable-panel-overlay (created lazily, owned here)
 let hostEl = null;        // the panel content host inside the overlay
@@ -46,7 +48,9 @@ let onDismissCb = null;   // optional: stage's hide-overlay hook
 // absent — those foci no longer summon a panel (the typed inventory +
 // the paperdoll HUD own them now; see the header note). They fall
 // through to the codex/world-recap default.
-function classifyFocus(focus, entities) {
+//
+/// PURE: exported for tests (tests/manager.test.mjs).
+export function classifyFocus(focus, entities) {
   const f = (focus || '').toLowerCase();
   const keys = Object.keys(entities || {});
   const has = (prefix) => keys.some((k) => k.startsWith(prefix));
@@ -55,11 +59,18 @@ function classifyFocus(focus, entities) {
   if (/\bactions?|abilities|options|what can i\b/.test(f)) return 'actions';
   if (/\bskills?|stats?|abilities\b/.test(f)) return 'skills';
   if (/\bparty|companions?|npcs?|who.?s here|who is here\b/.test(f)) return 'party';
+  // (2026-08-24 Part II C3) The chronicle — the pin/rollback surface over
+  // the episodic memory turns. (2026-08-25 fix) every alternative is
+  // word-bounded on BOTH sides — the old bare alternates matched "turns"
+  // inside "returns"/"overturns" and routed them to the chronicle.
+  if (/\b(chronicles?|memor(?:y|ies)|turns|rollback)\b/.test(f)) return 'chronicle';
   if (/\bcraft|forge|alchemy|cook|kitchen|workshop\b/.test(f)) return 'craft';
   if (/\bcodex|lore|reference|world|summary|recap\b/.test(f)) return 'codex';
   // Fallback by what entities exist.
   if (has('loc_')) return 'map';
-  if (has('npc_')) return 'party';
+  // (2026-08-24) Both cast conventions route to the party panel — the
+  // flat `npc_*` keys and the live dotted `npc.<id>.<field>` keys.
+  if (has('npc_') || has('npc.')) return 'party';
   if (has('skill_')) return 'skills';
   return 'codex'; // default: the world reference (always has summary/events)
 }
@@ -71,6 +82,13 @@ const RENDERERS = {
   party: renderParty,
   codex: renderCodex,
   craft: renderCraft,
+  chronicle: renderChronicle,
+};
+
+// Post-render hooks: panels whose cards carry interactive wiring (the party
+// grid's dossier clicks). Keyed by panel type; called once after mount.
+const WIRERS = {
+  party: wirePartyCards,
 };
 
 export function initPanelManager(overlayElement, hostElement, opts = {}) {
@@ -87,9 +105,17 @@ export function initPanelManager(overlayElement, hostElement, opts = {}) {
 
 // Summon a panel. Routes by focus → renderer. Mounts into the overlay.
 export function summon(focus, entities, schema) {
+  // (2026-08-25) The NPC dossier mounts on the panel OVERLAY (outside the
+  // content host), so a summon over a stale dossier must sweep it — the
+  // sanctioned closer runs the full teardown (element + Esc listener).
+  closeNpcDossier();
   const type = classifyFocus(focus, entities);
   const html = (RENDERERS[type] || renderCodex)(entities, schema);
-  if (hostEl) hostEl.innerHTML = html;
+  if (hostEl) {
+    hostEl.innerHTML = html;
+    const wirer = WIRERS[type];
+    if (wirer) wirer(hostEl);
+  }
   if (overlayEl) {
     overlayEl.dataset.panelType = type;
     overlayEl.classList.add('open');
@@ -99,6 +125,10 @@ export function summon(focus, entities, schema) {
 
 export function dismiss() {
   if (!overlayEl) return;
+  // (2026-08-25) The dossier lives on the panel OVERLAY, not the content
+  // host — clearing hostEl alone left it stacked over the next summon with
+  // its document-capture Esc listener still armed (stealing the next Esc).
+  closeNpcDossier();
   overlayEl.classList.remove('open');
   overlayEl.dataset.panelType = '';
   if (hostEl) hostEl.innerHTML = '';

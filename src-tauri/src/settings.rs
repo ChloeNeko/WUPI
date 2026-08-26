@@ -123,14 +123,48 @@ pub const CTX_FABLE: u32 = 8192;
 
 /// Schema-delta engine context. The micro-delta pass only needs system
 /// instruction + current schema JSON + one exchange (see schema_engine.rs).
-pub const CTX_SCHEMA: u32 = 2048;
+/// **2026-08-24: 2048 → 8192** (Chloe-authorized review, matching the
+/// tracker/chat contexts — the standing "all local contexts 8192" ladder).
+/// Measured composition of the WORLD-PROGRESSION tick prompt — the fattest
+/// schema-engine path: framing ~80 + system instruction 3,557 + schema JSON
+/// ≤4,000 (`SCHEMA_JSON_PROMPT_BUDGET_CHARS`) + interval paragraph ~500 ≈
+/// **8,137 chars ≈ 2,260 tokens at 3.6 chars/token — over the old
+/// 1,792-token prompt ceiling (2048 − 256) even with NO designated/evolution
+/// sections**; the realistic full composition approaches ~11k chars ≈ 3,080
+/// tokens, and the ALL-CAPS pathological composition (8 deferred attempts ×
+/// max-capped errors + both site sections saturated) reaches ~16.8k chars ≈
+/// 4,670 tokens. The middle-drop was therefore firing on healthy long
+/// campaigns, slicing into the system instruction and splicing the schema
+/// JSON the model must diff against — the exact duplicate-key spiral the
+/// piecewise caps exist to prevent. Every piece is already hard-capped (JSON
+/// 4k, evolution 2.3k, exchange 1.5k/side, deferred errors ≤400); the TOTAL
+/// outgrew 2048 — shrinking further would cut teaching or schema visibility,
+/// against the 2026-08-21 "never truncate" direction. 8192 gives a
+/// 7,936-token prompt ceiling ≈ 28.5k chars — even the all-caps composition
+/// fits with ~40% headroom, and the growth trajectory (the evolution
+/// section's budget rose 1400→1700→1900→2300 across 2026-08-22→24) has room
+/// before the composed-prompt pin trips again. Cost: KV worst-case linear
+/// ~120-190 MB (the same figure as the fable slot at 8192; sublinear in
+/// practice — the E4B's 512-token SWA layers don't grow), one-shot
+/// (clear+prefill per call) and swap-locked to single residency; prefill
+/// scales with ACTUAL prompt length (~2.3k realistic tokens), not n_ctx, so
+/// small prompts pay nothing for the headroom. The composed whole-prompt pin
+/// (`world_progression_prompt_worst_case_fits_schema_context`) is the
+/// authoritative guard on this path now.
+pub const CTX_SCHEMA: u32 = 8192;
 
 // ---------------------------------------------------------------------------
 // Visible-history windows (message counts, NOT tokens)
 // ---------------------------------------------------------------------------
 
-/// Local-only chat visible window (4 user↔assistant turns).
-pub const WINDOW_LOCAL_CHAT: usize = 8;
+/// Wupi-chat visible window. 16 messages = 8 user↔assistant turns (2026-08-24
+/// Chloe ruling — parity with the Fable narrator's [`WINDOW_API_FABLE`]). Both
+/// the local KV render and the hybrid API reply pass assemble the session at
+/// this window; the 8192 chat context absorbs it comfortably. History RESETS
+/// when the player exits the chat surface (`chat_reset` clears the
+/// conversation), so the window spans one sitting, never the process
+/// lifetime.
+pub const WINDOW_LOCAL_CHAT: usize = 16;
 
 /// API-connected Fable visible window (8 turns).
 pub const WINDOW_API_FABLE: usize = 16;
@@ -177,7 +211,7 @@ pub const WINDOW_TRACKER: usize = 2;
 pub const TRACKER_ASSISTANT_CHAR_CAP: usize = 1_200;
 
 /// (2026-08-16 bug 12) Per-side char cap for the exchange/request folded
-/// into the 2048-token schema prompts (delta + translation). The deferred
+/// into the schema-engine prompts (delta + translation). The deferred
 /// re-attempt entries were already capped at 200 chars while the LIVE
 /// exchange rode in verbatim — a long chat reply or player paste pushed the
 /// prompt over budget and the middle-drop deleted a contiguous band of the
@@ -188,7 +222,7 @@ pub const TRACKER_ASSISTANT_CHAR_CAP: usize = 1_200;
 pub const SCHEMA_EXCHANGE_CHAR_CAP: usize = 1500;
 
 /// (2026-08-16 yellow S4) TOTAL char budget for the schema JSON rendered into
-/// the 2048-token schema-engine prompts (`WorldSchema::to_json_prompt`). The
+/// the schema-engine prompts (`WorldSchema::to_json_prompt`). The
 /// per-field legal maxima (500 entities × 400-char values + summary + events)
 /// compose to ~25× the context; when the whole document would overflow, the
 /// renderer now trims entities (oldest first, `player.*` identity keys always
@@ -249,6 +283,15 @@ pub const API_TOP_P: f32 = 0.95;
 /// UNCAPPED (`None`): lorebook batch conversion legitimately needs long
 /// outputs and slice spans are short by construction.
 pub const API_NARRATOR_MAX_TOKENS: u32 = 800;
+
+/// (2026-08-24 hybrid chat) `max_tokens` for the WUPI-chat API reply pass.
+/// The real verbosity fix lives in `data/wupi.prompt`'s pacing law (answer
+/// first, no filler); this is the mechanical backstop so a runaway GLM reply
+/// can't wall-of-text the chat. 512 tokens ≈ 2 short paragraphs plus a fenced
+/// snippet — the pacing law asks for less; long file dumps belong in fenced
+/// blocks the tool transcript already bounded. The local fallback path is
+/// uncapped (it keeps its pre-hybrid decode shape).
+pub const API_WUPI_MAX_TOKENS: u32 = 512;
 
 /// (2026-08-22 Ghost Writer) `max_tokens` for the impersonation one-shot:
 /// the model writes the player's NEXT message in the player's voice. A

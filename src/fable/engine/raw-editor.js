@@ -127,6 +127,11 @@ let current = null;       // the active FILE_FOR entry
 let lastGood = '';        // the last successfully-saved text (JS-held revert target)
 let isValid = true;       // client-side validity flag (drives the lock)
 let onSavedCb = null;     // optional: refresh the dropdown after a save
+// (2026-08-24) True while openRawEditor's read() is still resolving. The
+// textarea is the EMPTY pre-fill in that window — a ✓ clicked there would
+// write '' over the real file (the codex wipe). ✓/↻ stay inert + revalidate
+// keeps its hands off until the text lands; ✕/Esc/backdrop still close.
+let loadPending = false;
 
 // Build the modal DOM once (called from stage.js buildStage). Hidden by
 // default. Returns the overlay element for stage.js to mount.
@@ -182,6 +187,7 @@ export async function openRawEditor(kind, onSaved, opts = {}) {
     codexFileName = name;
   }
   saveEpoch++;               // invalidate any save still resolving from a prior session
+  const epoch = saveEpoch;   // (2026-08-24) also invalidates THIS open's read continuation
   current = file;
   onSavedCb = onSaved || null;
   titleEl.textContent = kind === 'codex' && codexFileName
@@ -189,16 +195,26 @@ export async function openRawEditor(kind, onSaved, opts = {}) {
     : file.title;
   textareaEl.value = '';
   overlayEl.hidden = false;
+  // (2026-08-24) PENDING-LOAD LOCK: the read is in flight — ✓ + ↻ are inert
+  // (disabled + guarded) until the text lands, so the still-empty textarea
+  // can never be saved over the real file. ✕ / Esc / backdrop stay live.
+  loadPending = true;
+  saveBtn.disabled = true;
+  revertBtn.disabled = true;
   try {
     const text = await file.read();
     // card/codex reads can return empty for a fresh file; that's valid (the
     // editor starts blank for a new file). JSON tabs return '' too.
+    if (epoch !== saveEpoch) return; // superseded by a close/reopen mid-read
+    loadPending = false;
+    revertBtn.disabled = false;
     textareaEl.value = text || '';
     textareaEl.placeholder = '';   // clear any prior open's load-failure message
     lastGood = text || '';
     revalidate();
     setTimeout(() => textareaEl.focus(), 30);
   } catch (err) {
+    if (epoch !== saveEpoch) return; // the editor it failed in is gone
     console.warn('[fable] raw editor load failed', err);
     // (2026-08-22 Chloe) A failed read used to close the modal SILENTLY —
     // the ✎ read as dead ("nothing happens but the drawer closes"). Keep
@@ -208,6 +224,8 @@ export async function openRawEditor(kind, onSaved, opts = {}) {
     // so the empty text can never overwrite the real file. ✕ / Esc /
     // backdrop close normally.
     const msg = String(err && err.message ? err.message : err);
+    loadPending = false;
+    revertBtn.disabled = false;
     current = null;           // ✓ can never save over a file that failed to load
     lastGood = '';
     isValid = true;
@@ -246,6 +264,10 @@ let saveEpoch = 0;
 
 async function onSave() {
   if (!current || !isValid) return;
+  // (2026-08-24) Pending-load guard: the textarea is still the empty pre-fill
+  // — saving it would wipe the file (the button is disabled for this window;
+  // the guard is the authority for any programmatic path).
+  if (loadPending) return;
   // (2026-08-16 bug 5) Refuse while a narrator turn is in flight — the same
   // M5 discipline the inventory panel got. The editor's text is an OPEN-TIME
   // snapshot: a tracker turn landing behind the modal mutates the live
@@ -281,7 +303,10 @@ async function onSave() {
 }
 
 function onRevert() {
-  // Reset the textarea to the last-good text. Always works (no validity gate).
+  // Reset the textarea to the last-good text. Always works (no validity gate)
+  // — except mid-load, where there is no last-good yet (the pending window's
+  // empty revert would no-op confusingly at best).
+  if (loadPending) return;
   textareaEl.value = lastGood;
   revalidate();
   textareaEl.focus();
@@ -302,6 +327,8 @@ function closeModal() {
   overlayEl.hidden = true;
   current = null;
   onSavedCb = null;
+  loadPending = false;       // a close mid-read ends that window too
+  revertBtn.disabled = false;
   textareaEl.value = '';
   textareaEl.placeholder = '';
   lastGood = '';
@@ -315,6 +342,9 @@ function closeModal() {
 // check just keeps ✓ disabled + ✕ refusing while obviously broken, so the
 // user gets immediate feedback without a round-trip).
 function revalidate() {
+  // Mid-load the textarea holds no real text yet — the pending-load lock owns
+  // ✓'s state in that window (typing into the pre-fill can't re-arm it).
+  if (loadPending) return;
   const text = textareaEl.value;
   if (!text.trim()) {
     // An empty file is valid for a fresh card/codex (the editor starts blank).

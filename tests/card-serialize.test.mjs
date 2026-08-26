@@ -117,13 +117,13 @@ test('serializePlayer: new fields (horn/custom_tags/inventory) emitted when pres
   const { player } = serializePlayer({
     name: 'Nyx', race: 'tiefling', horn: 'curled red', job: 'thief',
     equipped: ['Notched Iron Broadsword'],
-    gear: ['compass', '  ', 'rope'],
+    stored: ['compass', '  ', 'rope'],
     custom_tags: { curse: 'moon-bound', night_vision: 'keen', blank: '' },
   });
   assert.equal(player.horn, 'curled red');
   // job is a persona member (the final-question offer) — Occupation line.
   assert.equal(player.persona.occupation, 'thief');
-  // equipped rides the inventory sibling seed; legacy gear folds to stored.
+  // equipped + stored ride the inventory sibling seed.
   assert.deepEqual(player.inventory.equipped, ['Notched Iron Broadsword']);
   assert.deepEqual(player.inventory.stored, ['compass', 'rope']);
   assert.deepEqual(player.custom_tags, { curse: 'moon-bound', night_vision: 'keen' }); // blank value dropped
@@ -131,7 +131,7 @@ test('serializePlayer: new fields (horn/custom_tags/inventory) emitted when pres
 
 test('serializePlayer: new optional fields omitted when absent', () => {
   const { player } = serializePlayer({ name: 'A' });
-  for (const k of ['horn', 'job', 'weakness', 'distinguishing_marks', 'gear', 'tools', 'weapons', 'custom_tags', 'persona', 'inventory']) {
+  for (const k of ['horn', 'job', 'weakness', 'distinguishing_marks', 'custom_tags', 'persona', 'inventory']) {
     assert.ok(!(k in player), `${k} should be omitted when absent`);
   }
 });
@@ -327,7 +327,7 @@ test('serializeSimCard: world branch emits subtype + setting + world sibling', (
 test('serializeSimCard: npc branch emits identity/persona line blocks + inventory sibling, NO cast', () => {
   const { xml } = serializeSimCard({
     card_type: 'npc', name: 'Mara', gender: 'female', race: 'human', hair_color: 'auburn',
-    clothing: ['apron'], accessories: ['silver locket'], gear: ['compass'],
+    clothing: ['apron'], accessories: ['silver locket'], stored: ['compass'],
     personality: 'warm', flaws: 'curious', likes: 'river songs',
     dislikes: 'nobles', job: 'innkeep', backstory: 'exile', dialogue_style: 'cheery',
     goal: 'buy the tavern', tone: 'cozy', date: 'Day 1', time: '09:00', weather: 'clear', location: 'Tavern',
@@ -343,10 +343,10 @@ test('serializeSimCard: npc branch emits identity/persona line blocks + inventor
   assert.ok(xml.includes('Occupation: innkeep'));
   assert.ok(xml.includes('Goals: buy the tavern'), 'goal → the Goals persona line');
   assert.ok(xml.includes('Backstory: exile'));
-  // The inventory sibling: clothing + accessories + stored (legacy gear).
+  // The inventory sibling: clothing + accessories + stored.
   assert.ok(xml.includes('Clothing: apron'));
   assert.ok(xml.includes('Accessories: silver locket'));
-  assert.ok(xml.includes('Stored: compass'), 'legacy gear folds to Stored');
+  assert.ok(xml.includes('Stored: compass'), 'stored rides the Stored line');
   // Tone rides the <world> sibling (a world anchor, never card-level).
   assert.ok(xml.includes('Tone: cozy'));
   assert.ok(!xml.includes('<tone>'));

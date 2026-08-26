@@ -110,14 +110,14 @@ test('buildReviewSections: player drops empty rows', () => {
 test('buildReviewSections: player surfaces horn, inventory, persona, custom tags — never wealth/reputation', () => {
   const secs = buildReviewSections('player', {
     name: 'Nyx', race: 'tiefling', horn: 'curled',
-    gear: ['compass', 'rope'], equipped: ['dagger'],
+    stored: ['compass', 'rope'], equipped: ['dagger'],
     job: 'thief', backstory: 'orphan',
     wealth: '200 gold', reputation: '-20',
     custom_tags: { curse: 'moon-bound', guard_reputation: '-20' },
   });
   const byName = Object.fromEntries(secs);
   assert.deepEqual(byName.Distinctive, [['Horn', 'curled']]);
-  // v2: legacy gear folds to the Stored row; equipped is its own line.
+  // v2: stored renders as the Stored row; equipped is its own line.
   assert.ok(byName.Inventory.find(([l]) => l === 'Stored'));    // chip list joined
   assert.ok(byName.Inventory.find(([l]) => l === 'Equipped'));
   // job + backstory surface under the opt-in Persona group.
@@ -696,7 +696,7 @@ test('missingMandatoryFields: npc items questions — must be asked, may be decl
   assert.deepEqual(missingMandatoryFields('sim', { ...base, items_answered: false }), []);
   // ANY filled item field counts as asked — no marker needed.
   assert.deepEqual(missingMandatoryFields('sim', { ...base, accessories: ['silver locket'] }), []);
-  assert.deepEqual(missingMandatoryFields('sim', { ...base, gear: ['compass'] }), []);
+  assert.deepEqual(missingMandatoryFields('sim', { ...base, stored: ['compass'] }), []);
   // The gate is npc-only: scenario/world drafts never carry it.
   const scen = { card_type: 'scenario', name: 'A', directive: 'd', trigger_condition: 't',
     primary_objective: 'o', participating_actors: ['b'], tone: 't', ...SIM_BASE, intro_answered: false };

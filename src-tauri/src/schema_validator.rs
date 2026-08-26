@@ -68,8 +68,12 @@ const MAX_SUMMARY_LEN: usize = 4_000;
 const MAX_EVENTS_PER_DELTA: usize = 20;
 const MAX_EVENT_LEN: usize = 1_000;
 const MAX_ENTITY_KEYS_PER_DELTA: usize = 50;
-const MAX_KEY_LEN: usize = 200;
-const MAX_VALUE_LEN: usize = 4_000;
+// (2026-08-22 multihog WS5) pub(crate): the schema engine's full-emit
+// fallback normalizes its lenient parse against the SAME clamps the
+// validator enforces, so a normalized fallback output can never fail
+// validation on length alone.
+pub(crate) const MAX_KEY_LEN: usize = 200;
+pub(crate) const MAX_VALUE_LEN: usize = 4_000;
 
 /// Future-phase extension point. Today the validator runs with
 /// `ValidationContext::default()` (no spatial graph, no typed entity specs).

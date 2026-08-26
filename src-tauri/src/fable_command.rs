@@ -188,7 +188,7 @@ pub fn render_translation_prompt(
                 "  {}. prior request: {:?}\n     prior errors: {}\n",
                 i + 1,
                 trigger.chars().take(200).collect::<String>(),
-                attempt.errors
+                crate::schema_engine::cap_attempt_error_chars(&attempt.errors)
             ));
         }
     }
@@ -258,7 +258,7 @@ pub fn render_bootstrap_prompt(
 
 const BOOTSTRAP_INSTRUCTION: &str = "\
 You are deriving the starting world-state anchors for a roleplay scene from its\n\
-opening narration. Read the opening scene + extract three anchors the scene\n\
+opening narration. Read the opening scene + extract the anchors the scene\n\
 establishes, emitting each as a JSON field (omit any the scene does not set):
 
 {\n\
@@ -275,6 +275,9 @@ establishes, emitting each as a JSON field (omit any the scene does not set):
      fields.\n\
   \"location_name\": \"<diegetic name>\" — the place's full prose name\n\
      (e.g. \"The Crooked Lantern\").\n\
+  \"arcana\": \"<resource name>\" — the arcane resource the opening scene\n\
+     names (mana, biotics, rage, ki). One short word. Omit when the fiction\n\
+     has no such resource.\n\
 }\n\
 \n\
 Rules:\n\
@@ -450,6 +453,7 @@ mod tests {
             trigger: Some("prior failed request".to_string()),
             errors: "pass 1 parse: ... | pass 2 validation: ...".to_string(),
             passes_used: 3,
+            surface: crate::schema_engine::DeltaSurface::Chat,
         }];
         let prompt = render_translation_prompt(
             "new request",

@@ -120,9 +120,19 @@ impl CrossroadsCategory {
 /// The system prompt for the options draw. The identity cache blocks
 /// (`<player>`, `<sim_card>`) and the live `<world_state>` are appended by
 /// the IPC command after this text, mirroring the narrator cache order.
+/// (2026-08-22 living-world) The GROUNDING LAW: every option respects what
+/// the `<world_state>` shows as true right now — it spends, offers, and
+/// promises only what the player actually holds, and treats the site as it
+/// stands. The world_state block lands immediately after this text in the
+/// assembled message, so the law sits right on top of the facts.
+/// (2026-08-24 Part II A4) Three more grounding teeth: resource
+/// eligibility (>0 in world_state), map-real obstacles (no invented locked
+/// doors — offering such a check makes it real if chosen), and the inline
+/// declared skill DC ("— [Lockpicking DC 18]") which commits the moment
+/// the option is offered (the B3 pinned-DC referee pairs with it).
 pub fn options_system_prompt(category: CrossroadsCategory) -> String {
     format!(
-        "You are the crossroads keeper of an ongoing story. You read where the tale stands and offer the player real forks in the road.\n\n{}\n\nGround every option in the current scene: its place, its people, its live tensions. Make the options distinct in kind, not in shade. Each one is a door the player could open next.",
+        "You are the crossroads keeper of an ongoing story. You read where the tale stands and offer the player real forks in the road.\n\n{}\n\nGround every option in the current scene: its place, its people, its live tensions. Ground every option in what the world_state shows as true right now: an option spends, offers, or promises only what the player actually holds (funds, gear, standing), and treats the site as it stands (an open door is open; a locked one wants its key). A resource must be >0 in the world_state to be eligible for an option — never offer to spend, offer, or promise what the player does not hold. When the world_state carries a site slice: do not invent obstacles in options (locked doors, traps, barricades, sealed passages) unless that map already shows them — offering such a check makes it real if chosen; keep options map-real. An option that hinges on a skilled act declares its difficulty inline in the summary — em dash, then brackets: — [Lockpicking DC 18]. The declared DC is committed the moment the option is offered. Make the options distinct in kind, not in shade. Each one is a door the player could open next.",
         category.law()
     )
 }
@@ -257,6 +267,30 @@ mod tests {
         assert!(out[0].summary.starts_with("The player draws"));
     }
 
+    /// (2026-08-24 Part II A4) The three grounding teeth on the options
+    /// draw: resource eligibility, map-real obstacles, and the committed
+    /// inline skill DC.
+    #[test]
+    fn options_prompt_carries_grounding_laws() {
+        let prompt = options_system_prompt(CrossroadsCategory::Player);
+        assert!(
+            prompt.contains("must be >0 in the world_state"),
+            "resource-eligibility law missing"
+        );
+        assert!(
+            prompt.contains("keep options map-real"),
+            "map-real obstacle law missing"
+        );
+        assert!(
+            prompt.contains("— [Lockpicking DC 18]"),
+            "inline DC form missing"
+        );
+        assert!(
+            prompt.contains("committed the moment the option is offered"),
+            "DC commitment law missing"
+        );
+    }
+
     #[test]
     fn strips_code_fences_before_parsing() {
         let fenced = format!("```json\n{}\n```", sample_json());
@@ -354,5 +388,35 @@ mod tests {
         assert!(world.contains("Introduce no new characters"));
         let npc = options_system_prompt(CrossroadsCategory::Npc);
         assert!(npc.contains("NEW character"));
+    }
+
+    /// (2026-08-22 living-world) The GROUNDING LAW: every category's options
+    /// prompt demands options respect the live `<world_state>` — resource
+    /// limits (only what the player holds) + site layout facts. The
+    /// em-dash-free pin above polices the style; this pins the substance.
+    #[test]
+    fn options_prompt_carries_the_grounding_law() {
+        let cats = [
+            CrossroadsCategory::Player,
+            CrossroadsCategory::World,
+            CrossroadsCategory::Npc,
+            CrossroadsCategory::Plot,
+            CrossroadsCategory::Explicit,
+        ];
+        for cat in cats {
+            let p = options_system_prompt(cat);
+            assert!(
+                p.contains("what the world_state shows as true right now"),
+                "grounding law missing on {cat:?}"
+            );
+            assert!(
+                p.contains("only what the player actually holds"),
+                "resource grounding missing on {cat:?}"
+            );
+            assert!(
+                p.contains("treats the site as it stands"),
+                "site grounding missing on {cat:?}"
+            );
+        }
     }
 }

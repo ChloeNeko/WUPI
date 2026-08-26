@@ -19,9 +19,12 @@
 // `wupi_lib::parse_fable_cli` (also the single-instance forwarder's parser,
 // 2026-08-20 — one rule set, no drift) + stashed via set_launch_context()
 // before run(); setup() appends `?direct=1` to the URL + the frontend drives
-// the rest. `--save` defaults to None = Continue (the most-recently-played
-// session's live state). This is also the arg shape a generated desktop
-// shortcut (shortcut.rs) bakes into the .lnk.
+// the rest. `--save` REQUIRES `--session` (v0.30.0: a bare save_id with no
+// session context is refused by enter_fable_session rather than guessed —
+// only ancient .lnk payloads ever carried one; the shipped .lnk bakes
+// `--card` alone). `--save` defaults to None = Continue (the
+// most-recently-played session's live state). This is also the arg shape a
+// generated desktop shortcut (shortcut.rs) bakes into the .lnk.
 //
 // Single-instance: both exes share the identifier `com.wupi.desktop`, so they
 // are mutually exclusive (can't run wupi.exe + fable.exe at once). Launching

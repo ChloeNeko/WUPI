@@ -167,6 +167,13 @@ pub(crate) const TRACKER_MAX_TOKENS: i32 = 512;
 /// guard in lockstep (prompt + 512 generation must fit CTX_FABLE).
 pub(crate) const TRACKER_RETRACK_MAX_TOKENS: i32 = 512;
 
+/// (2026-08-23 WS6) The token wall for the off-turn memory-consolidation
+/// extraction pass (`FableTurnMode::Consolidator`): one fenced JSON object
+/// — a ≤600-char summary + ≤8 × ≤200-char events fits comfortably under
+/// 512 (the architect's wall for the same output class); the fence-aware
+/// sniper stays the primary stop.
+pub(crate) const CONSOLIDATOR_MAX_TOKENS: i32 = 512;
+
 // ---------------------------------------------------------------------------
 // The Rust Sniper — early-stop for tracker rambling (2026-08-10)
 // ---------------------------------------------------------------------------
@@ -330,6 +337,11 @@ impl TrackerSniper {
 ///   emits one fenced JSON object, and the sniper is fence-aware so the
 ///   fence body can't be decapitated), with `SITE_ARCHITECT_MAX_TOKENS`
 ///   (512) as its reserve.
+/// - **Consolidator** — (2026-08-23 WS6) the off-turn memory-consolidation
+///   extraction pass (`fire_memory_consolidation`): the SAME deterministic
+///   profile + refusal + sniper as the architect (it too emits one fenced
+///   JSON object), with `CONSOLIDATOR_MAX_TOKENS` (512) as its reserve.
+///   Bracket-anchor EXEMPT (the contract opens with a ```json fence).
 /// - **Narrator** — the dev-only local-narrator path: creative sampler,
 ///   front-truncate overflow valve, no sniper, `FABLE_MAX_TOKENS` reserve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,6 +350,7 @@ pub enum FableTurnMode {
     TrackerRetrack,
     Narrator,
     Architect,
+    Consolidator,
 }
 
 /// A request to the game thread: stream a narrator turn for `prompt`.
@@ -426,8 +439,13 @@ struct SamplerConfig {
 /// unit-testable without a loaded model.
 ///
 /// Rationale (per the blueprint):
-/// - Hyphen `"-"` / `" -"`: -10.0 (the original §11.40 Bug B defense —
-///   suppresses the hyphen-spam attractor).
+/// - Hyphen `"-"` / `" -"`: the original §11.40 Bug B defense — suppresses
+///   the hyphen-spam attractor. SPLIT 2026-08-24 (Chloe ruling): the bare
+///   `"-"` stays -10.0 (mid-word spam), but `" -"` is -5.0 here — the
+///   fable chain is tracker-only now, and the leading-space hyphen is the
+///   token every removal marker rides (`[PACK -x]`, `[LEDGER wealth -n]`,
+///   `[ARCANA -n]`); -10 fought the grammar. The chat table
+///   (`engine.rs::punct_bias_table`) keeps `" -"` at -10.0 (visible prose).
 /// - Comma `","`: -1.0 (mild — still available for natural sentence
 ///   structure, but kills the comma-splicing attractor from Finding B).
 /// - Semicolon `";"`: -10.0 (heavy — semicolons invite run-on attention).
@@ -445,8 +463,8 @@ struct SamplerConfig {
 /// proves insufficient under live play.
 fn punct_bias_table() -> &'static [(&'static str, f32)] {
     &[
-        ("-", -10.0),         // §11.40 Bug B — hyphen-spam defense (preserved)
-        (" -", -10.0),        // leading-space hyphen (same attractor)
+        ("-", -10.0),         // §11.40 Bug B — mid-word hyphen-spam defense (preserved)
+        (" -", -5.0),         // removal-marker token — halved (see doc above)
         (",", -1.0),          // mild — kills comma-splicing, keeps natural commas
         (";", -10.0),         // heavy — semicolons invite run-ons
         ("\u{2013}", -100.0), // en-dash — hard ban
@@ -479,7 +497,10 @@ fn resolve_punct_biases(model: &LlamaModel) -> Vec<LlamaLogitBias> {
 fn sampler_config(mode: FableTurnMode) -> SamplerConfig {
     if matches!(
         mode,
-        FableTurnMode::Tracker | FableTurnMode::TrackerRetrack | FableTurnMode::Architect
+        FableTurnMode::Tracker
+            | FableTurnMode::TrackerRetrack
+            | FableTurnMode::Architect
+            | FableTurnMode::Consolidator
     ) {
         SamplerConfig {
             temp: crate::settings::TEMP_TRACKER,
@@ -783,12 +804,14 @@ impl FableRuntime {
         // the tracker sees its syntax.
         // Reserve is MODE-AWARE (2026-08-10 fix + 2026-08-19 Architect): the
         // tracker needs only TRACKER_MAX_TOKENS (512) of generation reserve,
-        // the architect SITE_ARCHITECT_MAX_TOKENS (512 — one fenced site
-        // JSON object), the narrator FABLE_MAX_TOKENS (1024).
+        // the architect SITE_ARCHITECT_MAX_TOKENS (1024 — one fenced site
+        // JSON object; raised from 512 on 2026-08-24, real settlement maps
+        // overflowed the old wall), the narrator FABLE_MAX_TOKENS (1024).
         let reserve = match req.mode {
             FableTurnMode::Tracker => TRACKER_MAX_TOKENS,
             FableTurnMode::TrackerRetrack => TRACKER_RETRACK_MAX_TOKENS,
             FableTurnMode::Architect => crate::site_map::SITE_ARCHITECT_MAX_TOKENS,
+            FableTurnMode::Consolidator => CONSOLIDATOR_MAX_TOKENS,
             FableTurnMode::Narrator => FABLE_MAX_TOKENS,
         };
         let max_prompt = (FABLE_CTX as usize).saturating_sub(reserve as usize);
@@ -808,7 +831,10 @@ impl FableRuntime {
             // was bypassed or the tokenizer defied the chars/token ratio.
             if matches!(
                 req.mode,
-                FableTurnMode::Tracker | FableTurnMode::TrackerRetrack | FableTurnMode::Architect
+                FableTurnMode::Tracker
+                    | FableTurnMode::TrackerRetrack
+                    | FableTurnMode::Architect
+                    | FableTurnMode::Consolidator
             ) {
                 return Err(GenerationOutcome::GenerationErr(anyhow::anyhow!(
                     "TRACKER/ARCHITECT PROMPT OVERFLOW: {} tokens > {} max — refusing to decode a \
@@ -962,7 +988,10 @@ impl FableRuntime {
         // differs (see above).
         let deterministic = matches!(
             req.mode,
-            FableTurnMode::Tracker | FableTurnMode::TrackerRetrack | FableTurnMode::Architect
+            FableTurnMode::Tracker
+                | FableTurnMode::TrackerRetrack
+                | FableTurnMode::Architect
+                | FableTurnMode::Consolidator
         );
         let mut sampler = if deterministic {
             tracing::info!("sampler: tracker profile (temp=0.2, top_p=0.9, DRY allowed_length=1)");
@@ -993,6 +1022,31 @@ impl FableRuntime {
             tracing::warn!("sampler: could not resolve any punctuation tokens — logit bias disabled");
         }
         let eos = self.model.token_eos();
+        // (2026-08-22 Chloe ruling — instant bracket execution) The tracker
+        // pass's FIRST token is structurally anchored to '[': the
+        // brackets-only contract makes it the correct opener on 100% of
+        // tracker turns, and forcing it kills the preamble-leak failure
+        // class (a "Here are the changes:" line burning the wall before the
+        // first real bracket) at the source. The parser is verb-anchored, so
+        // even a degenerate continuation ("[Here are…") can never swallow a
+        // later real bracket. Architect + Consolidator passes are EXEMPT —
+        // their contracts open with a ```json fence, not a bracket. Resolution
+        // failure disables the anchor for the pass (the resolve_punct_biases
+        // defensive convention) rather than forcing a wrong token.
+        let anchor_bracket_open: Option<LlamaToken> =
+            if matches!(req.mode, FableTurnMode::Tracker | FableTurnMode::TrackerRetrack) {
+                self.model
+                    .str_to_token("[", AddBos::Never)
+                    .ok()
+                    .and_then(|v| v.first().copied())
+            } else {
+                None
+            };
+        if matches!(req.mode, FableTurnMode::Tracker | FableTurnMode::TrackerRetrack)
+            && anchor_bracket_open.is_none()
+        {
+            tracing::warn!("bracket anchor: could not resolve the '[' token — anchor disabled this pass");
+        }
         let mut n_cur = n_prompt;
         let mut step_batch = LlamaBatch::new(1, 1);
         let mut out = String::new();
@@ -1003,6 +1057,7 @@ impl FableRuntime {
             FableTurnMode::Tracker => TRACKER_MAX_TOKENS,
             FableTurnMode::TrackerRetrack => TRACKER_RETRACK_MAX_TOKENS,
             FableTurnMode::Architect => crate::site_map::SITE_ARCHITECT_MAX_TOKENS,
+            FableTurnMode::Consolidator => CONSOLIDATOR_MAX_TOKENS,
             FableTurnMode::Narrator => FABLE_MAX_TOKENS,
         };
         let max_tokens = base_cap
@@ -1094,8 +1149,31 @@ impl FableRuntime {
 
             // sample(&ctx, -1) reads logits from the last decoded position.
             // Same direct API the chat engine uses (engine.rs:773).
-            let new_token: LlamaToken = sampler.sample(&self.ctx, -1);
-            sampler.accept(new_token);
+            // (2026-08-22 Chloe ruling — instant bracket execution) On the
+            // FIRST generated token of an anchored tracker pass, consume the
+            // chain's draw (keeps every stage's sample/accept bookkeeping
+            // coherent) and override with the '[' token — accept() is
+            // token-agnostic, so DRY/history state advances off the anchor
+            // token and the rest of the turn samples normally.
+            let new_token: LlamaToken = if gen_count == 0 {
+                match anchor_bracket_open {
+                    Some(anchor) => {
+                        let _draw = sampler.sample(&self.ctx, -1);
+                        sampler.accept(anchor);
+                        tracing::debug!("bracket anchor: first token forced to '['");
+                        anchor
+                    }
+                    None => {
+                        let t = sampler.sample(&self.ctx, -1);
+                        sampler.accept(t);
+                        t
+                    }
+                }
+            } else {
+                let t = sampler.sample(&self.ctx, -1);
+                sampler.accept(t);
+                t
+            };
 
             if self.model.is_eog_token(new_token) || new_token == eos {
                 break;
@@ -1453,7 +1531,9 @@ mod tests {
         let as_map: std::collections::HashMap<&str, f32> = table.iter().copied().collect();
         // Hyphen defenses (Bug B) — preserved from the pre-Prong-2 inline form.
         assert_eq!(as_map.get("-"), Some(&-10.0), "hyphen bias preserved (Bug B)");
-        assert_eq!(as_map.get(" -"), Some(&-10.0), "leading-space hyphen bias preserved");
+        // 2026-08-24 split: the fable chain halves the leading-space hyphen —
+        // the removal-marker token. The chat table keeps -10.0.
+        assert_eq!(as_map.get(" -"), Some(&-5.0), "leading-space hyphen halved (removal markers)");
         // New Prong 2 entries.
         assert_eq!(as_map.get(","), Some(&-1.0), "comma bias is mild (-1.0)");
         assert_eq!(as_map.get(";"), Some(&-10.0), "semicolon bias is heavy (-10.0)");

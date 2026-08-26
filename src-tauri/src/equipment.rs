@@ -16,7 +16,7 @@
 //! `fable_json_raw_set(kind="player")` unchanged. All fields are `#[serde
 //! (default)]` so existing saves load without migration.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // The six equipment slots — map 1:1 to body-part anchors on the paperdoll.
@@ -121,34 +121,41 @@ impl EquipSlot {
 // ---------------------------------------------------------------------------
 
 /// A behavior tag on an inventory item. Drives which actions the Soul Gem
-/// inspection popup offers (CONSUME / EQUIP / POCKET). The closed three-value
+/// inspection popup offers (CONSUME / EQUIP / POUCH). The closed three-value
 /// domain keeps the tracker prompt + the frontend UI in lockstep via the
-/// snake_case serde form (`"consumable"` / `"equippable"` / `"pocketable"`):
+/// snake_case serde form (`"consumable"` / `"equippable"` / `"pouchable"`):
 /// the local model emits these in `[EQUIP/BELT/PACK ... tags=...]`, Rust parses
 /// them into the enum, and the frontend reads `item.tags` as an array of these
 /// strings to conditionally render actions (no client-side name heuristics).
 ///
 /// `Equippable` is the natural tag for items the player can wear/wield;
-/// `Consumable` for food/drink/potions/scrolls; `Pocketable` for small items
-/// that fit a belt pouch (rings, keys, vials, coins). An item may carry several
-/// (a "Healing Potion" is both Consumable + Pocketable).
+/// `Consumable` for food/drink/potions/scrolls; `Pouchable` for small
+/// valuables that fit the pouch (coins, keys, ID papers, gems — the 2026-08-23
+/// pouch ruling). An item may carry several (a "Healing Potion" is both
+/// Consumable + Pouchable).
+///
+/// (2026-08-23 pouch ruling) The variant was RENAMED from `Pocketable` —
+/// "pocketing" is retired. The serde `alias` keeps every pre-rename save +
+/// tracker emission loading (`"pocketable"` deserializes as `Pouchable`); the
+/// wire/serialize form is now `"pouchable"`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Debug)]
 #[serde(rename_all = "snake_case")]
 pub enum ItemTag {
     Consumable,
     Equippable,
-    Pocketable,
+    #[serde(alias = "pocketable")]
+    Pouchable,
 }
 
 impl ItemTag {
     /// Case-insensitive parse from a serde string (`"consumable"`). Returns
-    /// `None` for unknown tags — the parser drops these silently (same
-    /// leniency as every other bracket field).
+    /// `None` for unknown tags — the parser drops these silently (same leniency
+    /// as every other bracket field).
     pub fn from_id(s: &str) -> Option<ItemTag> {
         match s.trim().to_lowercase().as_str() {
             "consumable" => Some(ItemTag::Consumable),
             "equippable" | "equipable" => Some(ItemTag::Equippable),
-            "pocketable" | "pocket" => Some(ItemTag::Pocketable),
+            "pouchable" | "pouch" | "pocketable" | "pocket" => Some(ItemTag::Pouchable),
             _ => None,
         }
     }
@@ -159,12 +166,12 @@ impl ItemTag {
         match self {
             ItemTag::Consumable => "consumable",
             ItemTag::Equippable => "equippable",
-            ItemTag::Pocketable => "pocketable",
+            ItemTag::Pouchable => "pouchable",
         }
     }
 }
 
-/// Parse a comma-separated tag string (`"consumable, pocketable"`) into a
+/// Parse a comma-separated tag string (`"consumable, pouchable"`) into a
 /// deduped `Vec<ItemTag>` in canonical order. Unknown tags are dropped (no
 /// error). Empty/whitespace input → empty vec. Used by the bracket text parser
 /// (`tags=consumable,equippable`).
@@ -172,7 +179,7 @@ pub fn parse_tag_list(s: &str) -> Vec<ItemTag> {
     let mut out: Vec<ItemTag> = Vec::new();
     for raw in s.split(',') {
         // Strip JSON array + quote punctuation the model sometimes wraps tags
-        // in (`tags=["pocketable"]` → the text path sees `["pocketable"]`).
+        // in (`tags=["pouchable"]` → the text path sees `["pouchable"]`).
         // Trimming `[]{}"' ` recovers the bare tag id for `from_id`.
         let cleaned = raw.trim_matches(|c| matches!(c, '[' | ']' | '"' | '\'' | ' '));
         if let Some(t) = ItemTag::from_id(cleaned) {
@@ -211,7 +218,7 @@ pub struct EquippedItem {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<String>,
-    /// Behavior tags (`consumable`/`equippable`/`pocketable`). `#[serde
+    /// Behavior tags (`consumable`/`equippable`/`pouchable`). `#[serde
     /// (default)]` so existing saves without tags load as empty; empty vecs
     /// are skipped on serialize to keep the JSON tight.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -254,7 +261,12 @@ impl SlotLayers {
 pub type Equipment = HashMap<EquipSlot, SlotLayers>;
 
 // ---------------------------------------------------------------------------
-// Stackable items — belt (quick-access) + pack (deep storage).
+// Stackable items — belt (quick-access), pouch (wallet), + pack (deep storage).
+// The 2026-08-23 pouch ruling: "pocketing" (small items riding the pants/
+// belt as pockets) is RETIRED. Three carried stacks now — the belt stays the
+// toolbelt/quick rack, the POUCH is the wallet (currency, coins, keys, ID,
+// small valuables — auto-routed at acquisition by [`pouch_fit`]), and the
+// pack is the unbounded default everything else falls into.
 // ---------------------------------------------------------------------------
 
 /// A stackable item entry: name + quantity + per-unit weight (lbs) + optional
@@ -274,7 +286,7 @@ pub struct StackItem {
     pub weight: f32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stats: Option<String>,
-    /// Behavior tags (`consumable`/`equippable`/`pocketable`). `#[serde
+    /// Behavior tags (`consumable`/`equippable`/`pouchable`). `#[serde
     /// (default)]` so existing saves without tags load as empty; empty vecs
     /// are skipped on serialize to keep the JSON tight. When `stack_upsert`
     /// merges into an existing same-name entry, the union of both tag sets is
@@ -336,7 +348,7 @@ pub fn stack_weight(items: &[StackItem]) -> f32 {
 /// (2026-08-17 E4B shakedown P1a) The comparison normalizes BOTH sides — the
 /// parse-time `clean_item_name` gate already strips mangled quoting upstream,
 /// and the trim+lowercase match here is the merge-on-add backstop for entries
-/// minted by other paths (the Soul Gem UI, legacy saves): a re-acquisition of
+/// minted by other paths (the Soul Gem UI, hand-edited files): a re-acquisition of
 /// an existing item must stack, never append a twin the panel renders twice.
 pub fn stack_upsert(items: &mut Vec<StackItem>, item: StackItem) -> bool {
     let key = item.name.trim().to_lowercase();
@@ -353,7 +365,7 @@ pub fn stack_upsert(items: &mut Vec<StackItem>, item: StackItem) -> bool {
         }
         // Union the tag sets (monotonic: once a tag is known it's never
         // forgotten on a restack — a "Healing Potion" re-added with only the
-        // consumable tag keeps the pocketable tag it had before).
+        // consumable tag keeps the pouchable tag it had before).
         for t in &item.tags {
             if !existing.tags.contains(t) {
                 existing.tags.push(*t);
@@ -431,6 +443,109 @@ pub fn stack_remove(items: &mut Vec<StackItem>, name: &str, qty: u32) -> bool {
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// (2026-08-23 pouch ruling) The pouch — the player's wallet. Auto-routing
+// vocabulary, the same discipline as the garment router: pure name heuristic,
+// one list, consulted at every acquisition path. The JS twin lives in
+// src/fable/engine/pouch.js (the manual POUCH action gate) — keep the two
+// vocabularies in sync, same as GARMENT_OVER_VOCAB.
+// ---------------------------------------------------------------------------
+
+/// Whole-word needles that make a name POUCH-FIT (currency, coins, keys, ID
+/// papers, loose gems/small valuables — "anything that can fit in a wallet").
+/// Matched on the lowercased word tokens of the name.
+pub const POUCH_FIT_WORDS: &[&str] = &[
+    // Currency + coin.
+    "coin", "coins", "currency", "money", "cash", "change", "credits",
+    "coppers", "silvers", "golds", "shillings", "pennies", "pence",
+    "farthings", "banknote", "banknotes", "dollar", "dollars", "cent",
+    "cents", "nickel", "nickels", "dime", "dimes", "scrip", "voucher",
+    "vouchers", "piece", "pieces",
+    // Keys.
+    "key", "keys", "keycard", "keyring",
+    // ID + papers.
+    "id", "ids", "identity", "identification", "passport", "passports",
+    "visa", "visas", "license", "licence", "licenses", "licences",
+    "permit", "permits", "papers", "document", "documents", "deed",
+    "deeds", "certificate", "certificates", "credential", "credentials",
+    "diploma", "diplomas",
+    // Small valuables (loose stones — jewelry is GUARD-excluded below).
+    "gem", "gems", "gemstone", "gemstones", "jewel", "jewels",
+    "diamond", "diamonds", "ruby", "rubies", "sapphire", "sapphires",
+    "emerald", "emeralds", "opal", "opals", "pearl", "pearls",
+    "amethyst", "amethysts", "topaz", "topazes", "onyx", "garnet",
+    "garnets", "tourmaline", "tourmalines", "aquamarine", "peridot",
+    "zircon", "spinel", "ingot", "ingots", "nugget", "nuggets",
+    "signet", "token", "tokens", "wallet", "wallets", "purse",
+    "coinpurse",
+];
+
+/// Whole-word needles that VETO pouch-fit even when a fit word also appears —
+/// worn jewelry, household goods, and containers are not wallet cargo
+/// ("gold ring" is worn, "pearl necklace" is worn, "silver tray" is
+/// tableware, "copper pot" is cookware).
+pub const POUCH_GUARD_WORDS: &[&str] = &[
+    // Worn jewelry + adornments.
+    "ring", "rings", "earring", "earrings", "necklace", "necklaces",
+    "pendant", "pendants", "amulet", "amulets", "bracelet", "bracelets",
+    "bangle", "bangles", "crown", "crowns", "circlet", "tiara", "anklet",
+    "brooch", "choker", "torc", "armband", "armlet",
+    // Tableware + household valuables (valuable, but not wallet-sized).
+    "goblet", "chalice", "cup", "cups", "plate", "plates", "tray",
+    "trays", "platter", "platters", "bowl", "bowls", "candlestick",
+    "candelabra", "mirror", "mirrors", "brush", "brushes", "comb",
+    "combs", "spoon", "spoons", "fork", "forks", "statue", "statuette",
+    "figurine", "idol", "idols", "mask", "masks", "lantern", "lanterns",
+    "pot", "pans", "kettle", "teapot",
+    // Consumables + gear that merely LOOK coin-adjacent.
+    "bottle", "bottles", "vial", "vials", "flask", "flasks", "potion",
+    "potions", "knife", "knives", "dagger", "daggers", "sword", "swords",
+    "wire", "wires", "sheet", "sheets",
+    // Worn-carrier cargo — "change of CLOTHES" is not pocket change.
+    "clothes", "clothing", "garment", "garments", "outfit", "outfits",
+];
+
+/// Bare metal names that read as MONEY only in a short name ("3 gold", "gold
+/// pieces", "silver") — in a longer name they're material descriptors
+/// ("silver-trimmed saddle"), so the ≤2-word gate + the guard list carry them.
+pub const POUCH_METAL_WORDS: &[&str] = &["gold", "silver", "copper", "platinum", "electrum"];
+
+/// True when a name is wallet cargo — currency, coins, keys, ID papers, or a
+/// small valuable — and belongs in the player's POUCH rather than the pack.
+/// The acquisition paths consult this via [`stash_target`]; the manual POUCH
+/// action in the Soul Gem panel gates on the JS twin. Pure two-pass heuristic:
+/// guard words veto first (worn/tableware misreads), then fit words, then the
+/// short-name metal rule. Mirrored byte-for-byte in `engine/pouch.js`.
+pub fn pouch_fit(name: &str) -> bool {
+    let words = phrase_words(name);
+    if words.is_empty() {
+        return false;
+    }
+    if words.iter().any(|w| POUCH_GUARD_WORDS.contains(&w.as_str())) {
+        return false;
+    }
+    if words.iter().any(|w| POUCH_FIT_WORDS.contains(&w.as_str())) {
+        return true;
+    }
+    words.len() <= 2 && words.iter().any(|w| POUCH_METAL_WORDS.contains(&w.as_str()))
+}
+
+/// The default-stash router every acquisition path funnels through: a
+/// pouch-fitting name targets the POUCH stack, everything else the pack (the
+/// unbounded default — "everything by default falls into inventory"). Returns
+/// the target list + its prompt-facing label (for notices).
+pub fn stash_target<'a>(
+    name: &str,
+    pouch: &'a mut Vec<StackItem>,
+    pack: &'a mut Vec<StackItem>,
+) -> (&'a mut Vec<StackItem>, &'static str) {
+    if pouch_fit(name) {
+        (pouch, "pouch")
+    } else {
+        (pack, "pack")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -606,20 +721,19 @@ fn noun_phrase_windows(text: &str) -> Vec<(String, Vec<String>)> {
 }
 
 // ---------------------------------------------------------------------------
-// Legacy migration: item_*/inv_* entity keys → typed inventory (one-shot).
+// Garment/weapon keyword routing (2026-08-18 clothing-as-inventory ruling:
+// one router, one vocabulary).
 // ---------------------------------------------------------------------------
 
-/// Keyword→slot routing for the legacy `item_*`/`inv_*` entity migration, the
-/// Player Creator's clothing chips (2026-08-18 clothing-as-inventory ruling —
-/// one router, one vocabulary), AND the live garment auto-wear paths
-/// (2026-08-19: the `[PACK]` applier + the Soul Gem AUTO-FIT — clothes must
-/// land on the body, not in the bag). Pure heuristic on the lowercased name:
-/// a sword/axe/mace routes to MainHand, a shield to OffHand, etc. Anything
-/// that doesn't match returns `None` → the item lands in the pack instead.
-/// Mirrors the (deleted) `panels/inventory.js` glyph-picker heuristic,
-/// adapted to slot routing. `pub` because lib.rs consults it directly (the
-/// `[PACK]` auto-wear gate + the equippable-tag ensure).
-pub fn route_legacy_to_slot(name_lower: &str) -> Option<EquipSlot> {
+/// Keyword→slot routing — the single vocabulary behind the Player Creator's
+/// clothing chips, the NPC-card outfit split, and the live garment auto-wear
+/// paths (2026-08-19: the `[PACK]` applier + the Soul Gem AUTO-FIT — clothes
+/// must land on the body, not in the bag). Pure heuristic on the lowercased
+/// name: a sword/axe/mace routes to MainHand, a shield to OffHand, etc.
+/// Anything that doesn't match returns `None` → the item lands in the pack
+/// instead. `pub` because lib.rs consults it directly (the `[PACK]`
+/// auto-wear gate + the equippable-tag ensure).
+pub fn route_item_to_slot(name_lower: &str) -> Option<EquipSlot> {
     // Underwear claims FIRST (2026-08-19): the deepest layer's vocabulary is
     // word-boundary matched and shares no words with the weapon/garment
     // needles, so precedence here is about clarity, not collision-avoidance
@@ -722,7 +836,7 @@ pub fn route_legacy_to_slot(name_lower: &str) -> Option<EquipSlot> {
 }
 
 /// Whole-word routing table for names whose substring form would misroute
-/// (see `route_legacy_to_slot`'s tail). Checked AFTER every needle.
+/// (see `route_item_to_slot`'s tail). Checked AFTER every needle.
 fn word_routed_slot(name_lower: &str) -> Option<EquipSlot> {
     const WORD_ROUTES: &[(&str, EquipSlot)] = &[
         ("shorts", EquipSlot::Legs),
@@ -768,7 +882,7 @@ fn contains_any(hay: &str, needles: &[&str]) -> bool {
 /// Under-clothing vocabulary: garments whose LOGICAL layer is Inner (worn
 /// beneath whatever else holds the slot — a sock under a boot, a chemise
 /// under a gown). Consulted ONLY as a layer PREFERENCE and only when it
-/// AGREES with [`route_legacy_to_slot`] on the slot (the agreement gate keeps
+/// AGREES with [`route_item_to_slot`] on the slot (the agreement gate keeps
 /// a "Socketed Wand" — contains "sock" — routing MainHand/Outer, never Feet).
 /// Pure vocabulary, no state.
 fn under_garment_slot(name_lower: &str) -> Option<EquipSlot> {
@@ -866,11 +980,11 @@ fn underwear_slot(name_lower: &str) -> Option<EquipSlot> {
 /// Overness ranking within a slot — which garment sits on TOP when two share
 /// it (2026-08-19 NPC-perception upgrade). Higher = more outer. Consulted by
 /// every auto-placement path (the tracker's layer-less `[EQUIP]`, the `[PACK]`
-/// auto-wear, the clothing seeds, the legacy migration) so a cloak OVER a
+/// auto-wear, and the clothing seeds) so a cloak OVER a
 /// shirt never lands beneath it. Slot-local by design: rank only ever
 /// compares two garments contending for the SAME slot, so the vocabulary is
 /// per-slot and coarse. Pure heuristic on the lowercased name, mirroring
-/// [`route_legacy_to_slot`]'s substring scan.
+/// [`route_item_to_slot`]'s substring scan.
 fn garment_rank(slot: EquipSlot, name_lower: &str) -> u8 {
     match slot {
         // Chest: cloaks/coats/surcoats drape over everything; armor and
@@ -967,7 +1081,7 @@ pub enum Placement {
 /// NPC-perception upgrade, Chloe ruling: the system KNOWS where things
 /// belong — there is no UI affordance for it). ONE placement authority shared
 /// by the bracket `[EQUIP]` applier, the `[PACK]` auto-wear, the clothing
-/// seeds, and the legacy migration, so the layer a garment lands in can never
+/// seeds, so the layer a garment lands in can never
 /// disagree with the layer the narrator-render perceives it in.
 ///
 /// - `explicit = Some(layer)` (the tracker emitted `layer=`): respected
@@ -1312,186 +1426,14 @@ pub fn narrative_trips_exposure(narrative: &[&str]) -> bool {
     }
     false
 }
-
-/// Migrate legacy `item_*`/`inv_*` entity keys into the typed inventory model.
-/// Called once from `WorldSchema::load_split` after the body-key filter. For
-/// each legacy item key: strips the prefix, title-cases the name, routes to a
-/// slot by keyword (else pack), reads the entity's state string as a hint
-/// (`"equipped"` → slot Outer layer, `"N in pack"` → pack with qty N), then
-/// removes the entity key. Idempotent: a second run finds no legacy keys →
-/// no-op. Mutates `entities`, `equipment`, `belt`, and `pack` in place.
-///
-/// This is the single chokepoint that retires the old freeform-item convention
-/// (the deleted `panels/inventory.js` read-view) — once migrated, the typed
-/// model is the sole source of truth.
-pub fn migrate_legacy_items(
-    entities: &mut BTreeMap<String, serde_json::Value>,
-    equipment: &mut Equipment,
-    pack: &mut Vec<StackItem>,
-) {
-    // Collect first to avoid mutating while iterating (borrowck). Only
-    // bare-string values are legacy-convention states ("equipped", "3 in
-    // pack"); a widened structured value at an `item_*`/`inv_*` key is
-    // unrecognized noise — skip it (leave it in the entity map untouched).
-    // Sorted by key (2026-08-15 audit fix): HashMap iteration order is
-    // random per process, and when two legacy items route to the same slot
-    // the winner (outer vs inner vs pack fallback) was decided by hash
-    // order — the same save could migrate differently every boot.
-    let mut legacy: Vec<(String, String)> = entities
-        .keys()
-        .filter(|k| k.starts_with("item_") || k.starts_with("inv_"))
-        .cloned()
-        // pull the matching values via a second pass (can't borrow mut + immut together)
-        .into_iter()
-        .filter_map(|k| {
-            entities
-                .get(&k)
-                .and_then(|v| v.as_str().map(|s| (k, s.to_string())))
-        })
-        .collect();
-    legacy.sort_by(|a, b| a.0.cmp(&b.0));
-
-    for (raw_key, state_raw) in legacy {
-        // Strip the prefix → the item slug. Title-case it into a display name.
-        let slug = raw_key
-            .strip_prefix("item_")
-            .or_else(|| raw_key.strip_prefix("inv_"))
-            .unwrap_or(&raw_key);
-        let mut name = prettify(slug);
-        // (2026-08-16 audit LOW) Name hygiene before it enters the typed
-        // model (it persists to player.json + renders into the carry-back):
-        // drop empties entirely (an `item_` key with a bare slug migrates as
-        // a nameless ghost stack) + clamp oversize slugs to the INV_NAME_MAX
-        // discipline instead of storing a paragraph-long "name".
-        name = name.trim().chars().take(crate::bracket_parser::INV_NAME_MAX).collect();
-        if name.is_empty() {
-            entities.remove(&raw_key);
-            continue;
-        }
-        let name = name;
-        let state = state_raw.trim().to_lowercase();
-
-        // State hint: "equipped" → slot Outer; "N in pack" / "N" → pack qty N.
-        // The panel convention was freeform, so we read defensively.
-        let is_equipped = state == "equipped" || state == "worn" || state == "held";
-
-        if let Some(slot) = route_legacy_to_slot(&name.to_lowercase()) {
-            if is_equipped {
-                // Route through the shared placement authority (2026-08-19):
-                // under-clothing claims Inner, over-garments demote the
-                // incumbent beneath them, anything displaced rides to the
-                // pack — the same never-vaporize contract as before, now
-                // rank-aware. Legacy items carry no tags (the old entity
-                // convention had none) → default to empty; a future tracker
-                // turn may tag them.
-                let placement = place_equipped(
-                    equipment,
-                    slot,
-                    EquippedItem { name: name.clone(), stats: None, ..Default::default() },
-                    None,
-                    false,
-                );
-                if let Placement::Worn { displaced, .. } = placement {
-                    for d in displaced {
-                        stack_upsert(
-                            pack,
-                            StackItem { name: d.name, qty: 1, weight: 1.0, stats: None, ..Default::default() },
-                        );
-                    }
-                } else {
-                    // Both layers hold and the item doesn't outrank them →
-                    // pack.
-                    stack_upsert(
-                        pack,
-                        StackItem { name: name.clone(), qty: 1, weight: 1.0, stats: None, ..Default::default() },
-                    );
-                }
-            } else {
-                // Not marked equipped → pack it.
-                let qty = parse_qty_hint(&state);
-                stack_upsert(
-                    pack,
-                    StackItem { name: name.clone(), qty, weight: 1.0, stats: None, ..Default::default() },
-                );
-            }
-        } else {
-            // No slot routing → pack with a qty hint if present.
-            let qty = parse_qty_hint(&state);
-            stack_upsert(
-                pack,
-                StackItem { name: name.clone(), qty, weight: 1.0, stats: None, ..Default::default() },
-            );
-        }
-
-        // Remove the legacy key either way — it now lives in the typed model.
-        entities.remove(&raw_key);
-    }
-}
-
-/// Parse a quantity hint from a legacy entity state string. Recognizes
-/// `"3 in pack"`, `"3"`, `"x3"`, `"qty: 3"`; falls back to 1.
-fn parse_qty_hint(state: &str) -> u32 {
-    // Pull the first run of digits in the string.
-    let digits: String = state.chars().take_while(|c| c.is_ascii_digit()).collect();
-    if digits.is_empty() {
-        // Try "in pack" / "x N" shapes by scanning for any digit run.
-        for token in state.split_whitespace() {
-            let t: String = token.chars().filter(|c| c.is_ascii_digit()).collect();
-            if !t.is_empty() {
-                if let Ok(n) = t.parse::<u32>() {
-                    return n.max(1);
-                }
-            }
-        }
-        return 1;
-    }
-    digits.parse::<u32>().unwrap_or(1).max(1)
-}
-
-/// Title-case a slug: `"iron_sword"` → `"Iron Sword"`, `"health_potion"` →
-/// `"Health Potion"`. Mirrors the deleted `panels/inventory.js::prettify`.
-fn prettify(slug: &str) -> String {
-    slug.split('_')
-        .map(|seg| {
-            let mut c = seg.chars();
-            match c.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
-                None => String::new(),
-            }
-        })
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 // ---------------------------------------------------------------------------
 // (2026-08-18 clothing-as-inventory ruling) Clothing seeds / migrates into
 // the typed inventory — it is NOT an identity or appearance line.
 // ---------------------------------------------------------------------------
-
-/// Split a legacy `outfit` appearance-delta line ("bloodstained leather,
-/// travel cloak, muddy boots") into per-garment chips. The historical seed
-/// comma-joined the Player Creator's chip list into one delta value, so the
-/// comma split is exact for authored data and a fine heuristic for tracker
-/// output. Each chip is trimmed + capped at
-/// `crate::bracket_parser::INV_NAME_MAX` (the same discipline
-/// `clean_item_name` applies to bracket emissions — a 256-char TRAIT_MAX
-/// chip must not become a paragraph-named inventory item). Empty chips drop.
-pub fn split_outfit_line(line: &str) -> Vec<String> {
-    line.split(',')
-        .map(|c| {
-            let capped: String = c.trim().chars().take(crate::bracket_parser::INV_NAME_MAX).collect();
-            capped.trim().to_string()
-        })
-        .filter(|c| !c.is_empty())
-        .collect()
-}
-
-/// Seed authored clothing chips into the typed inventory. Used at BOTH
-/// chokepoints: `enter_fable_session` (a fresh New Game's SavedPlayer chip
-/// list — the one-time starting kit) and `WorldSchema::load_split` (the
-/// legacy `outfit` appearance-delta migration). Garments route to their body
-/// slots via [`route_legacy_to_slot`] (cloak/dress/robe → Chest, trousers →
+/// Seed authored clothing chips into the typed inventory. Used at
+/// `enter_fable_session` (a fresh New Game's SavedPlayer chip list — the
+/// one-time starting kit). Garments route to their body
+/// slots via [`route_item_to_slot`] (cloak/dress/robe → Chest, trousers →
 /// Legs, boots → Feet…); chips with no body-slot vocabulary (gloves, a
 /// necklace, a sash) land in the pack — carried, still visible in the Soul
 /// Gem panel. Contention routes through [`place_equipped`] (2026-08-19):
@@ -1502,7 +1444,7 @@ pub fn split_outfit_line(line: &str) -> Vec<String> {
 /// Deduped by normalized name (trim + lowercase) against the equipment
 /// layers, the pack, AND earlier chips in the same batch — a mixed-era save
 /// that already tracks "Travel Cloak" as an item while still carrying the
-/// legacy outfit line must not mint a twin. Returns the number of chips
+/// batch must not mint a twin. Returns the number of chips
 /// seeded (for the INV log line). Pure fn over the typed model.
 pub fn seed_clothing_items(
     chips: &[String],
@@ -1534,7 +1476,7 @@ pub fn seed_clothing_items(
         // Garments are wearable: the equippable tag drives the Soul Gem
         // popup's EQUIP action once the item is in the pack.
         let tags = vec![ItemTag::Equippable];
-        match route_legacy_to_slot(&key) {
+        match route_item_to_slot(&key) {
             Some(slot) => {
                 let item = EquippedItem {
                     name: name.to_string(),
@@ -1589,11 +1531,14 @@ pub fn seed_clothing_items(
 /// ring, gloves) auto-wear on their zone from turn 1 (2026-08-19 zone sweep,
 /// Chloe ruling: "whatever accessories (that are obvious) equip themselves
 /// upon the first run"); anything non-specific (a trinket, a charm) plus
-/// Stored land in the pack. FRESH runs only — a resumed campaign's inventory
-/// is authoritative. Returns the number of items seeded.
+/// Stored land in the default stash — the POUCH when the name is wallet
+/// cargo (starting coin like "3 gold", 2026-08-23 pouch ruling), else the
+/// pack. FRESH runs only — a resumed campaign's inventory is authoritative.
+/// Returns the number of items seeded.
 pub fn seed_player_inventory(
     inv: &crate::player::PlayerInventory,
     equipment: &mut Equipment,
+    pouch: &mut Vec<StackItem>,
     pack: &mut Vec<StackItem>,
 ) -> usize {
     let mut seeded = seed_clothing_items(&inv.clothing, equipment, pack);
@@ -1631,10 +1576,11 @@ pub fn seed_player_inventory(
                 continue;
             }
         }
-        // Not a readied weapon (or both hands full) → the pack (never
-        // vaporized).
+        // Not a readied weapon (or both hands full) → the default stash
+        // (never vaporized).
+        let (target, _) = stash_target(item, pouch, pack);
         stack_upsert(
-            pack,
+            target,
             StackItem {
                 name: item.to_string(),
                 qty: 1,
@@ -1646,15 +1592,16 @@ pub fn seed_player_inventory(
         seeded += 1;
     }
     // Accessories: specific/jewelry pieces WEAR (the router knows them);
-    // non-specific trinkets pack — "if something isn't specific then going
+    // non-specific trinkets stash — "if something isn't specific then going
     // into inventory is perfectly fine" (Chloe, 2026-08-19).
     for item in inv.accessories.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let key = item.to_lowercase();
         let tags = vec![ItemTag::Equippable];
-        let Some(slot) = route_legacy_to_slot(&key) else {
-            // Non-specific trinket — the pack, no Equippable tag.
+        let Some(slot) = route_item_to_slot(&key) else {
+            // Non-specific trinket — the default stash, no Equippable tag.
+            let (target, _) = stash_target(item, pouch, pack);
             stack_upsert(
-                pack,
+                target,
                 StackItem {
                     name: item.to_string(),
                     qty: 1,
@@ -1686,11 +1633,12 @@ pub fn seed_player_inventory(
         ) {
             // Worn on its zone — never also packed.
             Placement::Worn { .. } => {}
-            // Routable but the zone couldn't take it — the pack keeps it
-            // (never vaporized).
+            // Routable but the zone couldn't take it — the default stash
+            // keeps it (never vaporized).
             _ => {
+                let (target, _) = stash_target(item, pouch, pack);
                 stack_upsert(
-                    pack,
+                    target,
                     StackItem {
                         name: item.to_string(),
                         qty: 1,
@@ -1704,8 +1652,9 @@ pub fn seed_player_inventory(
         seeded += 1;
     }
     for item in inv.stored.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let (target, _) = stash_target(item, pouch, pack);
         stack_upsert(
-            pack,
+            target,
             StackItem {
                 name: item.to_string(),
                 qty: 1,
@@ -1770,17 +1719,17 @@ mod tests {
     fn stack_upsert_unions_tags_on_restack() {
         let mut items = Vec::new();
         stack_upsert(&mut items, StackItem { name: "Healing Potion".into(), qty: 1, weight: 0.5, stats: None, tags: vec![ItemTag::Consumable], ..Default::default() });
-        stack_upsert(&mut items, StackItem { name: "healing potion".into(), qty: 1, weight: 0.5, stats: None, tags: vec![ItemTag::Pocketable], ..Default::default() });
+        stack_upsert(&mut items, StackItem { name: "healing potion".into(), qty: 1, weight: 0.5, stats: None, tags: vec![ItemTag::Pouchable], ..Default::default() });
         assert_eq!(items.len(), 1);
         assert!(items[0].tags.contains(&ItemTag::Consumable), "consumable tag kept on restack");
-        assert!(items[0].tags.contains(&ItemTag::Pocketable), "pocketable tag unioned in");
+        assert!(items[0].tags.contains(&ItemTag::Pouchable), "pocketable tag unioned in");
     }
 
     #[test]
     fn stack_upsert_merges_despite_whitespace_and_case_noise() {
         // 2026-08-17 E4B shakedown P1a: the belt re-added existing items as
         // new entries in the playtest. The comparison now normalizes BOTH
-        // sides — `Coin` merges with ` coin ` (Soul-Gem UI / legacy-save
+        // sides — `Coin` merges with ` coin ` (Soul-Gem UI / hand-edited
         // entries that skipped the parser's clean gate).
         let mut items = vec![StackItem { name: "coin".into(), qty: 3, weight: 0.1, stats: None, ..Default::default() }];
         let added = stack_upsert(&mut items, StackItem { name: " Coin ".into(), qty: 2, weight: 0.1, stats: None, ..Default::default() });
@@ -1844,28 +1793,92 @@ mod tests {
         assert_eq!(ItemTag::from_id("consumable"), Some(ItemTag::Consumable));
         assert_eq!(ItemTag::from_id("Equippable"), Some(ItemTag::Equippable));
         assert_eq!(ItemTag::from_id("equipable"), Some(ItemTag::Equippable), "common misspelling tolerated");
-        assert_eq!(ItemTag::from_id("POCKETABLE"), Some(ItemTag::Pocketable));
-        assert_eq!(ItemTag::from_id("pocket"), Some(ItemTag::Pocketable));
+        assert_eq!(ItemTag::from_id("POUCHABLE"), Some(ItemTag::Pouchable));
+        assert_eq!(ItemTag::from_id("pouch"), Some(ItemTag::Pouchable));
+        // (2026-08-23 pouch rename) the pre-rename forms keep parsing — old
+        // saves + old tracker emissions must load forever.
+        assert_eq!(ItemTag::from_id("POCKETABLE"), Some(ItemTag::Pouchable));
+        assert_eq!(ItemTag::from_id("pocket"), Some(ItemTag::Pouchable));
         assert_eq!(ItemTag::from_id("cursed"), None, "unknown tag rejected");
         assert_eq!(ItemTag::from_id(""), None);
     }
 
     #[test]
     fn parse_tag_list_dedupes_and_drops_unknown() {
-        let tags = parse_tag_list("consumable, pocketable, consumable, junk, equippable");
+        let tags = parse_tag_list("consumable, pouchable, consumable, junk, equippable");
         assert_eq!(tags.len(), 3);
         assert_eq!(tags[0], ItemTag::Consumable);
-        assert_eq!(tags[1], ItemTag::Pocketable);
+        assert_eq!(tags[1], ItemTag::Pouchable);
         assert_eq!(tags[2], ItemTag::Equippable);
+        // Legacy "pocketable" parses into the renamed variant.
+        let legacy = parse_tag_list("pocketable");
+        assert_eq!(legacy, vec![ItemTag::Pouchable]);
         assert!(parse_tag_list("   ").is_empty());
     }
 
     #[test]
     fn item_tag_serde_is_snake_case() {
-        let json = serde_json::to_string(&vec![ItemTag::Consumable, ItemTag::Pocketable]).unwrap();
-        assert_eq!(json, r#"["consumable","pocketable"]"#);
+        let json = serde_json::to_string(&vec![ItemTag::Consumable, ItemTag::Pouchable]).unwrap();
+        assert_eq!(json, r#"["consumable","pouchable"]"#);
+        // (2026-08-23 pouch rename) the serde alias keeps pre-rename saves
+        // loading — "pocketable" deserializes as Pouchable.
+        let legacy: Vec<ItemTag> = serde_json::from_str(r#"["pocketable"]"#).unwrap();
+        assert_eq!(legacy, vec![ItemTag::Pouchable]);
         let parsed: Vec<ItemTag> = serde_json::from_str(r#"["equippable"]"#).unwrap();
         assert_eq!(parsed, vec![ItemTag::Equippable]);
+    }
+
+    // ── Pouch routing (2026-08-23 pouch ruling) ──────────────────────────
+
+    #[test]
+    fn pouch_fit_wallet_cargo_matches() {
+        // Currency + coins (incl. the wizard's starting-coin "3 gold" form).
+        for name in [
+            "3 gold", "Gold", "silver", "Copper Coins", "gold pieces",
+            "assorted coppers", "Electrum", "small silver",
+        ] {
+            assert!(pouch_fit(name), "\"{name}\" should be pouch cargo");
+        }
+        // Keys + ID + papers + small valuables.
+        for name in [
+            "Brass Key", "keys", "Rusted Keyring", "ID Card", "identity papers",
+            "Passport", "Tavern Permit", "Deed to the Mill", "Ruby", "loose pearls",
+            "Emerald Gemstone", "Gold Ingot", "Leather Wallet", "Coin Purse",
+        ] {
+            assert!(pouch_fit(name), "\"{name}\" should be pouch cargo");
+        }
+    }
+
+    #[test]
+    fn pouch_fit_worn_and_household_vetoed() {
+        for name in [
+            "Gold Ring", "Pearl Necklace", "Ruby Pendant", "Silver Earrings",
+            "Crown Jewels", // crown guard beats jewels fit
+            "Silver Tray", "Copper Pot", "Golden Goblet", "Jade Statue",
+            "Healing Potion", "Glass Vial", "Iron Sword", "Copper Wire",
+            "Linen Shirt", "Bedroll", "Rations", "Lockpick Set",
+            "Change of Clothes", // "change" the money ≠ a change of clothes
+        ] {
+            assert!(!pouch_fit(name), "\"{name}\" must NOT be pouch cargo");
+        }
+        // Long metal-compound names stay pack cargo (the ≤2-word metal rule).
+        assert!(!pouch_fit("Silver-Trimmed Saddle"));
+        assert!(pouch_fit("3 gold"), "short metal names are money");
+        assert!(!pouch_fit(""), "empty name never fits");
+    }
+
+    #[test]
+    fn stash_target_routes_wallet_cargo_to_pouch() {
+        let mut pouch = Vec::new();
+        let mut pack = Vec::new();
+        let (target, label) = stash_target("Silver Coins", &mut pouch, &mut pack);
+        assert_eq!(label, "pouch");
+        stack_upsert(target, StackItem { name: "Silver Coins".into(), qty: 5, ..Default::default() });
+        let (target2, label2) = stash_target("Bedroll", &mut pouch, &mut pack);
+        assert_eq!(label2, "pack");
+        stack_upsert(target2, StackItem { name: "Bedroll".into(), qty: 1, ..Default::default() });
+        assert_eq!(pouch.len(), 1, "coins landed in the pouch");
+        assert_eq!(pack.len(), 1, "bedroll landed in the pack");
     }
 
     // ── render_for_prompt Outer-layer filter ──────────────────────────────
@@ -1902,113 +1915,6 @@ mod tests {
         let rendered = ps.render_for_prompt("").expect("non-default renders");
         assert!(!rendered.contains("equipped:"), "empty equipment → no equipped block");
     }
-
-    // ── Migration ────────────────────────────────────────────────────────
-
-    #[test]
-    fn migrate_legacy_items_routes_weapon_to_main_hand() {
-        let mut entities: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-        entities.insert("item_iron_sword".into(), serde_json::Value::String("equipped".into()));
-        let mut equipment = Equipment::new();
-        let mut pack = Vec::new();
-        migrate_legacy_items(&mut entities, &mut equipment, &mut pack);
-        assert!(entities.is_empty(), "legacy key removed");
-        let layers = equipment.get(&EquipSlot::MainHand).expect("sword routed to main_hand");
-        assert_eq!(layers.outer.as_ref().unwrap().name, "Iron Sword");
-        assert!(pack.is_empty(), "equipped weapon does not also go to pack");
-    }
-
-    #[test]
-    fn migrate_legacy_items_routes_unknown_to_pack() {
-        let mut entities: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-        entities.insert(
-            "inv_health_potion".into(),
-            serde_json::Value::String("3 in pack".into()),
-        );
-        let mut equipment = Equipment::new();
-        let mut pack = Vec::new();
-        migrate_legacy_items(&mut entities, &mut equipment, &mut pack);
-        assert!(equipment.is_empty(), "potion has no slot → no equipment");
-        assert_eq!(pack.len(), 1);
-        assert_eq!(pack[0].name, "Health Potion");
-        assert_eq!(pack[0].qty, 3, "qty hint parsed from '3 in pack'");
-    }
-
-    #[test]
-    fn migrate_legacy_items_is_idempotent() {
-        let mut entities: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-        entities.insert("item_iron_sword".into(), serde_json::Value::String("equipped".into()));
-        let mut equipment = Equipment::new();
-        let mut pack = Vec::new();
-        migrate_legacy_items(&mut entities, &mut equipment, &mut pack);
-        // Second run: no legacy keys left.
-        let equipment_before = equipment.clone();
-        let pack_before = pack.clone();
-        migrate_legacy_items(&mut entities, &mut equipment, &mut pack);
-        assert_eq!(equipment, equipment_before, "idempotent — no change on second run");
-        assert_eq!(pack, pack_before);
-    }
-
-    /// 2026-08-15 audit fix: two legacy items contending for the SAME slot
-    /// migrate deterministically (sorted by key) — HashMap iteration order
-    /// used to decide outer-vs-inner-vs-pack at random per boot.
-    #[test]
-    fn migrate_legacy_items_slot_contention_is_deterministic() {
-        let build = || {
-            let mut entities: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-            // Both route to chest ("armor"/"vest" keywords): alphabetically
-            // "item_iron_vest" < "item_leather_armor", so the vest takes
-            // Outer deterministically.
-            entities.insert(
-                "item_iron_vest".into(),
-                serde_json::Value::String("equipped".into()),
-            );
-            entities.insert(
-                "item_leather_armor".into(),
-                serde_json::Value::String("equipped".into()),
-            );
-            let mut equipment = Equipment::new();
-            let mut pack = Vec::new();
-            migrate_legacy_items(&mut entities, &mut equipment, &mut pack);
-            (equipment, pack)
-        };
-        // The SAME outcome on every run (the old HashMap order flipped it).
-        for _ in 0..8 {
-            let (equipment, pack) = build();
-            let chest = equipment.get(&EquipSlot::Chest).expect("chest populated");
-            assert_eq!(
-                chest.outer.as_ref().expect("outer filled").name,
-                "Iron Vest",
-                "alphabetically-first key wins the Outer layer deterministically"
-            );
-            assert_eq!(
-                chest.inner.as_ref().expect("inner filled").name,
-                "Leather Armor"
-            );
-            assert!(pack.is_empty(), "both layers absorbed the contention");
-        }
-    }
-
-    #[test]
-    fn migrate_legacy_items_skips_structured_values() {
-        // Widening guard (2026-08-11): a structured JSON value at an item_* key
-        // is unrecognized noise — leave it in the entity map untouched.
-        let mut entities: BTreeMap<String, serde_json::Value> = BTreeMap::new();
-        entities.insert(
-            "item_strange".into(),
-            serde_json::json!({ "enchantment": "unknown" }),
-        );
-        let mut equipment = Equipment::new();
-        let mut pack = Vec::new();
-        migrate_legacy_items(&mut entities, &mut equipment, &mut pack);
-        assert!(equipment.is_empty(), "structured value not routed");
-        assert!(pack.is_empty(), "structured value not packed");
-        assert!(
-            entities.contains_key("item_strange"),
-            "structured value left in entity map"
-        );
-    }
-
     // ── Clothing seeds (2026-08-18 clothing-as-inventory ruling) ─────────
 
     #[test]
@@ -2075,7 +1981,7 @@ mod tests {
     #[test]
     fn seed_clothing_dedupes_against_existing_items_and_batch() {
         // Mixed-era save: the cloak is already tracked as an item while the
-        // legacy outfit line still names it — no twin. Same-batch dupes
+        // batch still names it — no twin. Same-batch dupes
         // collapse too.
         let mut equipment = Equipment::new();
         equipment.insert(
@@ -2134,20 +2040,6 @@ mod tests {
         );
         assert!(equipment.contains_key(&EquipSlot::Head), "a plain cap still routes to head");
     }
-
-    #[test]
-    fn split_outfit_line_splits_trims_and_caps() {
-        let chips = split_outfit_line("bloodstained leather, travel cloak , muddy boots");
-        assert_eq!(chips, vec!["bloodstained leather", "travel cloak", "muddy boots"]);
-        // Oversize chip clamps to the INV_NAME_MAX discipline.
-        let long = "x".repeat(crate::bracket_parser::INV_NAME_MAX + 50);
-        let capped = split_outfit_line(&long);
-        assert_eq!(capped.len(), 1);
-        assert_eq!(capped[0].chars().count(), crate::bracket_parser::INV_NAME_MAX);
-        // Empty segments drop entirely.
-        assert!(split_outfit_line("  ,, ").is_empty());
-    }
-
     // ── Narrative phrase resolution (2026-08-17 E4B follow-up) ───────────
     // Every narrative string below is VERBATIM from the live playtest turns
     // (V5 shop scene + the innkeeper example) — the exact corpus that
@@ -2647,25 +2539,25 @@ mod tests {
     #[test]
     fn underwear_routes_by_whole_word_and_lands_inner() {
         // Word-boundary routing: smallclothes family → Legs, torso family → Chest.
-        assert_eq!(route_legacy_to_slot("cotton drawers"), Some(EquipSlot::Legs));
-        assert_eq!(route_legacy_to_slot("lace panties"), Some(EquipSlot::Legs));
-        assert_eq!(route_legacy_to_slot("linen petticoat"), Some(EquipSlot::Legs));
-        assert_eq!(route_legacy_to_slot("silk camisole"), Some(EquipSlot::Chest));
-        assert_eq!(route_legacy_to_slot("satin bra"), Some(EquipSlot::Chest));
+        assert_eq!(route_item_to_slot("cotton drawers"), Some(EquipSlot::Legs));
+        assert_eq!(route_item_to_slot("lace panties"), Some(EquipSlot::Legs));
+        assert_eq!(route_item_to_slot("linen petticoat"), Some(EquipSlot::Legs));
+        assert_eq!(route_item_to_slot("silk camisole"), Some(EquipSlot::Chest));
+        assert_eq!(route_item_to_slot("satin bra"), Some(EquipSlot::Chest));
         // The collision pins: the substring families must never misroute.
-        assert_eq!(route_legacy_to_slot("leather bracelet"), None, "'bra' never catches 'bracelet'");
-        assert_eq!(route_legacy_to_slot("oiled briefcase"), None, "'briefs' never catches 'briefcase'");
-        assert_eq!(route_legacy_to_slot("silk slippers"), Some(EquipSlot::Feet), "slippers stay footwear");
-        assert_eq!(route_legacy_to_slot("slip of paper"), None, "a slip of paper is stationery");
+        assert_eq!(route_item_to_slot("leather bracelet"), None, "'bra' never catches 'bracelet'");
+        assert_eq!(route_item_to_slot("oiled briefcase"), None, "'briefs' never catches 'briefcase'");
+        assert_eq!(route_item_to_slot("silk slippers"), Some(EquipSlot::Feet), "slippers stay footwear");
+        assert_eq!(route_item_to_slot("slip of paper"), None, "a slip of paper is stationery");
         // (2026-08-20) The GLM clothing-chip gaps: everyday modern garments
         // must EQUIP, not pack; the collision pins must not misroute.
-        assert_eq!(route_legacy_to_slot("cropped tee"), Some(EquipSlot::Chest), "'tee' word-route claims the chest");
-        assert_eq!(route_legacy_to_slot("graphic tee"), Some(EquipSlot::Chest));
-        assert_eq!(route_legacy_to_slot("crop top"), Some(EquipSlot::Chest), "'crop top' phrase needle");
-        assert_eq!(route_legacy_to_slot("sneakers"), Some(EquipSlot::Feet), "'sneaker' claims the feet");
-        assert_eq!(route_legacy_to_slot("white trainers"), Some(EquipSlot::Feet), "'trainer' word-route claims the feet");
-        assert_eq!(route_legacy_to_slot("leather canteen"), None, "'tee' never catches 'canteen'");
-        assert_eq!(route_legacy_to_slot("leather loafer"), Some(EquipSlot::Feet));
+        assert_eq!(route_item_to_slot("cropped tee"), Some(EquipSlot::Chest), "'tee' word-route claims the chest");
+        assert_eq!(route_item_to_slot("graphic tee"), Some(EquipSlot::Chest));
+        assert_eq!(route_item_to_slot("crop top"), Some(EquipSlot::Chest), "'crop top' phrase needle");
+        assert_eq!(route_item_to_slot("sneakers"), Some(EquipSlot::Feet), "'sneaker' claims the feet");
+        assert_eq!(route_item_to_slot("white trainers"), Some(EquipSlot::Feet), "'trainer' word-route claims the feet");
+        assert_eq!(route_item_to_slot("leather canteen"), None, "'tee' never catches 'canteen'");
+        assert_eq!(route_item_to_slot("leather loafer"), Some(EquipSlot::Feet));
         // Underwear claims the Inner layer under a worn skirt (the
         // under-garment preference agrees with the router).
         let mut equipment = Equipment::new();
@@ -2777,7 +2669,7 @@ mod tests {
             "wool tights", "linen petticoat", "silk underskirt", "bikini bottoms",
             "linen pantaloons",
         ] {
-            assert_eq!(route_legacy_to_slot(name), Some(EquipSlot::Legs), "legs family: {name}");
+            assert_eq!(route_item_to_slot(name), Some(EquipSlot::Legs), "legs family: {name}");
         }
         // Torso: lingerie, shapewear, full-body + sleep + swim uppers.
         for name in [
@@ -2788,22 +2680,22 @@ mod tests {
             "silk negligee", "cotton nightgown", "flannel nightie", "satin nightdress",
             "lace lingerie", "thermal long johns", "cotton union suit",
         ] {
-            assert_eq!(route_legacy_to_slot(name), Some(EquipSlot::Chest), "chest family: {name}");
+            assert_eq!(route_item_to_slot(name), Some(EquipSlot::Chest), "chest family: {name}");
         }
         // Feet stay feet — the footwear guard + needle order.
         for name in ["thong sandals", "short boots", "leather boots", "wool socks", "silk stockings"] {
-            assert_eq!(route_legacy_to_slot(name), Some(EquipSlot::Feet), "feet family: {name}");
+            assert_eq!(route_item_to_slot(name), Some(EquipSlot::Feet), "feet family: {name}");
         }
         // Outer legwear the sweep discovered was unroutable (packed!).
-        assert_eq!(route_legacy_to_slot("wool shorts"), Some(EquipSlot::Legs));
-        assert_eq!(route_legacy_to_slot("swim trunks"), Some(EquipSlot::Legs));
-        assert_eq!(route_legacy_to_slot("speedo"), Some(EquipSlot::Legs));
+        assert_eq!(route_item_to_slot("wool shorts"), Some(EquipSlot::Legs));
+        assert_eq!(route_item_to_slot("swim trunks"), Some(EquipSlot::Legs));
+        assert_eq!(route_item_to_slot("speedo"), Some(EquipSlot::Legs));
         // The non-collision pins hold.
-        assert_eq!(route_legacy_to_slot("oiled briefcase"), None);
-        assert_eq!(route_legacy_to_slot("leather bracelet"), None);
-        assert_eq!(route_legacy_to_slot("slip of paper"), None);
-        assert_eq!(route_legacy_to_slot("shortsword"), Some(EquipSlot::MainHand));
-        assert_eq!(route_legacy_to_slot("short cloak"), Some(EquipSlot::Chest), "cloak outranks the word check");
+        assert_eq!(route_item_to_slot("oiled briefcase"), None);
+        assert_eq!(route_item_to_slot("leather bracelet"), None);
+        assert_eq!(route_item_to_slot("slip of paper"), None);
+        assert_eq!(route_item_to_slot("shortsword"), Some(EquipSlot::MainHand));
+        assert_eq!(route_item_to_slot("short cloak"), Some(EquipSlot::Chest), "cloak outranks the word check");
     }
 
     #[test]
@@ -2877,7 +2769,7 @@ mod tests {
             "steel gorget", "velvet choker", "bronze torc", "silk scarf",
             "silver brooch", "silk cravat", "leather neck brace",
         ] {
-            assert_eq!(route_legacy_to_slot(name), Some(EquipSlot::Neck), "neck family: {name}");
+            assert_eq!(route_item_to_slot(name), Some(EquipSlot::Neck), "neck family: {name}");
         }
         // Arms: sleeves, bracers, elbow/shoulder armor.
         for name in [
@@ -2885,31 +2777,31 @@ mod tests {
             "red armband", "padded elbow pads", "steel pauldrons", "iron spaulders",
             "leather arm guards", "lined shoulder pads",
         ] {
-            assert_eq!(route_legacy_to_slot(name), Some(EquipSlot::Arms), "arms family: {name}");
+            assert_eq!(route_item_to_slot(name), Some(EquipSlot::Arms), "arms family: {name}");
         }
         // Hands: gloves, gauntlets, mittens, rings, wrist jewelry.
         for name in [
             "leather gloves", "steel gauntlets", "wool mittens",
             "silver ring", "golden rings", "beaded bracelet",
         ] {
-            assert_eq!(route_legacy_to_slot(name), Some(EquipSlot::Hands), "hands family: {name}");
+            assert_eq!(route_item_to_slot(name), Some(EquipSlot::Hands), "hands family: {name}");
         }
         // Armor, pads, straps, over-shoe wear.
-        assert_eq!(route_legacy_to_slot("dwarven chainmail"), Some(EquipSlot::Chest));
-        assert_eq!(route_legacy_to_slot("chain mail hauberk"), Some(EquipSlot::Chest));
-        assert_eq!(route_legacy_to_slot("quilted vest"), Some(EquipSlot::Chest), "vests stay chest");
-        assert_eq!(route_legacy_to_slot("padded knee pads"), Some(EquipSlot::Legs));
-        assert_eq!(route_legacy_to_slot("leather jock strap"), Some(EquipSlot::Legs));
-        assert_eq!(route_legacy_to_slot("wool leggings"), Some(EquipSlot::Legs));
-        assert_eq!(route_legacy_to_slot("polished spats"), Some(EquipSlot::Feet));
-        assert_eq!(route_legacy_to_slot("canvas gaiters"), Some(EquipSlot::Feet));
+        assert_eq!(route_item_to_slot("dwarven chainmail"), Some(EquipSlot::Chest));
+        assert_eq!(route_item_to_slot("chain mail hauberk"), Some(EquipSlot::Chest));
+        assert_eq!(route_item_to_slot("quilted vest"), Some(EquipSlot::Chest), "vests stay chest");
+        assert_eq!(route_item_to_slot("padded knee pads"), Some(EquipSlot::Legs));
+        assert_eq!(route_item_to_slot("leather jock strap"), Some(EquipSlot::Legs));
+        assert_eq!(route_item_to_slot("wool leggings"), Some(EquipSlot::Legs));
+        assert_eq!(route_item_to_slot("polished spats"), Some(EquipSlot::Feet));
+        assert_eq!(route_item_to_slot("canvas gaiters"), Some(EquipSlot::Feet));
         // The word-boundary pins: substring needles win FIRST, words are the
         // fallback — each of these would misroute on a substring form.
-        assert_eq!(route_legacy_to_slot("knee-high boots"), Some(EquipSlot::Feet), "boots beat the knee word");
-        assert_eq!(route_legacy_to_slot("sleeveless gown"), Some(EquipSlot::Chest), "gown beats the sleeve word");
-        assert_eq!(route_legacy_to_slot("golden earring"), Some(EquipSlot::Head), "earrings are head jewelry");
-        assert_eq!(route_legacy_to_slot("brass keyring"), None, "keyring is one word — not a ring");
-        assert_eq!(route_legacy_to_slot("kitchen spatula"), None, "spatula is not spats");
+        assert_eq!(route_item_to_slot("knee-high boots"), Some(EquipSlot::Feet), "boots beat the knee word");
+        assert_eq!(route_item_to_slot("sleeveless gown"), Some(EquipSlot::Chest), "gown beats the sleeve word");
+        assert_eq!(route_item_to_slot("golden earring"), Some(EquipSlot::Head), "earrings are head jewelry");
+        assert_eq!(route_item_to_slot("brass keyring"), None, "keyring is one word — not a ring");
+        assert_eq!(route_item_to_slot("kitchen spatula"), None, "spatula is not spats");
     }
 
     #[test]
@@ -2979,8 +2871,9 @@ mod tests {
             stored: vec!["Bedroll".into()],
         };
         let mut equipment = Equipment::new();
+        let mut pouch = Vec::new();
         let mut pack = Vec::new();
-        let seeded = seed_player_inventory(&inv, &mut equipment, &mut pack);
+        let seeded = seed_player_inventory(&inv, &mut equipment, &mut pouch, &mut pack);
         assert_eq!(seeded, 7);
         assert_eq!(
             equipment.get(&EquipSlot::Neck).and_then(|l| l.outer.as_ref()).map(|i| i.name.as_str()),
@@ -2997,6 +2890,30 @@ mod tests {
         let names: Vec<&str> = pack.iter().map(|i| i.name.as_str()).collect();
         assert!(names.contains(&"Lucky Trinket"), "non-specific accessory packs");
         assert!(names.contains(&"Bedroll"));
+        assert!(pouch.is_empty(), "nothing here is wallet cargo");
+    }
+
+    #[test]
+    fn player_seed_routes_wallet_cargo_to_the_pouch() {
+        // (2026-08-23 pouch ruling) starting coin carried as a Stored entry
+        // ("3 gold" — the 2026-08-22 money-is-inventory ruling) lands in the
+        // POUCH, not the pack; keys + ID papers too; ordinary storage packs.
+        let inv = crate::player::PlayerInventory {
+            clothing: vec![],
+            equipped: vec![],
+            accessories: vec![],
+            stored: vec!["3 gold".into(), "Brass Key".into(), "Identity Papers".into(), "Bedroll".into()],
+        };
+        let mut equipment = Equipment::new();
+        let mut pouch = Vec::new();
+        let mut pack = Vec::new();
+        seed_player_inventory(&inv, &mut equipment, &mut pouch, &mut pack);
+        let pouch_names: Vec<&str> = pouch.iter().map(|i| i.name.as_str()).collect();
+        assert!(pouch_names.contains(&"3 gold"), "starting coin pouched: {pouch_names:?}");
+        assert!(pouch_names.contains(&"Brass Key"));
+        assert!(pouch_names.contains(&"Identity Papers"));
+        let pack_names: Vec<&str> = pack.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(pack_names, vec!["Bedroll"], "the bedroll stays pack cargo");
     }
 
     #[test]
@@ -3011,8 +2928,9 @@ mod tests {
             stored: vec![],
         };
         let mut equipment = Equipment::new();
+        let mut pouch = Vec::new();
         let mut pack = Vec::new();
-        let seeded = seed_player_inventory(&inv, &mut equipment, &mut pack);
+        let seeded = seed_player_inventory(&inv, &mut equipment, &mut pouch, &mut pack);
         assert!(pack.is_empty(), "the worn glove must not also pack, got {pack:?}");
         assert_eq!(
             equipment.get(&EquipSlot::Hands).and_then(|l| l.outer.as_ref()).map(|i| i.name.as_str()),
@@ -3033,8 +2951,9 @@ mod tests {
             stored: vec![],
         };
         let mut equipment = Equipment::new();
+        let mut pouch = Vec::new();
         let mut pack = Vec::new();
-        seed_player_inventory(&inv, &mut equipment, &mut pack);
+        seed_player_inventory(&inv, &mut equipment, &mut pouch, &mut pack);
         assert_eq!(
             equipment.get(&EquipSlot::MainHand).and_then(|l| l.outer.as_ref()).map(|i| i.name.as_str()),
             Some("Hunting Bow")
@@ -3066,14 +2985,14 @@ mod tests {
     fn garment_vocabulary_expansion_routes_common_chips() {
         // The 2026-08-19 expansion: GLM-authored chip names that hit NO needle
         // (and dumped whole wardrobes into the pack) now route.
-        assert_eq!(route_legacy_to_slot("wool coat"), Some(EquipSlot::Chest));
-        assert_eq!(route_legacy_to_slot("travel garb"), Some(EquipSlot::Chest));
-        assert_eq!(route_legacy_to_slot("elegant attire"), Some(EquipSlot::Chest));
-        assert_eq!(route_legacy_to_slot("silk chemise"), Some(EquipSlot::Chest));
-        assert_eq!(route_legacy_to_slot("silver circlet"), Some(EquipSlot::Head));
-        assert_eq!(route_legacy_to_slot("wool hose"), Some(EquipSlot::Legs));
-        assert_eq!(route_legacy_to_slot("silk hosiery"), Some(EquipSlot::Feet));
+        assert_eq!(route_item_to_slot("wool coat"), Some(EquipSlot::Chest));
+        assert_eq!(route_item_to_slot("travel garb"), Some(EquipSlot::Chest));
+        assert_eq!(route_item_to_slot("elegant attire"), Some(EquipSlot::Chest));
+        assert_eq!(route_item_to_slot("silk chemise"), Some(EquipSlot::Chest));
+        assert_eq!(route_item_to_slot("silver circlet"), Some(EquipSlot::Head));
+        assert_eq!(route_item_to_slot("wool hose"), Some(EquipSlot::Legs));
+        assert_eq!(route_item_to_slot("silk hosiery"), Some(EquipSlot::Feet));
         // Weapon vocabulary still wins over garment needles in compounds.
-        assert_eq!(route_legacy_to_slot("shortsword"), Some(EquipSlot::MainHand));
+        assert_eq!(route_item_to_slot("shortsword"), Some(EquipSlot::MainHand));
     }
 }

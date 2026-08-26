@@ -31,6 +31,31 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { openRawEditor } from './raw-editor.js';
+import { buildQuestClocksModel, clockFracVar } from './quest-clocks.js';
+
+// (2026-08-24 Part II C4) The Quests section for the World tab: quest rows
+// (title, giver, objective progress, counter) + the deadline clock chips —
+// every deadline-bearing entry renders a conic ring whose CSS custom
+// property carries the elapsed fraction; overdue flips red. Returns '' when
+// no quests + no promises ride the schema (the section is conditional, the
+// Prime-Mandate shape).
+function renderQuestClocksSection(schema) {
+  const { rows } = buildQuestClocksModel(schema);
+  if (!rows.length) return '';
+  const items = rows.map((r) => {
+    const left = r.deadline > 0 && !r.overdue ? ' — time remains' : r.overdue ? ' — overdue' : '';
+    const progress = r.kind === 'quest'
+      ? `${r.done}/${r.objectiveCount} objectives${r.counter ? ` · ${r.counter}` : ''}`
+      : 'promise';
+    const ring = r.deadline > 0
+      ? `<span class="fable-clock-ring" style="--clock-frac: ${clockFracVar(r.frac)}"></span>`
+      : '';
+    return `<div class="fable-clock-chip${r.overdue ? ' is-overdue' : ''}">${ring}` +
+      `<span class="fable-clock-text">${esc(r.title || r.id)} · ${esc(r.giver)} · ${esc(progress)}${esc(left)}</span></div>`;
+  });
+  return section('Quests', items.join(''));
+}
+
 
 // The five tabs in rail order. `icon` is an inline SVG (minimalist brass).
 // `file` is the raw-editor target (`kind` for fable_json_raw_* / special for
@@ -56,10 +81,24 @@ const ICONS = {
   npc: '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="8" cy="8" r="2.8" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="16" cy="8" r="2.8" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 19c0-3 2.2-5 5-5s5 2 5 5M11 19c0-3 2.2-5 5-5s5 2 5 5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
 };
 
+// (2026-08-23 Playground) Exported so the Playground strip's three domain
+// buttons reuse the SAME glyphs the rail uses (one icon vocabulary).
+export { ICONS };
+
 let railEl = null;       // the .fable-tab-rail root
 let dropdownEl = null;   // the .fable-tab-dropdown (the prose panel)
 let tabBtns = {};        // key → button element
 let activeTab = null;    // the currently-active tab key (null = none)
+
+// (2026-08-24 race fix) Link-manager serialization state, module-level so it
+// survives the per-render closures: `codexLinkWriteBusy` is the in-flight
+// guard around fable_codex_link_set (rapid ↑/↓/✎/✕ used to compute two
+// orders off the SAME stale base — whichever IPC landed last won and the
+// other reorder silently vanished), `codexLinkRenderGen` lets a settled
+// write detect that a newer renderCodex (a ✎ save's renderActive) owns the
+// dropdown now.
+let codexLinkWriteBusy = false;
+let codexLinkRenderGen = 0;
 
 // Build the rail DOM. Called once from stage.js buildStage; injected into the
 // Wupi drawer between the brand header and the messages list. Returns the
@@ -157,6 +196,14 @@ async function renderTab(key, el) {
   if (key === 'codex') {
     el.querySelector('[data-raw-edit]').hidden = true;
   }
+  // (2026-08-22 ruling) The Player ✎ HIDES while no SavedPlayer is bound —
+  // there is nothing to edit (the combined .player + player.json editor's
+  // read gate fails whole-editor without an attachment). It starts hidden
+  // and renderPlayer re-shows it once fable_active_player_get resolves a
+  // bound player (head.setEditHidden below).
+  if (key === 'player') {
+    el.querySelector('[data-raw-edit]').hidden = true;
+  }
   const body = el.querySelector('[data-drop-body]');
   // Renderer hooks into the head: `setTitle` (a fallback label when the tab
   // has NO character name — the World/Codex/NPC tabs keep theirs) and
@@ -174,6 +221,12 @@ async function renderTab(key, el) {
       const has = nonEmpty(n);
       if (node) node.textContent = has ? String(n) : '';
       if (headEl) headEl.classList.toggle('has-name', has);
+    },
+    // The Player tab's ✎ visibility: hidden until a SavedPlayer is confirmed
+    // bound (see the default-hide above), re-shown by renderPlayer.
+    setEditHidden(hide) {
+      const node = el.querySelector('[data-raw-edit]');
+      if (node) node.hidden = !!hide;
     },
   };
   try {
@@ -217,6 +270,10 @@ async function renderPlayer(bodyEl, head) {
   // The header names the character being played — NAME ONLY (the tab label
   // hides while a name is set).
   head.setName(player && player.name);
+  // (2026-08-22 ruling) The ✎ re-appears ONLY while a SavedPlayer is bound —
+  // with no attachment the combined editor has nothing to load (its read
+  // throws 'No player attached to this game.'), so the affordance hides.
+  head.setEditHidden(!player);
 
   const parts = [];
   parts.push(renderVitals(ps, schema));
@@ -564,6 +621,17 @@ async function renderCodex(body) {
     const item = library.find((l) => String(l.name) === name);
     return item ? item.entry_count : 0;
   };
+  // This renderCodex's generation — bumped per entry so a write that settles
+  // after a re-render (a ✎ save's renderActive) can tell it no longer owns
+  // the dropdown.
+  const gen = ++codexLinkRenderGen;
+  // The busy visual: disable every row-action button while a link write is
+  // in flight (the disabled state is the "clicks are ignored" affordance).
+  const setBusy = (on) => {
+    for (const rowEl of body.querySelectorAll('.fable-codex-link-manage-row')) {
+      rowEl.querySelectorAll('button[data-act]').forEach((b) => { b.disabled = on; });
+    }
+  };
   const render = () => {
     const linkedNames = links.map(String);
     const unlinked = library.filter((l) => !linkedNames.includes(String(l.name)));
@@ -599,28 +667,47 @@ async function renderCodex(body) {
       rowEl.querySelectorAll('button[data-act]').forEach((btn) => {
         btn.addEventListener('click', async () => {
           const act = btn.dataset.act;
+          // (2026-08-24 race fix) Serialize link mutations: while a write is
+          // in flight every row action is a no-op — each accepted click must
+          // apply to the FRESHEST order (the last committed `links`), never a
+          // stale base captured before the prior IPC settled.
+          if (codexLinkWriteBusy) return;
           if (act === 'edit') {
             openRawEditor('codex', renderActive, { codexName: name });
             return;
           }
-          const next = [...links.map(String)];
-          if (act === 'up' || act === 'down') {
-            const i = next.indexOf(name);
-            const j = act === 'up' ? i - 1 : i + 1;
-            if (i < 0 || j < 0 || j >= next.length) return;
-            [next[i], next[j]] = [next[j], next[i]];
-          } else if (act === 'unlink') {
-            const i = next.indexOf(name);
-            if (i >= 0) next.splice(i, 1);
-          } else if (act === 'link') {
-            if (!next.includes(name)) next.push(name);
-          }
+          codexLinkWriteBusy = true;
+          setBusy(true);
           try {
+            const next = [...links.map(String)];
+            if (act === 'up' || act === 'down') {
+              const i = next.indexOf(name);
+              const j = act === 'up' ? i - 1 : i + 1;
+              if (i < 0 || j < 0 || j >= next.length) return; // no-op move
+              [next[i], next[j]] = [next[j], next[i]];
+            } else if (act === 'unlink') {
+              const i = next.indexOf(name);
+              if (i >= 0) next.splice(i, 1);
+            } else if (act === 'link') {
+              if (!next.includes(name)) next.push(name);
+            }
             await invoke('fable_codex_link_set', { cardId: card.card_id, codices: next });
-            links = next;
-            render();
+            if (gen === codexLinkRenderGen) {
+              links = next;
+              render();
+            } else if (activeTab === 'codex') {
+              // A newer renderCodex owns the dropdown (e.g. a ✎ save's
+              // renderActive) — its fetch may have raced this write, so
+              // refresh it against the settled backend order.
+              renderActive();
+            }
           } catch (err) {
             console.warn('[fable] codex link update failed', err);
+            if (gen === codexLinkRenderGen) render();
+            else if (activeTab === 'codex') renderActive();
+          } finally {
+            codexLinkWriteBusy = false;
+            setBusy(false);
           }
         });
       });
@@ -680,6 +767,10 @@ async function renderWorld(body) {
   // (2026-08-20 Economy) The Ledger section — properties, jobs, lifestyle.
   const ledger = renderLedgerSection(schema);
   if (ledger) parts.push(ledger);
+  // (2026-08-24 Part II C4) The Quests section — quests + promises with
+  // deadline rings (conic-gradient clock chips, brass → red when overdue).
+  const quests = renderQuestClocksSection(schema);
+  if (quests) parts.push(quests);
   if (nonEmpty(schema.summary)) parts.push(proseBlock('Summary', schema.summary));
   if (rumors.length) parts.push(listBlock('Rumors', rumors));
   if (worldEnts.length) parts.push(listBlock('Tracked details', worldEnts.map(([k, v]) => `${prettify(k)}: ${v}`)));
@@ -728,6 +819,18 @@ function npcReadCard(key, val) {
 // history lives in a separate element + is never cleared here.
 export function resetTabRail() {
   setActiveTab(null);
+}
+
+// (2026-08-23 Playground) NON-DESTRUCTIVE collapse: hide the open dropdown
+// but KEEP `activeTab` — the Playground strip covers the rail zone while
+// the wand is on, and a covered active tab must survive wand-off with its
+// state intact (its dropdown simply re-renders). `resetTabRail` semantics
+// are unchanged for drawer close / stage teardown.
+export function collapseTabDropdown() {
+  if (dropdownEl && activeTab) {
+    dropdownEl.hidden = true;
+    dropdownEl.innerHTML = '';
+  }
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────

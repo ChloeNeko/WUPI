@@ -55,6 +55,15 @@ pub struct SessionManifest {
     pub card_id: String,
     pub name: String,
     pub created_at: i64,
+    /// (2026-08-24 Part II D1) The memory partition this playthrough routes
+    /// through. ABSENT = the plain `card_id` partition (every existing
+    /// session — the field is purely additive). A BRANCHED session carries
+    /// `"<card_id>#<session_id>"` — entry installs it into
+    /// `AppState.active_memory_partition`, giving the branch full post-fork
+    /// episodic isolation while the codex partitions stay card-scoped
+    /// (authored lore is shared by design).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_partition: Option<String>,
 }
 
 /// A session's list-row projection (the Session Manager UI shape).
@@ -205,11 +214,92 @@ pub fn create_session(
         card_id: card.id.clone(),
         name,
         created_at: current_unix_ms(),
+        memory_partition: None,
     };
     let dir = sessions_root.join(&manifest.session_id);
     std::fs::create_dir_all(&dir)?;
     write_manifest(&dir, &manifest)?;
     Ok(manifest)
+}
+
+/// (2026-08-24 Part II D1) Read one session's manifest (pub read of the
+/// private parser — `enter_fable_session` resolves the branch partition
+/// through this, `fable_session_branch` reads the source's identity).
+/// `None` for a missing/unparseable manifest (the caller falls back to the
+/// plain card partition).
+pub fn load_manifest(
+    fable_root: &Path,
+    card_id: &str,
+    session_id: &str,
+) -> Option<SessionManifest> {
+    read_manifest(&resolve_session_root(fable_root, card_id, session_id))
+}
+
+/// (2026-08-24 Part II D1) BRANCH — copy one playthrough into a fresh
+/// session folder: session.json + the three split schemas + the whole
+/// saves/ tree (the undo rings ride along inside the saves), a fresh
+/// manifest carrying `memory_partition = "<card>#<new session>"`. The
+/// SOURCE is never touched (copy, not move). FAIL-CLOSED: any error
+/// removes the partial destination folder before propagating — the caller
+/// pairs this with the memory fork (which it rolls back the same way).
+/// The MEMORY copy itself lives in memory.rs (`fork_partition_to`) — this
+/// fn owns only the folder.
+pub fn branch_session(
+    fable_root: &Path,
+    card_id: &str,
+    source_session_id: &str,
+    name_hint: Option<&str>,
+) -> std::io::Result<SessionManifest> {
+    let source = resolve_session_root(fable_root, card_id, source_session_id);
+    if !source.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("source session folder missing: {}", source.display()),
+        ));
+    }
+    let sessions_root = resolve_sessions_root(fable_root, card_id);
+    std::fs::create_dir_all(&sessions_root)?;
+    let existing = std::fs::read_dir(&sessions_root)
+        .map(|rd| rd.flatten().filter(|e| e.path().is_dir()).count())
+        .unwrap_or(0);
+    let name = name_hint
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(60).collect::<String>())
+        .unwrap_or_else(|| format!("Session {}", existing + 1));
+    let session_id = mint_session_id();
+    let manifest = SessionManifest {
+        memory_partition: Some(format!("{card_id}#{session_id}")),
+        session_id,
+        card_id: card_id.to_string(),
+        name,
+        created_at: current_unix_ms(),
+    };
+    let dest = sessions_root.join(&manifest.session_id);
+    let result = copy_tree(&source, &dest).and_then(|()| write_manifest(&dest, &manifest));
+    if result.is_err() {
+        // Fail-closed: the partial branch never survives; the source is
+        // untouched by construction.
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+    result.map(|()| manifest)
+}
+
+/// Recursive folder copy (files + subdirectories; no symlink chase — the
+/// sessions tree is plain files). Pure std, no fs_extra dependency.
+fn copy_tree(src: &Path, dest: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dest)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let path = entry.path();
+        let target = dest.join(entry.file_name());
+        if path.is_dir() {
+            copy_tree(&path, &target)?;
+        } else {
+            std::fs::copy(&path, &target)?;
+        }
+    }
+    Ok(())
 }
 
 /// Write a session's manifest atomically (temp + rename, the save-slot
@@ -732,13 +822,7 @@ mod tests {
             intro_variants: Vec::new(),
             setting: Some("A test place.".into()),
             plot: None,
-            tone: None,
-            start_npc_ids: Vec::new(),
-            declared_activities: Vec::new(),
             player_name: Some("Tester".into()),
-            locations: Vec::new(),
-            cast: Vec::new(),
-            start: crate::sim_card::CardStart::default(),
             custom_tags: Default::default(),
         }
     }

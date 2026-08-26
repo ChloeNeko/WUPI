@@ -4,6 +4,7 @@ pub mod bracket_parser;
 pub mod chat_format;
 pub mod codex;
 pub mod consequence;
+pub mod consolidation;
 pub mod context_swap;
 pub mod crossroads;
 pub mod economy;
@@ -14,6 +15,7 @@ pub mod fable_save;
 pub mod ghostwriter;
 #[cfg(windows)]
 pub mod hardware;
+pub mod hazard;
 pub mod json_repair;
 pub mod kv_buffer;
 pub mod llm;
@@ -239,7 +241,7 @@ pub struct AppState {
     /// the swap. None = not running (chat proceeds without schema deltas).
     pub schema_engine: Arc<std::sync::Mutex<Option<Arc<schema_engine::SchemaEngine>>>>,
     /// Fail-proof delta contract (§5 layer 3): auto-summarizer attempts that
-    /// exhausted all 3 passes WITHOUT committing. Drained at the top of the
+    /// exhausted all passes WITHOUT committing. Drained at the top of the
     /// next `chat_send` and folded into the next delta prompt as "previously
     /// deferred state changes — re-attempt with the new exchange as anchor."
     /// Bounded by `MAX_FAILED_DELTA_ATTEMPTS`; oldest evicted on overflow
@@ -266,6 +268,17 @@ pub struct AppState {
     /// the character/simulation card system exists; when a card loads, its
     /// loader sets this. Read on every chat turn (search + 2× archive).
     pub active_card_id: Arc<std::sync::Mutex<String>>,
+    /// (2026-08-24 Part II D1) The ACTIVE memory partition — the routing key
+    /// every Fable memory surface (archival spawns, `search_fable_visible`,
+    /// consolidation triggers, the pin/rollback/turns-list IPCs) threads
+    /// through. Equal to `active_card_id` for every plain session; a BRANCHED
+    /// session's manifest carries `memory_partition = "<card>#<session>"` and
+    /// entry installs THAT here instead (full post-branch isolation — the
+    /// codex partitions stay card-scoped: authored lore is shared by design,
+    /// only EPISODIC rows fork). Restored to `__wupi__` at `fable_end`
+    /// alongside `active_card_id`; card delete sweeps the whole family
+    /// (`card` + `card#*`) via `purge_card_family`.
+    pub active_memory_partition: Arc<std::sync::Mutex<String>>,
     /// The active Simulation Card (the parsed persona artifact). Filled once
     /// in `setup()` from `data/wupi.sim` (§8C); reads after init are lock-free.
     /// `chat_send` renders it into the system-prompt persona section;
@@ -383,6 +396,17 @@ pub struct AppState {
     /// because `fable_player_action_set` (frontend) + the consume site inside
     /// `fable_send` can race; the consume path takes the lock first.
     pub pending_player_action: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// (2026-08-24 Part II B3) The ONE-SHOT pinned skill DC — armed by the
+    /// frontend `crossroads_commit_dc` IPC when the player picks a Crossroads
+    /// option whose summary declared "— [Skill DC N]" (the declared DC is
+    /// committed the moment the option was OFFERED). Consumed at the top of
+    /// `fable_send` (take + clear, ONE turn only) and threaded into
+    /// `referee_evaluate_skill_checks`, which uses it verbatim for the
+    /// matching skill — dice + seeds untouched. Closes the last sycophancy
+    /// door: the model cannot soften a check it already priced. Cleared at
+    /// session boundaries alongside `pending_player_action`. Tokio Mutex for
+    /// the same arm/consume race as its sibling slot.
+    pub pending_pinned_skill_dc: Arc<tokio::sync::Mutex<Option<(String, u32)>>>,
     /// Off-screen task directives emitted by the World Progression tick
     /// (Fable Phase 3 Slice 6 wiring, 2026-07-28). Each tick that resolves
     /// due tasks pushes their directives here; the next `fable_send`
@@ -406,6 +430,31 @@ pub struct AppState {
     /// under tokio Mutex (writer = the post-apply sites, reader = the prompt
     /// builds; they can race a cancel path).
     pub tracker_emit_errors: Arc<tokio::sync::Mutex<Vec<String>>>,
+    /// (2026-08-22 living-world) The Recovery Referee's rest signal — set
+    /// when a Downtime rest turn actually fired `apply_recovery`, consumed
+    /// (swap) by `apply_time_command_and_maybe_tick` so the rested anchor
+    /// lands on genuine rests even when the tracker forgot `[REST]` (the
+    /// deterministic backstop to the bracket's LLM path). `Relaxed` is
+    /// correct: a single bit with no dependent data.
+    pub pending_rest: Arc<std::sync::atomic::AtomicBool>,
+    /// (2026-08-24) The edit→re-track window marker. Armed BEFORE the session
+    /// text mutates (`edit_message` / `ghostwriter_continue`), held until the
+    /// re-track returns — closes the gap where `apply_edit` had landed but the
+    /// re-track's cancel token wasn't minted yet: a Save or narrator turn in
+    /// that window paired an edited beat with a pre-re-track schema. Feeds
+    /// `fable_turn_in_flight` (Save/aids refuse) + a narrow `fable_send` entry
+    /// refusal. `Relaxed` is correct: a single bit with no dependent data.
+    pub retrack_armed: Arc<std::sync::atomic::AtomicBool>,
+    /// (2026-08-24) ONE world-progression tick executes at a time. The
+    /// natural deferred tick (post-turn), the re-track's tick, and the
+    /// playground force-tick/tick-loop ALL route through
+    /// `fire_world_progression_tick`, which swap-guards this flag — a
+    /// second tick waits (bounded, session-guarded) instead of running
+    /// concurrently (double-fire double-advanced the world). Also the
+    /// frontend busy signal: `world-tick-begin`/`world-tick-end` events
+    /// ride its acquire/drop so the Soul Gem / raw editor's generating
+    /// gate stays red for the whole 1-3s post-`done` window.
+    pub world_tick_in_flight: Arc<std::sync::atomic::AtomicBool>,
     /// Per-game cancel token, parallel to `active_cancel`. Distinct slot so
     /// chat-stop and game-stop never cross-wire (Bug #7 pattern, §2C).
     pub active_fable_cancel: Arc<std::sync::Mutex<Option<llm::CancelToken>>>,
@@ -430,6 +479,35 @@ pub struct AppState {
     /// queues + re-stamping the loaded clock). Turn-side consumers capture
     /// the value at turn start and compare at fire time.
     pub fable_session_generation: Arc<std::sync::atomic::AtomicU64>,
+    /// (2026-08-23 WS6) Consecutive all-fail consolidation runs. At
+    /// [`consolidation::FAIL_STREAK_LIMIT`] the worker stands down (silent
+    /// skip — the bounded-burn guard: content the model consistently fails
+    /// to extract must not cost a decode pair every trigger). ANY committed
+    /// batch resets it.
+    pub consolidation_fail_streak: Arc<std::sync::atomic::AtomicU32>,
+    /// (2026-08-23 Playground) God-mode AUTO-PASS — when true every skill
+    /// check forces SUCCESS, the combat injury referee skips its outcome
+    /// block entirely, and rest interruption checks are treated as
+    /// auto-successful. Session-scoped: NEVER persisted, force-cleared at
+    /// every session boundary (`fable_start` / `fable_end` drain paths) so a
+    /// god flag can never leak into the next timeline. `Relaxed` is correct:
+    /// a single bit with no dependent data.
+    pub playground_auto_pass: Arc<std::sync::atomic::AtomicBool>,
+    /// (2026-08-23 Playground) God-mode FREEZE CLAMPS — when true the
+    /// survival clamps stop applying: the weary/exhausted fatigue floors,
+    /// the interrupted-rest "Impaired" debuff stamp, and the economy
+    /// insolvency arm's stamina drain + "Starving" stamp. (A future sanity
+    /// system wires into this same flag when its lane ships.) Same
+    /// session-scoped lifetime as [`Self::playground_auto_pass`].
+    pub playground_freeze_clamps: Arc<std::sync::atomic::AtomicBool>,
+    /// (2026-08-23 audit) ONE consolidation worker per process: the trigger
+    /// fires detached at the end of EVERY fable_send, and a run lasts
+    /// seconds — turn N's worker could still be mid-run when turn N+1's
+    /// spawns, re-decoding batches the first already committed (safe via
+    /// the Immutable Source Law check, but a wasted decode pair on the
+    /// turn lock). The `DOWNLOAD_IN_FLIGHT` pattern. `Relaxed` is correct:
+    /// a single bit with no dependent data.
+    pub consolidation_in_flight: Arc<std::sync::atomic::AtomicBool>,
     /// Per-edit-retrack cancel token (2026-08-15 audit fix). The retrack
     /// tracker pass (`retrack_edited_assistant_message`) runs DETACHED so it
     /// can overlap a Stage-2 narrator stream; it used to store its token into
@@ -594,6 +672,9 @@ impl AppState {
             active_card_id: Arc::new(std::sync::Mutex::new(
                 memory::WUPI_CARD_ID.to_owned(),
             )),
+            active_memory_partition: Arc::new(std::sync::Mutex::new(
+                memory::WUPI_CARD_ID.to_owned(),
+            )),
             active_card: Arc::new(std::sync::OnceLock::new()),
             fable_prompts: Arc::new(std::sync::OnceLock::new()),
             wupi_prompts: Arc::new(std::sync::OnceLock::new()),
@@ -611,10 +692,18 @@ impl AppState {
             pending_sd_model_path: Arc::new(std::sync::Mutex::new(None)),
             sd_autogen_disabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             pending_player_action: Arc::new(tokio::sync::Mutex::new(None)),
+            pending_pinned_skill_dc: Arc::new(tokio::sync::Mutex::new(None)),
             pending_tick_directives: Arc::new(tokio::sync::Mutex::new(Vec::new())),
             tracker_emit_errors: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            pending_rest: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            retrack_armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            world_tick_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_fable_cancel: Arc::new(std::sync::Mutex::new(None)),
             fable_session_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            consolidation_fail_streak: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            consolidation_in_flight: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            playground_auto_pass: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            playground_freeze_clamps: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fable_abort_requested: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_retrack_cancel: Arc::new(std::sync::Mutex::new(None)),
             active_slice_cancel: Arc::new(std::sync::Mutex::new(None)),
@@ -871,22 +960,12 @@ pub fn run() {
             let prism_dir = resolve_apps_dir(app.handle()).join("prism");
             std::fs::create_dir_all(prism_dir.join("gallery")).ok();
             // (The v0.2.4→v0.3.0 + games→fable boot migrations were DELETED
-            // 2026-08-14: every install on the supported 0.18→0.19 path ran
-            // them long ago, their sessions/schemas destinations are dead
-            // folders (§6B per-card layout replaced them), and the updater's
-            // §8C purge now reaps the leftovers. See crates/updater/src/purge.rs.)
-            // (2026-08-19) The v2 card/player format migration — BEFORE any
-            // window exists, so no frontend IPC can race the rewrite. Runs
-            // every boot; idempotent (v2-shaped entries are only cached).
-            migrate_cards_v2(app.handle());
-            // (2026-08-22 session decoupling) Move dynamic game data out of
-            // the card folders into the centralized tree: sessions (split
-            // JSONs + session.json + saves/) → data/saves/<CardName>/, the
-            // per-card `.codex` sibling → the universal data/codex/ library
-            // (+ a `<linked_codices>` link so nothing is lost). Same boot
-            // discipline: before any window, idempotent, failures log +
-            // retry next boot.
-            migrate_dynamic_data_v2(app.handle());
+            // 2026-08-14, and the v2 card/player + session-decoupling boot
+            // migrations were DELETED 2026-08-22 with the v0.30.0 clean
+            // break: pre-v2 cards/players are no longer converted or
+            // supported — users re-create them through the Creator, and the
+            // updater's §8C purge reaps leftover legacy folders. See
+            // crates/updater/src/purge.rs.)
             tracing::info!("portable data dir: {}", data_dir.display());
 
             let state: tauri::State<AppState> = app.state();
@@ -929,11 +1008,6 @@ pub fn run() {
             // local model has finished loading, NOT here: we can't swap
             // models before the local model has loaded.
             {
-                // One-shot filename migration (2026-08-20 rename): moves an
-                // existing `api_config.json` to `api.json` with profiles
-                // untouched — the app-side backstop for the updater's rename
-                // step. Cheap no-op once migrated.
-                api::ApiConfig::migrate_legacy_name(&data_dir);
                 let api_path = api::ApiConfig::resolve_path(&data_dir);
                 let loaded = api::ApiConfig::load(&api_path);
                 tracing::info!(
@@ -1272,6 +1346,7 @@ pub fn run() {
             fable_reveal_window,
             chat_send,
             chat_stop,
+            chat_reset,
             get_settings,
             get_intro,
             debug_memory_query,
@@ -1280,6 +1355,10 @@ pub fn run() {
             memory_update,
             memory_delete,
             memory_wipe_card,
+            memory_rollback_turn,
+            memory_set_pinned,
+            memory_rollback_consolidation,
+            memory_turns_list,
             operator_profile_get,
             operator_profile_set,
             api_profiles_list,
@@ -1335,9 +1414,9 @@ pub fn run() {
             creator_assistant_stop,
             creator_log,
             creator_read_import_text,
-            fable_card_set_intro,
             // §11.30 Left-Drawer HUD — manual player-action injection.
             fable_player_action_set,
+            crossroads_commit_dc,
             // Prism (image-generation app) IPCs (2026-07-31). prism_generate
             // drives the shared SD swap core with user params (seed/cfg/
             // sampler); the gallery_* IPCs are the Glass Vault CRUD.
@@ -1351,6 +1430,9 @@ pub fn run() {
             player_state_get,
             fable_active_card_get,
             fable_schema_get,
+            // (2026-08-23 fog-of-war map) the left-drawer location card's
+            // knowledge-filtered site-map slice.
+            fable_site_map_get,
             fable_schema_set,
             fable_card_get,
             fable_card_raw_get,
@@ -1360,14 +1442,18 @@ pub fn run() {
             fable_codex_library_list,
             fable_codex_file_read,
             fable_codex_file_write,
+            fable_codex_file_rename,
+            fable_codex_file_delete,
             fable_codex_link_get,
             fable_codex_link_set,
+            fable_codex_links_map,
             fable_codex_create_for_card,
             // New-creator sibling writes (explicit card_id; CREATE-time).
-            fable_card_sibling_write,
             // (2026-08-22 session decoupling) the Session Manager surface.
             fable_sessions_list,
             fable_session_delete,
+            fable_session_branch,
+            fable_campaign_export,
             fable_card_portrait_write,
             fable_card_portrait_url,
             fable_card_raw_get_by_id,
@@ -1403,6 +1489,36 @@ pub fn run() {
             fable_background_active_set,
             fable_rollback,
             fable_history_depth,
+            // (2026-08-23 Playground) the Sand Table turned player-facing UI —
+            // god flags, dice reports, sculptors (wallet / tags / cast /
+            // registry / milestones / revive), the world engine (time skip /
+            // forced tick / asset spawner / threat), + the snapshot-ring
+            // inspector. Reads + pure rolls are report-only guarded; every
+            // mutator follows the fable_rollback discipline.
+            playground_player_get,
+            playground_flags_set,
+            playground_wealth_delta,
+            playground_item_tag_set,
+            playground_hazard_roll,
+            playground_force_rest,
+            playground_apply_interruption,
+            playground_npc_get,
+            playground_relationship_set,
+            playground_npc_interior_set,
+            playground_npc_revive,
+            playground_near_names,
+            playground_registry_alias_add,
+            playground_registry_rename,
+            playground_registry_remove,
+            playground_milestone_inject,
+            playground_world_get,
+            playground_time_skip,
+            playground_force_tick,
+            playground_tick_loop,
+            playground_asset_remove,
+            playground_asset_spawn,
+            playground_site_threat_set,
+            playground_history_restore,
             system_menu::power_shutdown_cmd,
             system_menu::power_restart_cmd,
             system_menu::power_sleep_cmd,
@@ -2115,17 +2231,16 @@ async fn updater_apply(
     updater::perform_update(&app, update).await
 }
 
-/// Delete the updater's marker files (`%TEMP%\wupi_update_result.json` + the
-/// one-hop legacy `data/_update_result.json`) so the updater's user-takeover
-/// guard sees "a boot from this install happened". No outcome is returned or
-/// surfaced — update failures are diagnosed via crash logs + the updater's
-/// `%TEMP%` log (2026-08-20 Chloe ruling: no failure surfacing at all).
+/// Delete the updater's marker file (`%TEMP%\wupi_update_result.json`) so
+/// the updater's user-takeover guard sees "a boot from this install
+/// happened". No outcome is returned or surfaced — update failures are
+/// diagnosed via crash logs + the updater's `%TEMP%` log (2026-08-20 Chloe
+/// ruling: no failure surfacing at all).
 /// Called by BOTH boot paths (the OS boot gate in runBootGate AND the
 /// fable.exe entry — every boot from this install must consume the marker).
 #[tauri::command]
-fn updater_consume_result(app: tauri::AppHandle) {
-    let exe_dir = resolve_install_root(&app);
-    updater::clear_result_markers(&exe_dir);
+fn updater_consume_result() {
+    updater::clear_result_markers();
 }
 
 /// Deferred chat-model spawn. The boot UX (script.js) calls this AFTER the
@@ -2344,10 +2459,9 @@ async fn boot_load_model(app: tauri::AppHandle, state: tauri::State<'_, AppState
 /// replaced verbatim on update.
 ///
 /// Walks the candidate list in order: the portable `data/wupi.sim` FIRST
-/// (the active persona the user runs against), then legacy/dev paths:
-/// `<exe_dir>/cards/Wupi.sim` (pre-§8C portable layout) and the dev repo's
-/// `cards/` dir (for local development). Exact-name match (case-insensitive)
-/// against `wupi.sim`. Returns `None` when no card is found; the caller falls
+/// (the active persona the user runs against), then the dev-repo mirrors
+/// (`<repo>/data/wupi.sim`, for `cargo run` where the exe lives under
+/// `target/`). Returns `None` when no card is found; the caller falls
 /// back to a minimal stub persona so the app still boots.
 fn resolve_wupi_sim_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     use tauri::Manager;
@@ -2357,50 +2471,24 @@ fn resolve_wupi_sim_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     candidates.push(resolve_data_dir(app).join("wupi.sim"));
     if let Some(d) = app.path().resource_dir().ok() {
         candidates.push(d.join("data").join("wupi.sim"));
-        // Legacy pre-§8C portable layout (`cards/Wupi.sim`) + dev-repo paths.
-        // Kept as fallbacks so a v0.2.4 → v0.3.0 in-place upgrade finds the
-        // old card if the new data/wupi.sim isn't present yet.
-        candidates.push(d.join("cards"));
     }
     if let Some(exe) = std::env::current_exe().ok() {
         if let Some(parent) = exe.parent() {
-            // Legacy pre-§8C portable layout: cards shipped next to wupi.exe.
-            candidates.push(parent.join("cards"));
-            // Dev-repo paths (exe lives in target/release or target/debug).
-            // The §8C source tree has the persona at `<repo>/data/wupi.sim`;
-            // the legacy `<repo>/cards/` is kept for in-place upgrades that
-            // haven't been re-extracted from the new zip yet.
+            // Dev-repo paths (exe lives in target/release or target/debug):
+            // the §8C source tree has the persona at `<repo>/data/wupi.sim`.
             if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
                 candidates.push(grand.join("data").join("wupi.sim"));
-                candidates.push(grand.join("cards"));
             }
             if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
                 candidates.push(gg.join("data").join("wupi.sim"));
-                candidates.push(gg.join("cards"));
             }
         }
     }
 
-    for dir_or_file in &candidates {
-        // The first candidate is a FILE path (`data/wupi.sim`); the rest are
-        // DIR paths (`cards/`) to be scanned for a `wupi.sim`/`Wupi.sim` entry.
-        if dir_or_file.is_file() {
-            tracing::info!("resolved card: {}", dir_or_file.display());
-            return Some(dir_or_file.clone());
-        }
-        let dir = match dir_or_file {
-            p if p.is_dir() => p,
-            _ => continue,
-        };
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_lowercase();
-                if name == "wupi.sim" {
-                    let path = entry.path();
-                    tracing::info!("resolved card: {} (from {})", path.display(), dir.display());
-                    return Some(path);
-                }
-            }
+    for candidate in &candidates {
+        if candidate.is_file() {
+            tracing::info!("resolved card: {}", candidate.display());
+            return Some(candidate.clone());
         }
     }
     None
@@ -2487,32 +2575,11 @@ fn resolve_wupi_prompt_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf
 /// fresh each `chat_send` via `user_profile::load`: that's the hot-reload
 /// mechanism (live edits take effect on the next message, no reboot, no
 /// watcher thread).
-///
-/// Legacy fallback: a pre-§8C install may have `data/Operator.xml` (or
-/// `cards/Operator.xml`) from a prior version. If found AND no `user.xml`
-/// exists yet, prefer it so the user's prior identity survives the upgrade.
-/// Once `user.xml` exists, the legacy path is ignored.
 fn resolve_user_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
     let data_dir = resolve_data_dir(app);
     let live_path = data_dir.join("user.xml");
     if live_path.exists() {
         return Some(live_path);
-    }
-    // Legacy fallback: pre-§8C install with data/Operator.xml. Adopt it as
-    // the live user.xml (the XML structure is unchanged: name + description,
-    // same strict-XML + CDATA + roxmltree parser).
-    let legacy_data_path = data_dir.join("Operator.xml");
-    if legacy_data_path.exists() {
-        if std::fs::create_dir_all(&data_dir).is_ok() {
-            if std::fs::rename(&legacy_data_path, &live_path).is_ok() {
-                tracing::info!(
-                    "adopted legacy user profile: {} -> {}",
-                    legacy_data_path.display(),
-                    live_path.display()
-                );
-                return Some(live_path);
-            }
-        }
     }
     // No user.xml yet. Pre-create the data dir so the User Editor has a
     // home for its first save; do NOT seed an empty file (the absence of
@@ -2923,7 +2990,7 @@ async fn route_to_fable_manager(
     let current_schema = state.fable_schema.lock().await.clone();
 
     // 2b. Drain the failed-translation queue (fail-proof contract §5 layer 3).
-    //     Any prior player request that exhausted all 3 passes is folded into
+    //     Any prior player request that exhausted all passes is folded into
     //     this request's prompt so the model gets another shot with the new
     //     request as anchor. Take() empties the slot: if THIS turn also fails,
     //     the new failure re-enqueues below.
@@ -2965,7 +3032,7 @@ async fn route_to_fable_manager(
         }
     };
     // 3b. Fail-proof contract: if the reply carries a retryable failed_attempt
-    //     (all 3 passes failed on parse/validation), enqueue it for the next
+    //     (all passes failed on parse/validation), enqueue it for the next
     //     translation request — within the retry budget (the passes_used
     //     circuit breaker, 2026-08-16 audit LOW).
     //     (2026-08-16 bug 17, translation sibling) The drained PRIORS follow
@@ -3138,6 +3205,24 @@ fn render_inventory_summary(schema: &schema::WorldSchema) -> String {
         lines.push(format!("Belt:\n{}", belt.join("\n")));
     }
 
+    // Pouch — the wallet (2026-08-23 pouch ruling): auto-routed currency,
+    // keys, ID papers, + small valuables.
+    if !ps.pouch.is_empty() {
+        let pouch: Vec<String> = ps
+            .pouch
+            .iter()
+            .map(|i| {
+                let stats = i.stats.as_deref().map(|s| format!(" ({})", s)).unwrap_or_default();
+                if i.qty > 1 {
+                    format!("  {} x{}{}", i.name, i.qty, stats)
+                } else {
+                    format!("  {}{}", i.name, stats)
+                }
+            })
+            .collect();
+        lines.push(format!("Pouch:\n{}", pouch.join("\n")));
+    }
+
     // Pack — deep storage + carried-weight readout.
     if !ps.pack.is_empty() {
         let pack: Vec<String> = ps
@@ -3174,12 +3259,11 @@ async fn route_to_fable_query(
     let snapshot = state.fable_schema.lock().await.clone();
     let state_json = snapshot.to_json_pretty();
 
-    // Inventory focus (2026-08-07): items now live in the typed
-    // player_state.{equipment,belt,pack} model, not the freeform entity map
-    // (legacy item_*/inv_* entities are migrated out on load). So an
-    // "inventory"/"items"/"equipment"/"carrying"/"pack"/"belt" focus must
-    // render from the typed model — the entity substring match below would
-    // find nothing. Build a tight summary Wupi narrates from.
+    // Inventory focus (2026-08-07): items live in the typed
+    // player_state.{equipment,belt,pouch,pack} model, not the entity map. So
+    // an "inventory"/"items"/"equipment"/"carrying"/"pack"/"belt"/"pouch"
+    // focus must render from the typed model — the entity substring match
+    // below would find nothing. Build a tight summary Wupi narrates from.
     let lower = focus.to_lowercase();
     let inventory_focus = matches!(
         lower.as_str(),
@@ -3411,7 +3495,9 @@ fn strip_invalid_relationship_writes(
 
 /// Assemble the Wupi-chat system prompt from its stable sections: the authored
 /// copilot directive (`data/wupi.prompt`), the `wupi.sim` persona render, the
-/// user profile, + the `<current_context>` block. Pure (2026-08-17 E4B
+/// user profile, the optional `<active_card>` block (present only while a
+/// Fable session is seated — the drawer's "this card"/"here" anchor), + the
+/// `<current_context>` block. Pure (2026-08-17 E4B
 /// shakedown P0): the assembly is what `chat_send` renders every turn, and
 /// its total size is the chat lockout surface — the system prefix is
 /// untouchable by `truncate_to_fit`, so a prefix over the prompt budget
@@ -3421,6 +3507,7 @@ fn assemble_wupi_system_prompt(
     role: Option<&str>,
     persona: Option<&str>,
     user_profile: Option<&str>,
+    active_card: Option<&str>,
     effective_ctx: u32,
     conversation_budget: u32,
 ) -> String {
@@ -3434,10 +3521,87 @@ fn assemble_wupi_system_prompt(
     if let Some(p) = user_profile.map(str::trim).filter(|s| !s.trim().is_empty()) {
         sections.push(p.to_owned());
     }
+    if let Some(a) = active_card.map(str::trim).filter(|s| !s.trim().is_empty()) {
+        sections.push(a.to_owned());
+    }
     sections.push(format!(
         "<current_context>\ncontext_size: {effective_ctx}\nconversation_budget: {conversation_budget}\n</current_context>"
     ));
     sections.join("\n\n")
+}
+
+/// Render `path` relative to the install root with forward slashes ("" when
+/// `path` doesn't live under `root` — a dev-layout path outside the root
+/// simply omits the line rather than leaking an absolute path into the
+/// prompt).
+fn install_relative(path: &std::path::Path, root: &std::path::Path) -> String {
+    path.strip_prefix(root)
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_default()
+}
+
+/// (2026-08-24 active-card awareness) Build the `<active_card>` block injected
+/// into the Wupi-chat system prompt while a Fable session is seated. Gives
+/// Wupi the identity + on-disk location of the card the user is CURRENTLY
+/// playing so "this card" / "the current card" / "here" (about card content)
+/// resolves unambiguously — the most common drawer request shape ("could you
+/// fix this", "add this here"). Byte-identical for the whole session → no
+/// cold-reset churn beyond the session swap itself. `None` when no game is
+/// active (the OS-home chat never carries the block).
+fn build_active_card_block(
+    state: &tauri::State<'_, AppState>,
+    app: &tauri::AppHandle,
+) -> Option<String> {
+    let card = state
+        .active_fable_card
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())?;
+    let install_root = resolve_install_root(app);
+    let cards_root = resolve_fable_cards_dir(app)?;
+    // The namesake .sim inside the walker-resolved display folder.
+    let card_file = resolve_card_file(&cards_root, &card.id, "sim");
+    let rel_card_file = install_relative(&card_file, &install_root);
+    let folder_name = card_file
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().into_owned());
+    let session_id = state
+        .active_session_id
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .filter(|s| !s.is_empty());
+
+    let mut lines = vec![
+        "<active_card>".to_owned(),
+        format!("name: {}", card.name),
+        format!("id: {}", card.id),
+    ];
+    if let Some(sub) = card.subtype.as_deref().filter(|s| !s.is_empty()) {
+        lines.push(format!("subtype: {sub}"));
+    }
+    if !rel_card_file.is_empty() {
+        lines.push(format!("card_file: {rel_card_file}"));
+    }
+    if let (Some(folder), Some(sid)) = (folder_name.as_deref(), session_id.as_deref()) {
+        lines.push(format!("session_id: {sid}"));
+        lines.push(format!(
+            "session_file: apps/fable/data/saves/{folder}/{sid}/session.json"
+        ));
+    }
+    lines.push(
+        "User is playing this card right now. When User says \"this card\", \"the current \
+         card\", or \"here\" about card content, they mean THIS card."
+            .to_owned(),
+    );
+    lines.push(
+        "Card-file edits land on disk and apply at the next session start; the live \
+         session keeps its state."
+            .to_owned(),
+    );
+    lines.push("</active_card>".to_owned());
+    Some(lines.join("\n"))
 }
 
 #[tauri::command]
@@ -3617,18 +3781,34 @@ async fn chat_send(
     // <player_name> with the same "User" default — separate path.)
     .filter(|s| !s.trim().is_empty())
     .or_else(|| Some("<user_profile>\nname: User\n</user_profile>".to_owned()));
+
+    // (2026-08-24 active-card awareness) While a Fable session is seated,
+    // inject an `<active_card>` anchor so "this card" / "here" resolves to
+    // the card the user is playing. Both backends (local + API) see it.
+    let active_card_block = build_active_card_block(&state, &app);
+
+    // (2026-08-24 hybrid chat) API-when-connected routing (Chloe ruling,
+    // reversing the 2026-08-08 local-only override): when the API is
+    // connected, GLM writes the visible reply and the local E4B stays the
+    // tool dispatcher (see the dispatch block below). This is the REAL
+    // readiness check — no `debug_assertions` bypass (that dev escape is
+    // Fable-gate-only; a dev build with no profile must not pretend).
+    let api_http: Option<llm::HttpBackend> = {
+        let source = *state.model_source.lock().unwrap_or_else(|e| e.into_inner());
+        if source != api::ModelSource::Api {
+            None
+        } else {
+            let cfg = state.api_config.lock().unwrap_or_else(|e| e.into_inner());
+            cfg.active_profile().map(|p| http_backend_cached(&state, p))
+        }
+    };
+
     // §2F eager-prefill sliding window (2026-07-13): cap visible history to
     // the last VISIBLE_WINDOW messages regardless of token budget. Memory (M)
     // backfills evicted turns via retrieval. Truncation in the engine becomes
-    // a safety net that effectively never fires (4 short turns ≪ ~3000 budget).
-    //
-    // Wupi chat is LOCAL-ONLY (2026-08-08 override): the window is always the
-    // local 8-message window + the 2048 context. The API path is deleted
-    // (the API is exclusively the Fable narrator now); model_source no longer
-    // drives chat routing. The local chat backend carries short assistant
-    // replies only — no narration, no long payloads. 8 messages = 4
-    // user↔assistant exchanges, plenty for a tracking assistant + small talk,
-    // fits the 2048 budget.
+    // a safety net that effectively never fires. The window is 16 messages
+    // (8 turns, 2026-08-24 parity ruling with the Fable narrator); both the
+    // local engine's KV render and the hybrid API pass assemble at it.
     let visible_window = settings::WINDOW_LOCAL_CHAT;
 
     // System prompt: assembled inline from the authored copilot directive
@@ -3644,18 +3824,40 @@ async fn chat_send(
         state.wupi_prompts.get().map(|p| p.role.as_str()),
         persona.as_deref(),
         user_profile.as_deref(),
+        active_card_block.as_deref(),
         effective_ctx,
         settings.conversation_budget,
     );
+    // (2026-08-24 review fix) The API reply pass runs at CTX_API — give ITS
+    // system-prompt variant the real budget so GLM isn't told 8192 while
+    // holding 16384 (under-reporting was safe, just dishonest). The local
+    // dispatch pass + the local fallback keep the local number above.
+    let api_system_prompt = if api_http.is_some() {
+        assemble_wupi_system_prompt(
+            state.wupi_prompts.get().map(|p| p.role.as_str()),
+            persona.as_deref(),
+            user_profile.as_deref(),
+            active_card_block.as_deref(),
+            settings::CTX_API,
+            settings.conversation_budget,
+        )
+    } else {
+        system_prompt.clone()
+    };
 
     // Append the user message to the session. The message window is re-read
-    // later by `run_local_or_echo` (inside `run_agent_loop`) directly from
-    // the session, so we don't need to build + carry a `messages` Vec here
-    // (that was only for the now-deleted API `http.stream()` call).
-    {
+    // later by `run_local_or_echo` (inside `run_agent_loop`) for the local
+    // renders AND by `wupi_api_reply` for the hybrid API window — both
+    // assemble from the live session, so nothing is carried here.
+    // `turn_start_len` is the pre-turn length: the cancelled-empty revert
+    // below truncates back to it (a tool turn leaves dispatcher turns in the
+    // tail that `rollback_last_user_message`'s pop-one can't reach).
+    let turn_start_len = {
         let mut s = state.session.lock().await;
+        let len = s.messages.len();
         s.add_message(session::Role::User, text.clone());
-    }
+        len
+    };
 
     let on_chunk: llm::ChunkFn = Arc::new({
         let on_event = on_event.clone();
@@ -3686,11 +3888,10 @@ async fn chat_send(
     // spawn_from_shared).
     let context_swap_clone = state.context_swap.clone();
     let backend_slot = Arc::clone(&state.backend);
-    // Wupi chat is LOCAL-ONLY (2026-08-08 override): the chat backend ALWAYS
-    // runs at CTX_LOCAL_WITH_API (8192 since the 2026-08-21 Chloe ruling; the
-    // 2026-08-17 E4B-prefix P0 raised 2048→3072 after the swapped-in model's
-    // system prefix blew the old 1536-token prompt budget). The API
-    // path is deleted; there is no source-dependent teardown or re-spawn here.
+    // The local chat backend ALWAYS runs at CTX_LOCAL_WITH_API (8192 since
+    // the 2026-08-21 Chloe ruling) — the hybrid API pass (2026-08-24) rides
+    // HTTP and never touches this context, so there is still no
+    // source-dependent teardown or re-spawn here.
     let chat_context_size = settings::CTX_LOCAL_WITH_API;
     let _chat_lease = context_swap_clone
         .acquire(
@@ -3784,41 +3985,34 @@ async fn chat_send(
         }
     };
 
-    // Dispatch with seamless per-turn fallback. The contract (per Chloe's
-    // spec): if the API is selected but fails on this turn (network, 4xx/5xx,
-    // stream error, or no profile), the turn transparently falls back to the
-    // local model with the 6-message window — the user sees a reply, not an
-    // error. `model_source` stays Api so the NEXT turn retries the API
-    // automatically (the moment it's healthy, chat returns to API + 12). This
-    // gives the seamless back-and-forth: every turn tries API, drops to local
-    // on failure, returns to API the instant it recovers. No manual reconnect.
+    // ── Hybrid dispatch (2026-08-24) ────────────────────────────────────
+    // Chloe ruling 2026-08-24 (reversing the 2026-08-08 local-only override):
+    // when the API is connected, GLM writes the reply the user sees; the
+    // local E4B stays the TOOL DISPATCHER — tool calling is local-only
+    // machinery and the API never receives a tool declaration. Turn shape
+    // when `api_http` is Some:
+    //   1. local decode(s) in dispatch mode — tool calls only; a no-tool
+    //      decode is the `[handoff]` sentinel: discarded, never committed,
+    //      never streamed to the UI (chunks go to a sinkhole);
+    //   2. `wupi_api_reply` streams the GLM reply through the same `chunk`
+    //      channel, with the executed-tool transcript appended as a trailing
+    //      system block so GLM reports what ran;
+    //   3. on API failure or an empty body: transparent local fallback (one
+    //      no-tools prose decode) — the user sees a reply, not an error, and
+    //      the `api_fallback` event lets the UI note why the voice changed.
+    // `model_source` STILL gates Fable eligibility (`require_api_for_fable`)
+    // — unchanged; it now ALSO routes Wupi chat.
     //
-    // To make the fallback cache-coherent with the local engine's delta-prefill,
-    // the local path re-assembles the message window at 6 (the API may have
-    // assembled 12 above): the local engine's KV cache only ever saw the
-    // 6-window render, so feeding it the same shape keeps the delta path fast.
-    //
-    // TOOL ROUTING (v0.8): tool calling is ALWAYS local, even when the API is
-    // the active narrator. The local model stays resident as the silent agent
-    // (§8 v0.6.3), so we run the agent loop against it FIRST. If the model
-    // emits tool calls → execute locally, the local reply is final. If no
-    // tools fired AND source==Api → discard the local prose and hand the turn
-    // to the API for the narrative reply. `fable_send` (the narrator path)
-    // never enters this block — it has its own dispatch and never gets tools.
+    // No local backend + API connected (no GGUF): skip the dispatcher
+    // entirely — the API replies directly, no tools attached.
+    let hybrid = api_http.is_some();
     let chat_tools: Vec<chat_format::ToolSpec> = if backend_opt.is_some() {
-        // Always-on tools (file ops, codex, sim cards, user profile).
+        // Always-on tools (file ops, sim cards, user profile).
         let mut s = tools::specs();
         // Fable-only tools. Attached ONLY when a Fable session is active so
         // they stay invisible to the model in plain Wupi-assistant chat (the
         // false-tool-call guardrail at the prompt level — saves ~250 tokens
-        // of tool declarations when no game is running). Two buckets:
-        //   - `fable_specs()`     — sync Trait tools (currently empty; the
-        //                            Director suite was removed).
-        //   - `fable_state_specs()` — the 3 async-dispatched stateful tools
-        //                            (fable_message_edit/delete,
-        //                            fable_schema_patch). Their specs render
-        //                            into the prompt; their execute path goes
-        //                            through `dispatch_fable_state_tool`.
+        // of tool declarations when no game is running).
         if fable_is_active(&state) {
             s.extend(tools::fable_specs());
             s.extend(tools::fable_state_specs());
@@ -3828,60 +4022,140 @@ async fn chat_send(
         Vec::new()
     };
 
-    // Per-pass system prompt (the core of the 2026-07-29 persona/protocol split).
-    // The .sim cards are now PURE FLAVOR (identity, voice, personality) — they
-    // carry no technical protocols. The structured-output protocol
-    // (`WUPI_AGENT_PROTOCOL`) is Rust-injected here, scoped to the TOOL pass
-    // ONLY. This mirrors the existing Fable split (narrator = prose, tracker/
-    // scribe = mechanical): the catgirl persona carries all conversational text,
-    // and the agent protocol carries the machine-readable surface (tool args,
-    // file contents, code). The two are complementary — no KV clear is needed
-    // (unlike the §11.52 tracker split, where the two prompts conflicted).
-    //
-    // `chat_tools.is_empty()` is the precise pass discriminator: when tools are
-    // attached, this decode is an AGENT pass (may emit tool calls → needs the
-    // protocol); when empty, it's a PROSE pass (pure persona, no protocol). The
-    // API handoff (`messages` assembled at line ~2883) + both local fallbacks
-    // (below) keep the bare `system_prompt` — the protocol would be inert there
-    // anyway (no tools advertised), but keeping it out also keeps those decodes
-    // byte-identical to the pre-change behavior (zero cold-reset risk).
-    let agent_system_prompt = if chat_tools.is_empty() {
-        system_prompt.clone()
+    // The local dispatch pass gets the base system prompt plus the dispatch
+    // contract when hybrid (another model writes the visible reply — this
+    // pass emits tools only). The API pass + both local no-tool decodes (the
+    // fallback + the non-hybrid path) keep the clean base prompt.
+    let agent_system_prompt = if hybrid && !chat_tools.is_empty() {
+        format!("{system_prompt}\n\n{WUPI_DISPATCH_CONTRACT}")
     } else {
-        // The `prompts` module's WUPI_AGENT_PROTOCOL was removed; the tool pass
-        // now uses the base system prompt (the tool descriptions themselves
-        // carry the structured-output contract via their schemas).
         system_prompt.clone()
     };
 
-    // ── Wupi chat is LOCAL-ONLY (2026-08-08 override) ───────────────────
-    // The API branch is DELETED. Wupi chat (OS home + the Fable Wupi drawer)
-    // always runs on the local model at 2048, temp 0.85, with `<think>` always
-    // on + tools. The API is reserved exclusively for Fable narration
-    // (`fable_send`, a separate path). `model_source` no longer drives chat
-    // routing — it's now purely a Fable-eligibility flag.
-    //
-    // `run_agent_loop` IS the user-visible reply path: it handles tool
-    // calling end-to-end (fast path when no tools, multi-iteration loop
-    // otherwise) and returns `(ParsedOutput, bool)` — the exact shape the
-    // post-routing code (session append, memory archive, schema delta, done
-    // event) consumes. It is model_source-agnostic.
-    let (result, tools_fired) = match run_agent_loop(
-        &state, &app, &on_event, &agent_system_prompt, visible_window,
-        memory_block, world_state, chat_tools,
-        settings::CTX_LOCAL_WITH_API,
-        on_chunk.clone(), cancel.clone(), backend_opt.clone(),
-    )
-    .await
-    {
-        Ok((result, tools_fired)) => (result, tools_fired),
-        Err(()) => {
-            rollback_last_user_message(&state, &app).await;
-            return Ok(());
-        }
-    };
+    // `run_agent_loop` IS the local path: tool calling end-to-end (fast path
+    // when no tools, multi-iteration loop otherwise) returning the final
+    // decode + the executed-tool transcript for the API handoff.
+    let (mut result, tools_fired, tool_transcript) =
+        if hybrid && backend_opt.is_none() {
+            // No local model → no dispatcher, no tools; the API answers
+            // directly below. Empty seed result: the handoff overwrites it,
+            // and a failed handoff falls back to `run_local_or_echo`'s echo
+            // arm (which emits its own not-loaded notice).
+            (chat_format::ParsedOutput::empty(), false, Vec::new())
+        } else {
+            match run_agent_loop(
+                &state, &app, &on_event, &agent_system_prompt, visible_window,
+                memory_block.clone(), world_state.clone(), chat_tools,
+                settings::CTX_LOCAL_WITH_API,
+                on_chunk.clone(), cancel.clone(), backend_opt.clone(), hybrid,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(()) => {
+                    rollback_last_user_message(&state, &app).await;
+                    return Ok(());
+                }
+            }
+        };
     // tools_fired is read by the done event below to flag a tool-call turn.
     let _ = &tools_fired;
+
+    // ── The API handoff (hybrid turns only) ─────────────────────────────
+    if hybrid {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            // Stopped during the local dispatch pass. The discard rule would
+            // leak the `[handoff]` sentinel as the reply — finalize the turn
+            // empty instead (mirrors `fable_stop`'s empty final_text).
+            result = chat_format::ParsedOutput::empty();
+        } else {
+            let handoff = match api_http.as_ref() {
+                Some(http) => {
+                    wupi_api_reply(
+                        &state,
+                        http,
+                        &api_system_prompt,
+                        memory_block.clone(),
+                        world_state.clone(),
+                        &tool_transcript,
+                        on_chunk.clone(),
+                        cancel.clone(),
+                    )
+                    .await
+                }
+                None => unreachable!("hybrid implies api_http is Some"),
+            };
+            match handoff {
+                Ok(out) if !out.content.trim().is_empty() => {
+                    result = out;
+                }
+                Ok(_) if cancel.load(std::sync::atomic::Ordering::Relaxed) => {
+                    // Stopped during the API request phase — finalize the
+                    // empty turn; never run a fallback decode after a stop.
+                }
+                err => {
+                    // Seamless local fallback (the pre-2026-08-08 contract):
+                    // one final no-tools prose decode on the local engine,
+                    // streamed for real. Covers transport failure AND an
+                    // empty API body (in-band provider weirdness).
+                    // model_source stays Api — the next turn retries the API
+                    // automatically.
+                    let why = match err {
+                        Err(e) => format!("{e:#}"),
+                        Ok(_) => "empty api reply".to_owned(),
+                    };
+                    tracing::warn!(error = %why, "wupi api handoff failed — falling back to local");
+                    let _ = on_event.send(serde_json::json!({
+                        "type": "api_fallback",
+                        "message": "api unreachable — answered locally",
+                    }));
+                    match run_local_or_echo(
+                        &state, &on_event, &system_prompt, visible_window,
+                        memory_block.clone(), world_state.clone(), Vec::new(),
+                        settings::CTX_LOCAL_WITH_API,
+                        on_chunk.clone(), cancel.clone(), backend_opt.as_ref(),
+                    )
+                    .await
+                    {
+                        Ok(local) => result = local,
+                        Err(()) => {
+                            rollback_last_user_message(&state, &app).await;
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // (2026-08-24 review fix) A turn CANCELLED before any reply text landed
+    // leaves no session trace (the `fable_stop` full-revert discipline):
+    // truncate back to the pre-turn length instead of committing an empty
+    // assistant turn — an empty model turn renders as a blank turn block on
+    // the next render and archives a junk reply row. Covers the hybrid
+    // cancel arms (during dispatch / during the API wait) AND a local decode
+    // stopped before its first token. Partial replies (a local or API stream
+    // stopped mid-flight) keep the normal commit path below.
+    if cancel.load(std::sync::atomic::Ordering::Relaxed)
+        && result.content.trim().is_empty()
+        && result.raw.trim().is_empty()
+    {
+        {
+            let mut s = state.session.lock().await;
+            s.messages.truncate(turn_start_len);
+        }
+        clear_active_cancel(&state, &cancel);
+        on_event
+            .send(serde_json::json!({
+                "type": "done",
+                "cancelled": true,
+                "final_text": "",
+                "reasoning": "",
+                "tool_call": tools_fired,
+            }))
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
 
     // Bug #3 Step 4: hold the raw model output alongside the cleaned content +
     // reasoning so the formatter can re-render cache-coherently next turn (no
@@ -3948,6 +4222,11 @@ async fn chat_send(
                 }
                 if codex_was_injected {
                     tracing::debug!("codex echo-skip: assistant reply not archived (codex reference was injected this turn)");
+                } else if !memory::archivable_prose(&asst_text) {
+                    // (2026-08-26 chronicle-hygiene) Punctuation-only output
+                    // ("/", "…") archives nothing — no alphanumeric content
+                    // means nothing semantic to embed or recall.
+                    tracing::debug!("assistant reply not archived (no alphanumeric content)");
                 } else if let Err(e) = engine.add_memory(asst_text, &card_id, memory::Role::Assistant, 1.0, Some(&turn_uuid)).await {
                     tracing::warn!(error = %format!("{e:#}"), "archive assistant turn failed");
                 }
@@ -3986,15 +4265,22 @@ async fn chat_send(
     // can't run until the chat decode finishes (both need the GPU), the
     // lease just makes that dependency explicit + OOM-safe.
     //
-    // Capture the exchange from the session (clean strings, same source as
-    // the memory archive: sidesteps the token-boundary-drift landmine the
-    // same way). Read inside a brief lock, clone out, then drop the guard
-    // before spawning so the task doesn't pin the session mutex.
-    let (user_text, asst_text) = {
-        let s = state.session.lock().await;
-        let user = s.messages.len().checked_sub(2).and_then(|i| s.messages.get(i)).map(|m| m.content.clone());
-        (user, result.content.clone())
+    // Capture the exchange for the delta pass (clean strings, same source as
+    // the memory archive). (2026-08-24 review fix) The user half is the
+    // turn's OWN input — NOT the session tail: on a tool-firing turn the
+    // tail is [user, assistant(toolcall), tool_response marker, final], so
+    // the old checked_sub(2) lookup resolved to the `__tool_response__`
+    // machine-marker JSON and fed THAT to `should_fire_delta` + the delta
+    // prompt as the "user exchange" (the exact bug the 2026-08-15 audit
+    // comment above the archiver describes; only the archiver was switched
+    // to `text` then). `text` is still in scope and is exactly the player's
+    // message — no session lock needed.
+    let user_text: Option<String> = if text.trim().is_empty() {
+        None
+    } else {
+        Some(text.clone())
     };
+    let asst_text = result.content.clone();
     // The delta pass is a full local-model (E4B) forward pass. Skip it for clearly non-
     // substantive turns (short filler like "ok"/"thanks", or empty replies)
     //: see `should_fire_delta` for the conservative heuristic. 99% of real
@@ -4010,15 +4296,25 @@ async fn chat_send(
     } else {
         let current_schema = state.schema.lock().await.clone();
         // Drain the failed-delta queue (fail-proof contract §5 layer 3):
-        // prior turns' attempts that exhausted all 3 passes WITHOUT
+        // prior turns' attempts that exhausted all passes WITHOUT
         // committing. Folded into this turn's delta prompt so the model
         // gets a fresh shot with the new exchange as anchor. Take()
         // empties the slot: if THIS turn also fails, the new failure is
-        // re-enqueued below.
-        let deferred = {
+        // re-enqueued below. (2026-08-24 fix) CHAT-surface only — a Fable
+        // failure diffs against a different schema and stays queued for
+        // its own surface's drain.
+        let mut deferred: Vec<schema_engine::FailedAttempt> = Vec::new();
+        {
             let mut q = state.failed_delta_queue.lock().await;
-            std::mem::take(&mut *q)
-        };
+            q.retain(|a| {
+                if a.surface == schema_engine::DeltaSurface::Chat {
+                    deferred.push(a.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         if !deferred.is_empty() {
             tracing::info!(
                 deferred = deferred.len(),
@@ -4067,6 +4363,7 @@ async fn chat_send(
                     (user_text.unwrap_or_default(), asst_text),
                     &current_schema,
                     deferred.clone(),
+                    schema_engine::DeltaSurface::Chat,
                 )
             {
                 Ok(rx) => rx,
@@ -4124,7 +4421,7 @@ async fn chat_send(
                         push_failed_attempt_capped(&mut q, failed);
                         tracing::warn!(
                             error = %reply.error,
-                            "schema delta failed all 3 passes; queued for next-turn re-attempt"
+                            "schema delta failed all passes; queued for next-turn re-attempt"
                         );
                     } else if !reply.error.is_empty() {
                         for prior in deferred {
@@ -4171,15 +4468,15 @@ fn clear_active_cancel(state: &tauri::State<'_, AppState>, token: &llm::CancelTo
 }
 
 /// Run a chat turn on the local backend (or the EchoBackend last-resort when
-/// no local model is loaded). The local backend is ALWAYS resident under the
-/// v0.6.3 redesign: it's the silent agent doing schema/memory tracking AND the
-/// seamless fallback when the API is unhealthy.
+/// no local model is loaded). The local backend is the silent agent doing
+/// tool dispatch + schema/memory tracking AND the seamless fallback when the
+/// API is unhealthy (2026-08-24 hybrid chat).
 ///
-/// `window` is the message-window size to re-assemble. The API path may have
-/// assembled 12 above; on fallback we re-assemble at 6 to match the local
-/// engine's KV-cache-coherent delta-prefill (the local engine only ever saw
-/// the 6-window render, so feeding it the same shape keeps the fast delta
-/// path). The local-only path passes `visible_window` (6) through unchanged.
+/// `window` is the message-window size to re-assemble — always the local
+/// `WINDOW_LOCAL_CHAT` (16, 2026-08-24 parity ruling) render, matching the
+/// local engine's KV-cache-coherent delta-prefill. The hybrid API pass
+/// assembles its own window separately (`wupi_api_reply`) and never comes
+/// through here.
 ///
 /// Re-assembles from the live session (the user message was already appended
 /// by the caller) rather than re-slicing a stale `messages` vec, so the
@@ -4249,17 +4546,25 @@ async fn run_local_or_echo(
 /// and re-decodes. Up to `tools::MAX_TOOL_ITERATIONS` rounds per `chat_send`
 /// turn (mirrors the schema engine's 3-pass contract philosophy).
 ///
-/// Returns `(final_parsed_output, tools_fired)`. The caller uses `tools_fired`
-/// to decide whether to skip the API path: if the local agent handled the
-/// request via tools, the API isn't consulted (the tool-response-driven final
-/// decode IS the user-visible reply).
+/// Returns `(final_parsed_output, tools_fired, tool_transcript)`. The
+/// transcript records every executed call (name/args/ok/output) for the
+/// hybrid API handoff; `tools_fired` flags the done event. In HYBRID mode
+/// (`hybrid == true`, 2026-08-24) the loop is a pure tool DISPATCHER for the
+/// API reply pass: a no-tool decode is the `[handoff]` sentinel — discarded,
+/// never committed — and iteration-cap exhaustion hands off with the
+/// transcript instead of forcing a local prose decode. The user-visible
+/// reply comes from `wupi_api_reply` (or the local fallback on API
+/// failure). In non-hybrid mode the final no-tool decode IS the reply, as
+/// before.
 ///
 /// # Event channel
 ///
 /// Each iteration emits `tool_call` and `tool_result` events through `on_event`
 /// so the frontend can show chips ("🔧 calling file_read…", "✓ file_read").
-/// The final iteration's `chunk`s stream normally via `on_chunk` inside
-/// `run_local_or_echo`.
+/// In non-hybrid mode the final iteration's `chunk`s stream normally via
+/// `on_chunk` inside `run_local_or_echo`; in hybrid mode ALL local decode
+/// chunks go to a sinkhole (dispatch prose + the `[handoff]` sentinel are
+/// internal machinery — the bubble shows only the API stream + tool chips).
 ///
 /// # Tool-turn insertion (cache-coherent)
 ///
@@ -4271,10 +4576,10 @@ async fn run_local_or_echo(
 ///   2. The tool-response turn (a user-role message carrying the
 ///      `<|tool_response>` content marker).
 ///
-/// Both inserts go inside the session lock critical section. The existing
-/// archiver/delta logic uses `checked_sub(2)` indexing against the final
-/// message list, which still resolves correctly because the inserts land
-/// AFTER the user's original message and BEFORE the next prefill.
+/// Both inserts go inside the session lock critical section. The archiver
+/// and the delta pass both read their user text from the turn's OWN input
+/// (`text`, never a session-tail index — the 2026-08-24 review fix), so the
+/// inserts landing after the user's original message disturb nothing.
 
 // ---------------------------------------------------------------------------
 // Fable-state tool dispatch (2026-08-11)
@@ -4478,10 +4783,616 @@ async fn dispatch_fable_state_tool(
             );
             format!("patched schema fields: {}", merged_keys.join(", "))
         }
+        // (2026-08-23 NPC export/import) The two card-bridge tools. Both
+        // run inline in the dispatch (the export's HTTP wait holds no local
+        // lock — the turn lock is held by THIS chat, and the API never
+        // touches it).
+        "fable_npc_export" => {
+            let surface = call.args["npc_id"].as_str().unwrap_or("").trim().to_string();
+            export_npc_card(state, app, &surface).await?
+        }
+        "fable_npc_import" => {
+            let card_arg = call.args["card_id"].as_str().unwrap_or("").trim().to_string();
+            import_npc_card(state, app, &card_arg).await?
+        }
         _ => return Ok(None), // unreachable: is_fable_state_tool gated above
     };
     Ok(Some(outcome))
 }
+
+// ---------------------------------------------------------------------------
+// (2026-08-23) NPC export / import — the WUPI tool surface
+// ---------------------------------------------------------------------------
+
+/// The live-simulation facts an export drafts against. Assembled under the
+/// schema lock (plus retrieved memories), then handed to the PURE helpers
+/// below — everything testable stays AppState-free.
+pub(crate) struct NpcExportFacts {
+    pub id: String,
+    pub name: String,
+    pub role: String,
+    pub tier: Option<String>,
+    pub aliases: Vec<String>,
+    pub mood: Option<String>,
+    pub intent: Option<String>,
+    /// The worn rack (outfit) — becomes the card's Clothing line.
+    pub worn: Vec<String>,
+    /// The held rack — becomes the card's Stored line.
+    pub held: Vec<String>,
+    /// The relationship tier, if one is tracked.
+    pub relationship: Option<String>,
+    /// Recent relationship milestones (bounded).
+    pub milestones: Vec<String>,
+    /// Free-form `npc.<id>.*` entity strings (bounded).
+    pub entities: Vec<(String, String)>,
+    /// Retrieved episodic memory rows mentioning the NPC (bounded, set
+    /// after the lock drops).
+    pub memories: Vec<String>,
+}
+
+/// Render the facts dossier the API sees. Pure. Bounded: every list carries
+/// its own small cap here (not at assembly) so the dossier cannot balloon
+/// the CTX_API request regardless of schema composition.
+pub(crate) fn build_npc_export_dossier(f: &NpcExportFacts) -> String {
+    let mut out = String::with_capacity(1_024);
+    out.push_str("## THE NPC (mechanical facts — high fidelity, never contradict)\n");
+    out.push_str(&format!("- Name: {}\n", f.name));
+    out.push_str(&format!("- Id: {}\n", f.id));
+    // Learned surface names — the parser's alias list. Name + id are deduped
+    // out (they already ride the lines above); the remainder are facts GLM
+    // must see (the never-invent law cuts both ways: never DROP them either).
+    let extra_aliases: Vec<&str> = f
+        .aliases
+        .iter()
+        .map(|a| a.trim())
+        .filter(|a| {
+            !a.is_empty()
+                && !a.eq_ignore_ascii_case(f.name.trim())
+                && !a.eq_ignore_ascii_case(f.id.trim())
+        })
+        .take(6)
+        .collect();
+    if !extra_aliases.is_empty() {
+        out.push_str(&format!("- Also known as: {}\n", extra_aliases.join(", ")));
+    }
+    if !f.role.trim().is_empty() {
+        out.push_str(&format!("- Role: {}\n", f.role.trim()));
+    }
+    if let Some(tier) = f.tier.as_deref().filter(|t| !t.trim().is_empty()) {
+        out.push_str(&format!("- Standing/tier: {tier}\n"));
+    }
+    if let Some(mood) = f.mood.as_deref().filter(|m| !m.trim().is_empty()) {
+        out.push_str(&format!("- Current mood: {}\n", mood.trim()));
+    }
+    if let Some(intent) = f.intent.as_deref().filter(|i| !i.trim().is_empty()) {
+        out.push_str(&format!("- Current intent: {}\n", intent.trim()));
+    }
+    if let Some(rel) = f.relationship.as_deref().filter(|r| !r.trim().is_empty()) {
+        out.push_str(&format!("- Relationship to the player: {rel}\n"));
+    }
+    if !f.worn.is_empty() {
+        out.push_str(&format!("- Worn (the outfit): {}\n", f.worn.iter().take(10).cloned().collect::<Vec<_>>().join(", ")));
+    }
+    if !f.held.is_empty() {
+        out.push_str(&format!("- Carried: {}\n", f.held.iter().take(10).cloned().collect::<Vec<_>>().join(", ")));
+    }
+    if !f.milestones.is_empty() {
+        out.push_str("## RELATIONSHIP HISTORY (what actually happened)\n");
+        for m in f.milestones.iter().take(8) {
+            out.push_str(&format!("- {}\n", m));
+        }
+    }
+    if !f.entities.is_empty() {
+        out.push_str("## TRACKED TRAITS\n");
+        for (k, v) in f.entities.iter().take(12) {
+            out.push_str(&format!("- {}: {}\n", k, v));
+        }
+    }
+    if !f.memories.is_empty() {
+        out.push_str("## SCENES THEY LIVED (episodic recall — the card's voice grows from these)\n");
+        for m in f.memories.iter().take(5) {
+            let bounded: String = m.chars().take(400).collect();
+            out.push_str(&format!("- {bounded}\n"));
+        }
+    }
+    out
+}
+
+/// The wizard-style prompt pair: Rust builds both sides, the API drafts ONE
+/// fenced JSON object, Rust serializes the card (GLM never writes XML).
+/// Mirrors the creator-assistant input-curation law: map facts with high
+/// fidelity, compress to core beats, never invent.
+pub(crate) fn build_npc_export_prompts(dossier: &str) -> (String, String) {
+    let system = "\
+You are the NPC card writer. You receive the mechanical facts + lived scenes \
+of ONE played character and draft their shareable persona card as ONE fenced \
+```json object. Curate with high fidelity: every fact you are given is true \
+and must survive; unknown fields stay empty strings — NEVER invent traits, \
+history, or numbers the facts do not support. Compress prose to its core \
+beats; the card is a portrait, not a chronicle. Write in the simulation's \
+language.
+
+Output format (raw JSON only, no prose outside the fence):
+{
+  \"identity\": {\"gender\": \"\", \"race\": \"\", \"age\": \"\", \"height\": \"\", \
+\"weight\": \"\", \"body\": \"\", \"skin\": \"\", \"eyes\": \"\", \"hair_color\": \"\", \
+\"hair_length\": \"\", \"hair_style\": \"\"},
+  \"persona\": {\"personality\": \"\", \"conversation_style\": \"\", \"likes\": \"\", \
+\"dislikes\": \"\", \"flaws\": \"\", \"goals\": \"\", \"occupation\": \"\", \"backstory\": \"\"},
+  \"setting\": \"one line: the world this character belongs to (from their scenes)\",
+  \"plot\": \"one line: the hook they carry into a new campaign\"
+}
+Every value is a short string; unknown = \"\". The backstory is the ARC of \
+their played life (what the scenes + milestones actually show), told in at \
+most 6 sentences.";
+    let user = format!(
+        "Draft the NPC card for this played character.\n\n{dossier}\n\
+         Output ONLY the fenced ```json object."
+    );
+    (system.to_string(), user)
+}
+
+/// Parse the API's draft: fenced ```json first, then bare JSON, then the
+/// repair pipeline. `None` when nothing parseable arrived.
+pub(crate) fn parse_npc_card_draft(raw: &str) -> Option<serde_json::Value> {
+    let fenced = raw
+        .split("```")
+        .nth(1)
+        .map(|body| body.trim_start_matches("json").trim())
+        .filter(|b| !b.is_empty())
+        .unwrap_or(raw.trim());
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(fenced) {
+        if v.is_object() {
+            return Some(v);
+        }
+    }
+    let repaired = crate::json_repair::repair(fenced);
+    serde_json::from_str::<serde_json::Value>(&repaired)
+        .ok()
+        .filter(|v| v.is_object())
+}
+
+/// Fold the draft + the facts into a v2 npc `SimCard`. Pure. Rust owns the
+/// mechanical half (id, inventory from the live racks, tier/relationship
+/// tags); the API owns only the prose the draft carries. Rust serializes —
+/// GLM never writes XML.
+pub(crate) fn build_npc_card_from_draft(
+    draft: &serde_json::Value,
+    f: &NpcExportFacts,
+) -> sim_card::SimCard {
+    let s = |obj: &serde_json::Value, key: &str| -> Option<String> {
+        obj.get(key)
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let identity_src = draft.get("identity").cloned().unwrap_or_default();
+    let persona_src = draft.get("persona").cloned().unwrap_or_default();
+    let mut card = sim_card::fallback();
+    card.name = f.name.clone();
+    // (2026-08-23 audit fix) The LIVE registry id, not slugify(name): a
+    // discovered NPC's registry id can differ from its name slug, and a
+    // name-slug card re-imported into the SAME simulation would register a
+    // duplicate Core NPC (the id-equality refusal can't see it). Registry
+    // ids are already sanitize_slug-shaped, so the card keeps a legal id.
+    card.id = sanitize_slug(&f.id);
+    card.card_type = "simulation".to_string();
+    card.subtype = Some("npc".to_string());
+    card.format_v2 = true;
+    card.identity = sim_card::CardIdentity {
+        gender: s(&identity_src, "gender"),
+        race: s(&identity_src, "race"),
+        age: s(&identity_src, "age"),
+        height: s(&identity_src, "height"),
+        weight: s(&identity_src, "weight"),
+        body: s(&identity_src, "body"),
+        skin: s(&identity_src, "skin"),
+        eyes: s(&identity_src, "eyes"),
+        hair_color: s(&identity_src, "hair_color"),
+        hair_length: s(&identity_src, "hair_length"),
+        hair_style: s(&identity_src, "hair_style"),
+        extra: Vec::new(),
+    };
+    card.persona = sim_card::CardPersona {
+        personality: s(&persona_src, "personality"),
+        conversation_style: s(&persona_src, "conversation_style"),
+        likes: s(&persona_src, "likes"),
+        dislikes: s(&persona_src, "dislikes"),
+        flaws: s(&persona_src, "flaws"),
+        goals: s(&persona_src, "goals"),
+        // The drafted occupation wins; the live registry ROLE (pure fact)
+        // backfills when the draft left it empty.
+        occupation: s(&persona_src, "occupation").or_else(|| {
+            let r = f.role.trim();
+            (!r.is_empty()).then(|| r.to_string())
+        }),
+        backstory: s(&persona_src, "backstory"),
+        extra: Vec::new(),
+    };
+    card.setting = s(draft, "setting");
+    card.plot = s(draft, "plot");
+    // Inventory: pure FACTS from the live racks (never drafted).
+    card.inventory = sim_card::CardInventory {
+        clothing: f.worn.clone(),
+        equipped: Vec::new(),
+        accessories: Vec::new(),
+        stored: f.held.clone(),
+    };
+    if let Some(tier) = f.tier.as_deref().filter(|t| !t.trim().is_empty()) {
+        card.custom_tags.insert("tier".to_string(), tier.to_string());
+    }
+    if let Some(rel) = f.relationship.as_deref().filter(|r| !r.trim().is_empty()) {
+        card.custom_tags
+            .insert("relationship".to_string(), rel.to_string());
+    }
+    card
+}
+
+/// The npc-card → live-simulation registration, extracted from
+/// `enter_fable_session`'s self-registration block so the WUPI import tool
+/// reuses the EXACT seeding semantics (Core entry + the garment-routed
+/// interior seed, idempotent by item name). Returns `Ok(true)` when the
+/// registry entry was pushed, `Ok(false)` when it already existed (the
+/// `idempotent` enter path still seeds); `Err` on the hard collisions —
+/// the enter path skips those silently (logged), the import tool rejects.
+pub(crate) fn register_npc_card_in_schema(
+    s: &mut schema::WorldSchema,
+    card: &sim_card::SimCard,
+    player_slug: &str,
+    idempotent: bool,
+) -> Result<bool, String> {
+    // (2026-08-19 player-name guard, entry seam) An npc card sharing the
+    // attached player's exact name would self-register the player as an NPC.
+    if !player_slug.is_empty()
+        && (sanitize_slug(&card.id) == player_slug || sanitize_slug(&card.name) == player_slug)
+    {
+        return Err(format!(
+            "{} shares the attached player's name — refused",
+            card.name
+        ));
+    }
+    let already = s.npc_registry.entries.iter().any(|e| e.id == card.id);
+    if already && !idempotent {
+        return Err(format!(
+            "an NPC named {} (id {}) already exists in this simulation",
+            card.name, card.id
+        ));
+    }
+    if !already {
+        s.npc_registry.entries.push(schema::NpcEntry {
+            id: card.id.clone(),
+            name: card.name.clone(),
+            role: String::new(),
+            tier: None,
+            aliases: vec![card.name.clone()],
+            prominence: schema::NpcProminence::Core,
+        });
+    }
+    if !card.inventory.is_empty() {
+        let rack = s.npc_interior.entry(card.id.clone()).or_default();
+        // (2026-08-19 zone sweep, Chloe ruling: npc-card clothing is
+        // auto-EQUIPPED and tracked from turn one) The outfit splits from
+        // the held rack: Clothing + garment-routable Equipped/Accessories
+        // WEAR (`worn`); weapon-ish Equipped + non-specific Accessories +
+        // Stored stay HELD (the `[NPC_ITEM]` theft loop's rack).
+        let weaponish = |name: &str| {
+            const WEAPON_TERMS: [&str; 14] = [
+                "sword", "blade", "axe", "bow", "dagger", "staff", "spear", "hammer",
+                "knife", "wand", "mace", "lance", "rapier", "scythe",
+            ];
+            let lower = name.to_lowercase();
+            WEAPON_TERMS.iter().any(|t| lower.contains(t))
+        };
+        let worn_class = |name: &str, from_clothing: bool| {
+            if from_clothing {
+                return true;
+            }
+            let lower = name.to_lowercase();
+            !weaponish(name) && equipment::route_item_to_slot(&lower).is_some()
+        };
+        for (name, line) in card
+            .inventory
+            .clothing
+            .iter()
+            .map(|n| (n, 0))
+            .chain(card.inventory.equipped.iter().map(|n| (n, 1)))
+            .chain(card.inventory.accessories.iter().map(|n| (n, 2)))
+            .chain(card.inventory.stored.iter().map(|n| (n, 3)))
+        {
+            let name = name.trim();
+            if name.is_empty() {
+                continue;
+            }
+            let already_worn = rack
+                .worn
+                .iter()
+                .any(|i| i.name.trim().eq_ignore_ascii_case(name));
+            let already_held = rack
+                .items
+                .iter()
+                .any(|i| i.name.trim().eq_ignore_ascii_case(name));
+            if already_worn || already_held {
+                continue;
+            }
+            let equippable = line != 3;
+            let item = equipment::StackItem {
+                name: name.to_string(),
+                qty: 1,
+                stats: None,
+                tags: if equippable {
+                    vec![equipment::ItemTag::Equippable]
+                } else {
+                    vec![]
+                },
+                ..equipment::StackItem::default()
+            };
+            let wear = match line {
+                0 => true,
+                1 => worn_class(name, false),
+                2 => worn_class(name, false),
+                _ => false,
+            };
+            if wear {
+                equipment::stack_upsert(&mut rack.worn, item);
+            } else {
+                equipment::stack_upsert(&mut rack.items, item);
+            }
+        }
+        while rack.worn.len() > schema::NPC_WORN_MAX {
+            rack.worn.remove(0);
+        }
+    }
+    Ok(!already)
+}
+
+/// Write a finished card to the cards tree — the create_sim_card tool's
+/// composition (walker-resolved existing folder OR collision-relieved
+/// display stem, atomic write, id→folder cache), minus the XML parse (we
+/// hold the typed card). Returns the relative path written.
+pub(crate) fn write_sim_card_internal(
+    app: &tauri::AppHandle,
+    card: &sim_card::SimCard,
+) -> Result<String, String> {
+    ensure_playable_v2(card)?;
+    let cards_root = resolve_fable_cards_dir(app)
+        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
+    let existing = resolve_card_folder(&cards_root, &card.id);
+    let stem = match &existing {
+        Some(folder) => folder
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(&card.name)
+            .to_owned(),
+        None => unique_display_stem(&cards_root, &card.name, "Card", None),
+    };
+    let rel = format!("apps/fable/cards/{stem}/{stem}.sim");
+    let path = cards_root.join(format!("{stem}/{stem}.sim"));
+    let parent = path
+        .parent()
+        .ok_or_else(|| "no parent dir".to_string())?
+        .to_path_buf();
+    std::fs::create_dir_all(&parent).map_err(|e| format!("mkdir: {e}"))?;
+    let xml = card.serialize_v2();
+    if xml.len() > 100_000 {
+        return Err("card exceeds the 100 KB cap".to_string());
+    }
+    // The atomic temp+rename discipline (the create_sim_card tool's).
+    let file_name = format!("{stem}.sim");
+    let tmp = parent.join(format!(".{}.{}", file_name, fable_save::unique_tmp_suffix()));
+    std::fs::write(&tmp, xml.as_bytes()).map_err(|e| format!("write temp: {e}"))?;
+    if let Err(first_err) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&path);
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("rename onto {rel:?} failed ({first_err}, retry {e})"));
+        }
+    }
+    cache_card_folder(&cards_root, &card.id, &parent);
+    Ok(rel)
+}
+
+/// `fable_npc_export` — resolve the NPC, assemble the dossier, draft through
+/// the narrator API (the wizard's Rust-prompted one-shot shape — an HTTP
+/// call needs no local-model lock, so it runs INLINE in the tool dispatch;
+/// the drawer's tool chip shows it live), then Rust builds + writes the
+/// card. The simulation is never modified.
+async fn export_npc_card(
+    state: &tauri::State<'_, AppState>,
+    app: &tauri::AppHandle,
+    surface: &str,
+) -> Result<String, String> {
+    // 1. Facts under the schema lock (never held across the HTTP wait).
+    let facts: Option<NpcExportFacts> = {
+        let s = state.fable_schema.lock().await;
+        let entry = schema::resolve_npc_surface(&s.npc_registry.entries, surface)
+            .ok_or_else(|| {
+                format!(
+                    "no NPC named \"{surface}\" in this simulation — use the id or name from the cast"
+                )
+            })?
+            .clone();
+        let interior = s.npc_interior.get(&entry.id);
+        let rel = s.relationships.get(&entry.id);
+        let prefix = format!("npc.{}.", entry.id);
+        let entities: Vec<(String, String)> = s
+            .entities
+            .iter()
+            .filter(|(k, _)| k.starts_with(&prefix))
+            .take(12)
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    v.as_str().map(|s| s.to_string()).unwrap_or_default(),
+                )
+            })
+            .collect();
+        Some(NpcExportFacts {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            role: entry.role.clone(),
+            tier: entry.tier.clone(),
+            aliases: entry.aliases.clone(),
+            mood: interior.and_then(|i| i.mood.clone()),
+            intent: interior.and_then(|i| i.intent.clone()),
+            worn: interior
+                .map(|i| i.worn.iter().map(|w| w.name.clone()).collect())
+                .unwrap_or_default(),
+            held: interior
+                .map(|i| i.items.iter().map(|w| w.name.clone()).collect())
+                .unwrap_or_default(),
+            relationship: rel.map(|r| format!("{:?}", r.tier)),
+            milestones: rel
+                .map(|r| r.events.iter().rev().take(8).cloned().collect())
+                .unwrap_or_default(),
+            entities,
+            memories: Vec::new(),
+        })
+    };
+    let mut facts = facts.ok_or("schema lock poisoned")?;
+    // 2. Episodic recall (lock dropped): the NPC's lived scenes. Partition =
+    // the ACTIVE memory partition (a branch's `card#session` key), so a
+    // branched session's dossier recalls the branch's scenes, not the base
+    // card partition's.
+    if let Some(engine) = state.memory.get() {
+        let partition = state
+            .active_memory_partition
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Ok(hits) = engine.search(&facts.name, &partition, 5, None).await {
+            facts.memories = hits.into_iter().map(|h| h.entry.text_content).collect();
+        }
+    }
+    // 3. The API gate + profile (the creator path's exact checks).
+    require_api_for_fable(state).map_err(|e| format!("NPC export needs the narrator API: {e}"))?;
+    let profile = {
+        let cfg = state.api_config.lock().unwrap_or_else(|e| e.into_inner());
+        cfg.active_profile().cloned()
+    };
+    let Some(profile) = profile else {
+        return Err("NPC export needs the narrator API — no active profile".to_string());
+    };
+    // 4. Draft: one-shot HTTP, no chunk streaming (the tool chip is the UI).
+    let (system, user) = build_npc_export_prompts(&build_npc_export_dossier(&facts));
+    let api_msgs = vec![
+        session::ApiMessage {
+            role: "system".into(),
+            content: system,
+            raw_output: String::new(),
+        },
+        session::ApiMessage {
+            role: "user".into(),
+            content: user,
+            raw_output: String::new(),
+        },
+    ];
+    let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
+    let cancel: llm::CancelToken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let http = http_backend_cached(state, &profile);
+    let reply = http
+        .stream(
+            api_msgs,
+            None,
+            None,
+            Vec::new(),
+            settings::CTX_API,
+            noop_chunk,
+            cancel,
+            None,
+        )
+        .await
+        .map_err(|e| format!("the narrator API failed: {e}"))?;
+    let draft = parse_npc_card_draft(&reply.content)
+        .ok_or_else(|| "the API draft was unparseable — try again".to_string())?;
+    // 5. Build + write. Rust serializes; GLM never touches XML.
+    let card = build_npc_card_from_draft(&draft, &facts);
+    let rel = write_sim_card_internal(app, &card)?;
+    tracing::info!(npc = %facts.id, card = %rel, "NPC exported to card");
+    Ok(format!(
+        "card written: {rel} (id '{}') — {} is now a shareable npc card",
+        card.id, facts.name
+    ))
+}
+
+/// `fable_npc_import` — bring an npc card into the LIVE simulation:
+/// off-screen register (Core cast + seeded wardrobe; the narrator introduces
+/// them organically — no presence, no teleport).
+async fn import_npc_card(
+    state: &tauri::State<'_, AppState>,
+    app: &tauri::AppHandle,
+    card_id: &str,
+) -> Result<String, String> {
+    // A narrator turn in flight holds a pre-turn schema snapshot it restores
+    // on cancel/api_lost — an import racing it would be silently reverted
+    // the moment the turn unwound. Refuse while any fable turn runs.
+    if fable_turn_in_flight(state) {
+        return Err(
+            "a narrator turn is still in flight: stop it (or wait) before importing an NPC"
+                .into(),
+        );
+    }
+    // 1. Resolve the card (walker-authoritative).
+    let dir = resolve_fable_cards_dir(app)
+        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
+    let card = find_card_by_id(&dir, card_id)?;
+    if card.subtype.as_deref() != Some("npc") {
+        return Err(format!(
+            "'{}' is a {} card, not an npc card — only npc cards import into a live simulation",
+            card.name,
+            card.subtype.as_deref().unwrap_or("plain")
+        ));
+    }
+    // 2. Register + seed under the schema lock (pre-mutation snapshot first).
+    // The player-name guard reads the AppState cache (the attached
+    // SavedPlayer's name) — the same source enter_fable_session seeds from.
+    let player_slug = state
+        .active_player_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_deref()
+        .map(sanitize_slug)
+        .unwrap_or_default();
+    {
+        let mut s = state.fable_schema.lock().await;
+        let snap = s.clone();
+        register_npc_card_in_schema(&mut s, &card, &player_slug, false)?;
+        drop(s);
+        push_fable_history_snapshot(state, snap).await;
+    }
+    // 3. Persist + notify (the fable_schema_patch discipline).
+    let roleplay_card_id = active_fable_card_id(state)?;
+    let schema_snapshot = state.fable_schema.lock().await.clone();
+    let session_id = active_session_or_err(state)?;
+    save_schema(app, &roleplay_card_id, &session_id, &schema_snapshot).await;
+    let _ = app.emit(
+        "fable-session-changed",
+        serde_json::json!({ "kind": "schema", "imported_npc": card.id }),
+    );
+    tracing::info!(npc = %card.id, "NPC card imported into live simulation");
+    Ok(format!(
+        "{} registered off-screen (Core cast, wardrobe seeded) — the narrator can introduce them naturally in play",
+        card.name
+    ))
+}
+
+/// One executed tool call, recorded for the hybrid API handoff transcript
+/// (2026-08-24). `output` is the full tool output; the transcript renderer
+/// bounds what actually reaches GLM.
+#[derive(Debug, Clone)]
+struct ToolTurn {
+    name: String,
+    args: serde_json::Value,
+    ok: bool,
+    output: String,
+}
+
+/// (2026-08-24 hybrid chat) The dispatch-mode contract appended to the LOCAL
+/// system prompt when the API will write the visible reply. Teaches the E4B
+/// the tools-only pass: emit tool calls; when none are needed, output the
+/// `[handoff]` sentinel. Positive framing, ~60 tokens, present only on hybrid
+/// dispatch turns (never in the API prompt, the fallback decode, or the
+/// non-hybrid local path).
+const WUPI_DISPATCH_CONTRACT: &str = "<dispatch_mode>\nTool dispatch pass. Another model writes the reply User sees. Your job is tools only.\nEmit tool calls using the declared protocol. When no tool is needed — or the tool results are in and another call will not help — output exactly: [handoff]\nConversational prose has no place in this pass.\n</dispatch_mode>";
 
 async fn run_agent_loop(
     state: &tauri::State<'_, AppState>,
@@ -4496,7 +5407,8 @@ async fn run_agent_loop(
     on_chunk: llm::ChunkFn,
     cancel: llm::CancelToken,
     backend_opt: Option<Arc<llm::LlamaCppBackend>>,
-) -> Result<(chat_format::ParsedOutput, bool), ()> {
+    hybrid: bool,
+) -> Result<(chat_format::ParsedOutput, bool, Vec<ToolTurn>), ()> {
     use tools::ToolCtx;
 
     // NOTE: the API-mode `force_full_ctx` teardown used to live here but was
@@ -4507,15 +5419,23 @@ async fn run_agent_loop(
     // producing "model not loaded yet" errors. See chat_send's
     // `force_full_ctx` block (~line 2646) for the full Bug #2 history.
 
+    // Hybrid dispatch decodes stream to a SINKHOLE: the `[handoff]` sentinel
+    // (and any contract prose the model leaks around tool calls) is internal
+    // machinery. The user's bubble carries only the API stream + tool chips.
+    let sinkhole: llm::ChunkFn = Arc::new(|_piece: &str| {});
+
     // No tools → no loop; just decode once. This is the common chat case.
+    // (Hybrid never lands here with tools attached; the API-direct no-backend
+    // case is short-circuited in `chat_send` before the loop.)
     if tools.is_empty() {
+        let decode_chunk: llm::ChunkFn = if hybrid { sinkhole } else { on_chunk };
         let result = run_local_or_echo(
             state, on_event, system_prompt, window,
             memory_block, world_state, Vec::new(),
-            context_size, on_chunk, cancel, backend_opt.as_ref(),
+            context_size, decode_chunk, cancel, backend_opt.as_ref(),
         )
         .await?;
-        return Ok((result, false));
+        return Ok((result, false, Vec::new()));
     }
 
     let install_root = resolve_install_root(app);
@@ -4532,26 +5452,40 @@ async fn run_agent_loop(
 
     // Iterate. Each iteration: decode → parse tool calls → execute → insert
     // response turns → re-decode. Break when the model emits no tool calls
-    // OR we hit the iteration cap (then we force a final no-tools prose decode
-    // so the user gets a reply rather than a dangling tool-call echo).
+    // OR we hit the iteration cap (in non-hybrid mode we then force a final
+    // no-tools prose decode so the user gets a reply rather than a dangling
+    // tool-call echo; in hybrid mode we hand off to the API with the
+    // transcript — GLM reports what ran).
     let mut tools_fired = false;
+    let mut transcript: Vec<ToolTurn> = Vec::new();
     let mut iteration = 0usize;
 
     while iteration < tools::MAX_TOOL_ITERATIONS {
         iteration += 1;
+        let decode_chunk: llm::ChunkFn = if hybrid {
+            sinkhole.clone()
+        } else {
+            on_chunk.clone()
+        };
         let result = run_local_or_echo(
             state, on_event, system_prompt, window,
             memory_block.clone(), world_state.clone(),
             tools.clone(),
-            context_size, on_chunk.clone(), cancel.clone(),
+            context_size, decode_chunk, cancel.clone(),
             backend_opt.as_ref(),
         )
         .await?;
 
         let calls = tools::parse_tool_calls(&result.raw);
         if calls.is_empty() {
-            // No tool calls this round → the model produced a final reply.
-            return Ok((result, tools_fired));
+            // No tool calls this round → in non-hybrid mode the model
+            // produced the final reply. In hybrid mode this decode was the
+            // dispatch contract's `[handoff]` sentinel (or disobedient
+            // prose — discarded either way): the turn goes to the API.
+            if hybrid {
+                return Ok((chat_format::ParsedOutput::empty(), tools_fired, transcript));
+            }
+            return Ok((result, tools_fired, transcript));
         }
 
         // We have tool calls. Commit the assistant's tool-call turn first
@@ -4612,7 +5546,17 @@ async fn run_agent_loop(
                                 // The fable_card_delete IPC carries the same
                                 // guard; this is the drawer-chat path (the
                                 // tool is reachable mid-game by design).
-                                if call.name == "delete_sim_card"
+                                //
+                                // (2026-08-24 active-card guards) The broader
+                                // refusal set runs FIRST: create_sim_card
+                                // overwrite of the active card, file_delete
+                                // of its .sim, and file_write of an INVALID
+                                // .sim onto it.
+                                if let Some(refusal) =
+                                    active_card_tool_refusal(state, app, call)
+                                {
+                                    (false, refusal)
+                                } else if call.name == "delete_sim_card"
                                     && tool_delete_targets_active_card(state, &call.args)
                                 {
                                     (false, "error: that card's game session is active — exit to the title screen before deleting it".to_string())
@@ -4625,8 +5569,26 @@ async fn run_agent_loop(
                             }
                             Err(e) => (false, format!("invalid args: {e}")),
                         },
-                    None => (false, format!("unknown tool: {}", call.name)),
-                },
+                        None => {
+                            // (2026-08-24) Near-name hint so the repair loop
+                            // can self-correct a typo in one round trip.
+                            let mut known: Vec<String> =
+                                registry.iter().map(|t| t.spec().name.clone()).collect();
+                            known.extend(
+                                tools::FABLE_STATE_TOOL_NAMES
+                                    .iter()
+                                    .map(|s| (*s).to_owned()),
+                            );
+                            (
+                                false,
+                                format!(
+                                    "unknown tool: {}{}",
+                                    call.name,
+                                    tools::near_name_hint(&call.name, &known)
+                                ),
+                            )
+                        }
+                    },
             };
 
             // delete_sim_card removed the card FOLDER; its memory partition
@@ -4672,6 +5634,24 @@ async fn run_agent_loop(
                                 }
                             }
                         }
+                        // (2026-08-22 session decoupling) The tool's folder
+                        // delete must match `fable_card_delete`'s TOTAL
+                        // footprint: the sessions tree under
+                        // `data/saves/<Name>/` dies with the card (captured
+                        // pre-delete — see SimDeleteAftermath). Best-effort.
+                        if let Some(tree) =
+                            aftermath.as_ref().and_then(|a| a.sessions_tree.clone())
+                        {
+                            if tree.is_dir() {
+                                if let Err(e) = std::fs::remove_dir_all(&tree) {
+                                    tracing::warn!(
+                                        tree = %tree.display(),
+                                        err = %e,
+                                        "tool card delete: session tree removal failed (continuing)"
+                                    );
+                                }
+                            }
+                        }
                         let mut keys = vec![slug.clone()];
                         if let Some(parsed) = aftermath.and_then(|a| a.parsed_id) {
                             if !keys.contains(&parsed) {
@@ -4679,7 +5659,7 @@ async fn run_agent_loop(
                             }
                         }
                         for key in keys {
-                            match engine.purge_card_partition(&key).await {
+                            match engine.purge_card_family(&key).await {
                                 Ok(0) => {}
                                 Ok(n) => tracing::info!(card_id = %key, purged = n, "tool-deleted card's memory partition purged"),
                                 Err(e) => tracing::error!(
@@ -4701,6 +5681,15 @@ async fn run_agent_loop(
                 "output": outcome.1,
             }));
 
+            // (2026-08-24 hybrid chat) Record the executed call for the API
+            // handoff transcript (rendered bounded by `render_tool_activity`).
+            transcript.push(ToolTurn {
+                name: call.name.clone(),
+                args: call.args.clone(),
+                ok: outcome.0,
+                output: outcome.1.clone(),
+            });
+
             // Insert the tool-response turn. We use a content marker the
             // formatter recognizes (chat_format.rs renders `<|tool_response>`
             // from it, cache-coherently). User-role so it reads as the
@@ -4719,20 +5708,181 @@ async fn run_agent_loop(
         // Loop continues → next iteration decodes with the extended session.
     }
 
-    // Iteration cap hit. The last assistant turn we committed was a tool-call
-    // turn; do one final no-tools decode so the user gets a prose reply
-    // rather than a dangling tool-call echo.
+    // Iteration cap hit. In hybrid mode hand off to the API with the
+    // transcript — GLM reports what ran (the dispatch contract's job is
+    // done; no forced local prose). In non-hybrid mode the last assistant
+    // turn we committed was a tool-call turn, so do one final no-tools
+    // decode to give the user a prose reply rather than a dangling
+    // tool-call echo.
     tracing::warn!(
         iterations = tools::MAX_TOOL_ITERATIONS,
-        "tool agent loop hit iteration cap; forcing a final prose decode"
+        hybrid,
+        "tool agent loop hit iteration cap; handing off (hybrid) or forcing a final prose decode (local)"
     );
+    if hybrid {
+        return Ok((chat_format::ParsedOutput::empty(), tools_fired, transcript));
+    }
     let final_result = run_local_or_echo(
         state, on_event, system_prompt, window,
         memory_block, world_state, Vec::new(),
         context_size, on_chunk, cancel, backend_opt.as_ref(),
     )
     .await?;
-    Ok((final_result, tools_fired))
+    Ok((final_result, tools_fired, transcript))
+}
+
+/// (2026-08-24 hybrid chat) The GLM reply pass. Assembles the API message
+/// window from the live session — FILTERING OUT the local dispatcher's
+/// internal turns (assistant tool-call turns + user tool-response markers
+/// never happened as far as GLM is concerned) — appends the executed-tool
+/// transcript as a trailing system block, and streams the reply through the
+/// same `chunk` channel the local engine uses. `Err` only on transport
+/// failure; cancellation surfaces as `Ok` with partial/empty content (the
+/// caller finalizes it like a cancelled local decode).
+async fn wupi_api_reply(
+    state: &tauri::State<'_, AppState>,
+    http: &llm::HttpBackend,
+    system_prompt: &str,
+    memory_block: Option<String>,
+    world_state: Option<String>,
+    transcript: &[ToolTurn],
+    on_chunk: llm::ChunkFn,
+    cancel: llm::CancelToken,
+) -> Result<chat_format::ParsedOutput, String> {
+    // Window: the last WINDOW_LOCAL_CHAT messages (16 — 2026-08-24 parity
+    // ruling), dispatcher turns filtered. The filter must run BEFORE the
+    // slice AND BEFORE `normalize_alternating` (dropping internal turns can
+    // create same-role neighbors, e.g. user→user around a removed tool
+    // exchange). Filtering after the slice would burn 2 of the 16 slots per
+    // dispatch round (up to 6 with MAX_TOOL_ITERATIONS = 3) — the window is
+    // 16 USER-VISIBLE messages, so the internals never count against it.
+    let mut messages = {
+        let s = state.session.lock().await;
+        let filtered: Vec<&session::Message> = s
+            .messages
+            .iter()
+            .filter(|m| {
+                !(m.role == session::Role::Assistant
+                    && m.raw_output.contains(tools::TOOL_CALL_MARKER))
+                    && !(m.role == session::Role::User
+                        && m.content.starts_with(tools::TOOL_RESPONSE_MARKER_PREFIX))
+            })
+            .collect();
+        let start = filtered.len().saturating_sub(settings::WINDOW_LOCAL_CHAT);
+        let mut out = vec![session::ApiMessage {
+            role: "system".into(),
+            content: system_prompt.to_owned(),
+            raw_output: String::new(),
+        }];
+        for m in &filtered[start..] {
+            out.push(session::ApiMessage {
+                role: match m.role {
+                    session::Role::User => "user",
+                    session::Role::Assistant => "assistant",
+                    session::Role::System => "system",
+                }
+                .into(),
+                content: m.content.clone(),
+                raw_output: m.raw_output.clone(),
+            });
+        }
+        session::normalize_alternating(out)
+    };
+    if !transcript.is_empty() {
+        messages.push(session::ApiMessage {
+            role: "system".into(),
+            content: render_tool_activity(transcript),
+            raw_output: String::new(),
+        });
+    }
+    match http
+        .stream(
+            messages,
+            memory_block,
+            world_state,
+            Vec::new(), // tools are local-only; the API never sees declarations
+            settings::CTX_API,
+            on_chunk,
+            cancel,
+            Some(settings::API_WUPI_MAX_TOKENS),
+        )
+        .await
+    {
+        Ok(mut out) => {
+            sanitize_api_reply_markers(&mut out);
+            Ok(out)
+        }
+        Err(e) => Err(format!("{e:#}")),
+    }
+}
+
+/// Render the executed-tool transcript for the API reply pass. Bounded: at
+/// most 8 entries (dispatch iterations can fan out), args + output
+/// char-trimmed. Pure — unit-tested.
+fn render_tool_activity(transcript: &[ToolTurn]) -> String {
+    const MAX_ENTRIES: usize = 8;
+    const ARGS_CAP: usize = 200;
+    const OUTPUT_CAP: usize = 300;
+    let mut lines = vec![
+        "<tool_activity>".to_owned(),
+        "You already ran these tools this turn. The work is done — report the results to User concisely; do not re-run or invent tools.".to_owned(),
+    ];
+    for t in transcript.iter().take(MAX_ENTRIES) {
+        let args = compact_args(&t.args, ARGS_CAP);
+        let status = if t.ok { "ok" } else { "FAILED" };
+        let output = trim_chars(&t.output, OUTPUT_CAP);
+        if args.is_empty() {
+            lines.push(format!("- {} → {}: {}", t.name, status, output));
+        } else {
+            lines.push(format!("- {} {} → {}: {}", t.name, args, status, output));
+        }
+    }
+    if transcript.len() > MAX_ENTRIES {
+        lines.push(format!("(+{} more)", transcript.len() - MAX_ENTRIES));
+    }
+    lines.push("</tool_activity>".to_owned());
+    lines.join("\n")
+}
+
+/// Compact JSON args to one line, char-capped (chars, not bytes —
+/// anti-pattern #6). Null args render empty.
+fn compact_args(args: &serde_json::Value, cap: usize) -> String {
+    match args {
+        serde_json::Value::Null => String::new(),
+        v => trim_chars(&serde_json::to_string(v).unwrap_or_default(), cap),
+    }
+}
+
+/// Char-bounded trim with an ellipsis marker (chars, not bytes).
+fn trim_chars(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        s.to_owned()
+    } else {
+        let mut out: String = s.chars().take(cap).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Strip any tool-protocol markers an API reply managed to contain, so the
+/// committed turn can never inject fake protocol examples into the local
+/// engine's later prompt renders (defense-in-depth — GLM has no tool
+/// surface, but the committed raw feeds the Gemma formatter verbatim).
+fn sanitize_api_reply_markers(out: &mut chat_format::ParsedOutput) {
+    const MARKERS: [&str; 6] = [
+        "<|tool_call>",
+        "<tool_call|>",
+        "<|tool_response>",
+        "<tool_response|>",
+        "<|tool>",
+        "<tool|>",
+    ];
+    for marker in MARKERS {
+        if out.content.contains(marker) || out.raw.contains(marker) {
+            out.content = out.content.replace(marker, "");
+            out.raw = out.raw.replace(marker, "");
+        }
+    }
 }
 
 /// Cap on accumulated deferred delta attempts per queue (fail-proof contract
@@ -4865,14 +6015,6 @@ async fn reenqueue_failed_attempts(    queue: &Arc<tokio::sync::Mutex<Vec<schema
 /// Pure arithmetic on the typed `i64` — no calendar library, no fuzzy
 /// comparison, no model discretion. Rust owns the gate; the model can't
 /// talk itself out of generating an off-screen update.
-/// Legacy World Progression tick interval (Fable Seam #4, 2026-07-27).
-/// Superseded 2026-07-27 by the ScenePacing-driven interval
-/// (`SceneMode::progression_interval_hours`) — Combat/Downtime/Exploration
-/// each get their own interval. Retained for any future "fixed-interval"
-/// debug mode + as documentation of the original 24h default.
-#[allow(dead_code)]
-const WORLD_PROGRESSION_INTERVAL_HOURS: u32 = 24;
-
 /// Ring-buffer cap for `AppState::fable_schema_history` (1-click undo,
 /// 2026-07-27). 5 snapshots = the last 5 world-state mutations are undoable.
 /// Bounded to cap memory growth (each clone holds the full `entities`
@@ -4922,6 +6064,37 @@ async fn push_fable_history_snapshot(state: &AppState, snapshot: schema::WorldSc
 /// longer meaningful to undo INTO (it belongs to a different game session).
 async fn clear_fable_history(state: &AppState) {
     state.fable_schema_history.lock().await.clear();
+}
+
+/// (2026-08-24) Truncate the undo ring back to a depth captured at TURN
+/// START. Every revert path in `fable_send` / the edit re-track restores the
+/// live schema but used to leave the dead turn's ring entries behind — the
+/// next Undo popped one and "resurrected" the aborted turn's world state
+/// (then autosaved it). Popping from the BACK removes exactly the entries
+/// this turn pushed (the ring is back-loaded; pre-turn entries sit below).
+/// A no-op when nothing was pushed. Caveat: if the ring was already at
+/// `FABLE_HISTORY_CAP` when the turn started, this turn's pushes FIFO-evicted
+/// the oldest pre-turn entries and `len` never grew past the cap — the
+/// truncation can't distinguish those, so it no-ops (documented edge; the
+/// topmost dead entry there restores the turn's pre-referee world, which is
+/// what the revert already restored).
+async fn truncate_fable_history_to_depth(state: &AppState, depth: usize) {
+    let mut hist = state.fable_schema_history.lock().await;
+    let mut removed = 0usize;
+    while hist.len() > depth {
+        match hist.pop_back() {
+            Some(_) => removed += 1,
+            None => break,
+        }
+    }
+    drop(hist);
+    if removed > 0 {
+        tracing::info!(
+            removed,
+            depth,
+            "undo ring truncated to turn-start depth (turn aborted after pushes)"
+        );
+    }
 }
 
 /// Apply any `[TIME ...]` bracket command from the narrator's output, then
@@ -5015,6 +6188,7 @@ fn apply_ledger_commands(
     s: &mut schema::WorldSchema,
     cmds: &[&bracket_parser::BracketCommand],
     player_slug: &str,
+    narrative_corpus: &[&str],
     reject_directives: &mut Vec<String>,
     undo_snapshot: &mut Option<schema::WorldSchema>,
 ) -> bool {
@@ -5557,6 +6731,22 @@ fn apply_ledger_commands(
                     if *wealth_delta == 0 {
                         continue; // no-op discipline (parser already drops zeros)
                     }
+                    // (2026-08-22 second playtest pass — gain grounding) The
+                    // tracker minted +12 off the player COUNTING their coin
+                    // ("counting the coins in my coinpurse" — a mention, not
+                    // an exchange). A gain applies only when the narrative
+                    // window carries a transfer verb; coin nouns alone never
+                    // ground one. Rejects coach the re-emit for real flows.
+                    if *wealth_delta > 0 && !economy::wealth_gain_grounded(narrative_corpus) {
+                        reject_directives.push(
+                            "Pocket wealth not changed — nothing in this scene moves coin (no payment, loot, or sale in the window). Mentioning coin (counting it, quoting a price, planning a sale) is not gaining it; emit [LEDGER wealth +<n>] only when coin actually changes hands.".to_string(),
+                        );
+                        tracing::debug!(
+                            delta = wealth_delta,
+                            "[LEDGER] wealth gain rejected — no transfer signal in the window"
+                        );
+                        continue;
+                    }
                     let current = s.player_state.wealth as i64;
                     let target = current + *wealth_delta as i64;
                     if target < 0 {
@@ -5590,7 +6780,15 @@ async fn apply_phase3_bracket_commands(
     decay_presence: bool,
     narrative_window: &[session::Message],
     notices: &mut Vec<(&'static str, String)>,
-) -> (bool, Vec<String>) {
+) -> (bool, Vec<String>, Vec<String>) {
+    // Returns `(mutated, reject_directives, event_directives)`.
+    // (2026-08-23 hazard referees) `event_directives` is a SEPARATE channel
+    // from the rejects: rejects feed `tracker_emit_errors` distillation
+    // (the tracker's own next-turn teaching) — an EVENT is a legal,
+    // positive referee outcome (road/city encounter) that must NEVER be
+    // distilled into "you emitted something illegal". Both merge into the
+    // SAME turn's narrator `<directives>` block (events after rejects,
+    // then the time-channel events).
     // `notices`: (kind, text) pairs for the frontend's turn-notice bubbles
     // (2026-08-22 playtest) — automatic inventory moves (equip/auto-wear/
     // pocket/spill) happen silently inside the tracker apply and the player
@@ -5776,6 +6974,37 @@ async fn apply_phase3_bracket_commands(
         .iter()
         .filter(|c| matches!(c, bracket_parser::BracketCommand::Ledger { .. }))
         .collect();
+    // (2026-08-22 living-world) The quest verb + the arcane-pool verb.
+    // QUEST runs after PROMISE (its structural sibling); ARCANA is
+    // independent (a PlayerState mutation). [REST] is NOT here — it is
+    // consumed by apply_time_command_and_maybe_tick (post-[TIME] stamp).
+    let quest_cmds: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Quest { .. }))
+        .collect();
+    let arcana_cmds: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Arcana { .. }))
+        .collect();
+    // (2026-08-22 multihog WS1) The timed-lapse verb: [EXPIRY] arms an
+    // entity-key or site-asset lapse the deterministic clock sweep later
+    // fires (`sweep_entity_expiry` / `sweep_asset_expiry` in the [TIME]
+    // path — zero LLM overhead at expiry time).
+    let expiry_cmds: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Expiry { .. }))
+        .collect();
+    // (2026-08-22 multihog WS2) The barred-way verb: [UNLOCK] flips a
+    // Locked reciprocal connection pair to Open once the narrative
+    // establishes the opening.
+    let unlock_cmds: Vec<&bracket_parser::BracketCommand> = parsed
+        .commands
+        .iter()
+        .filter(|c| matches!(c, bracket_parser::BracketCommand::Unlock { .. }))
+        .collect();
 
     if effects.is_empty()
         && milestones.is_empty()
@@ -5810,6 +7039,16 @@ async fn apply_phase3_bracket_commands(
         // (2026-08-20) Same discipline: a [LEDGER]-only turn (a quiet
         // transaction scene) must reach the applier below.
         && ledger_cmds.is_empty()
+        // (2026-08-22) Same discipline: a [QUEST]-only / [ARCANA]-only turn
+        // must reach the appliers below.
+        && quest_cmds.is_empty()
+        && arcana_cmds.is_empty()
+        // (2026-08-22 multihog WS1) Same discipline: an [EXPIRY]-only turn
+        // must reach the applier below.
+        && expiry_cmds.is_empty()
+        // (2026-08-22 multihog WS2) Same discipline: an [UNLOCK]-only turn
+        // must reach the applier below.
+        && unlock_cmds.is_empty()
     {
         // Phase 5A: even with no bracket commands this turn, presence grace-
         // decay must run if there are existing presences (a turn with zero
@@ -5821,7 +7060,7 @@ async fn apply_phase3_bracket_commands(
         // work, zero snapshot).
         let nothing_to_decay = state.fable_schema.lock().await.presences.is_empty();
         if nothing_to_decay {
-            return (false, Vec::new());
+            return (false, Vec::new(), Vec::new());
         }
     }
 
@@ -5832,6 +7071,9 @@ async fn apply_phase3_bracket_commands(
     // the same `<directives>` block as the Referees' output. Empty for the
     // historical bracket commands (EFFECT/MILESTONE/TASK/WEATHER never reject).
     let mut reject_directives: Vec<String> = Vec::new();
+    // (2026-08-23 hazard referees) Hazard-event directives (road/city
+    // encounters) — the separate positive-outcome channel (see the fn doc).
+    let mut event_directives: Vec<String> = Vec::new();
 
     {
         let mut s = state.fable_schema.lock().await;
@@ -5863,7 +7105,11 @@ async fn apply_phase3_bracket_commands(
                 let kind = consequence::sanitize_tag_kind(tag_kind, label);
                 let tag = consequence::StatusTag {
                     label: label.clone(),
-                    polarity: *polarity,
+                    // (2026-08-22 second playtest pass) Affliction labels
+                    // never count as Buffs — the playtest's four minor
+                    // injuries landed `buff` and nudged `derive_condition`
+                    // UP off wounds.
+                    polarity: consequence::coerce_effect_polarity(label, *polarity),
                     expires_at,
                     source: String::new(),
                     // §11.44: thread the parser's tag_kind into StatusTag.kind.
@@ -6129,6 +7375,18 @@ async fn apply_phase3_bracket_commands(
                 if id.is_empty() {
                     continue;
                 }
+                // (2026-08-24 fix) JS-leakage sentinels + bare numerals never
+                // become places — the live test caught phantom `undefined`
+                // neighbors + numeric ids minting as graph truth. Garbage gets
+                // a teaching reject (the one sanctioned DISCOVER reject:
+                // garbage is not discovery), never a ghost node.
+                if schema::is_garbage_identifier(node_id) {
+                    reject_directives.push(format!(
+                        "Place not registered — \"{node_id}\" is not a usable place id. Give the place its diegetic name (e.g. [DISCOVER forge_district]); never sentinels or bare numbers."
+                    ));
+                    tracing::warn!(raw = %node_id, "[DISCOVER] refused — garbage identifier");
+                    continue;
+                }
                 // (2026-08-20 audit P2-1) Full twin guard, the SAME
                 // resolution chain [TRAVEL] runs before minting:
                 // exact/slug/name, the ≥0.75 typo guard, AND the strict
@@ -6165,7 +7423,11 @@ async fn apply_phase3_bracket_commands(
                         // neighbor ids: `[DISCOVER x neighbors=x]` minted a
                         // self-edge (the player forever "adjacent" to where
                         // they stand; render noise + a degenerate graph).
-                        .filter(|n| !n.is_empty() && *n != id)
+                        // (2026-08-24 fix) Garbage neighbors drop too —
+                        // `neighbors=undefined` minted a phantom reference.
+                        .filter(|n| {
+                            !n.is_empty() && *n != id && !schema::is_garbage_identifier(n)
+                        })
                         .collect(),
                     setting: setting.trim().to_string(), ..Default::default()
                 };
@@ -6224,6 +7486,10 @@ async fn apply_phase3_bracket_commands(
                 None
             }
         });
+        // (2026-08-23 hazard referees) The successful-journey capture for
+        // the post-move ROAD EVENT roll: (from, to, adjacent?) — set by
+        // both success arms below, consumed after the block.
+        let mut travel_move: Option<(String, String, bool)> = None;
         if let Some(dest_raw) = last_travel {
             // Resolve the destination to a canonical node id. The tracker often
             // emits diegetic names ("Market Square") instead of bare slugs
@@ -6295,7 +7561,88 @@ async fn apply_phase3_bracket_commands(
                     s.travel_graph.link_nodes(&from_id, &dest);
                     let prev = s.travel_graph.current_node.clone();
                     s.travel_graph.current_node = Some(dest.clone());
+                    // (2026-08-22 living-world) Departure clears the
+                    // departed site's re-entry digest — the player has now
+                    // read those "changed since your last visit" lines for
+                    // the duration of their stay.
+                    if let Some(prev_id) = prev.as_deref() {
+                        // (2026-08-23 hosted interiors) AUTO-COLLAPSE:
+                        // traveling away exits any active building first —
+                        // clear the chain + stamp both levels (you can't
+                        // stand in a tavern forty miles behind you). The
+                        // narrator prose covers the walk-out.
+                        if let Some(building) = s
+                            .site_maps
+                            .get(prev_id)
+                            .and_then(|m| m.current_building.clone())
+                        {
+                            let child_key =
+                                crate::site_map::hosted_key(prev_id, &building);
+                            if let Some(child) = s.site_maps.get_mut(&child_key) {
+                                crate::site_map::exit_building_child_stamp(
+                                    child,
+                                    now_minutes,
+                                );
+                            }
+                            if let Some(m) = s.site_maps.get_mut(prev_id) {
+                                m.current_building = None;
+                            }
+                        }
+                        if let Some(m) = s.site_maps.get_mut(prev_id) {
+                            m.pending_digest.clear();
+                        }
+                    }
+                    // (2026-08-22 multihog WS3) ARRIVAL drains the
+                    // destination's unconsumed pressure into its re-entry
+                    // digest as observable local consequences, then clears
+                    // it — the player now witnesses what was building.
+                    // (An unmapped destination keeps its pressure: the
+                    // future architect's SiteBrief reads it.)
+                    if s.site_maps.contains_key(&dest) {
+                        let drained: Vec<String> = s
+                            .travel_graph
+                            .nodes
+                            .iter_mut()
+                            .find(|n| n.id == dest)
+                            .map(|node| std::mem::take(&mut node.pending_pressure))
+                            .unwrap_or_default();
+                        if !drained.is_empty() {
+                            if let Some(m) = s.site_maps.get_mut(&dest) {
+                                for line in drained {
+                                    let bounded: String = line
+                                        .chars()
+                                        .take(crate::site_map::DIGEST_LINE_CHARS)
+                                        .collect();
+                                    m.pending_digest
+                                        .push(format!("pressure made visible: {bounded}"));
+                                }
+                                let overflow = m
+                                    .pending_digest
+                                    .len()
+                                    .saturating_sub(crate::site_map::DIGEST_LINE_MAX);
+                                if overflow > 0 {
+                                    m.pending_digest.drain(..overflow);
+                                }
+                            }
+                        }
+                        // (2026-08-23 WS5) ARRIVAL flushes the destination's
+                        // OPEN causal threads into the digest — the player
+                        // is back, so every off-screen question becomes live
+                        // play (one "open question" line each, then the
+                        // ledger clears).
+                        // (2026-08-25 stale-anchor fix) ARRIVAL also
+                        // re-anchors the player at the map's ENTRANCE —
+                        // departure left current_area wherever they last
+                        // stood, and every consumer (the traversal gate,
+                        // the GM hidden-truth hop) would otherwise read a
+                        // room the player left behind on a previous visit.
+                        if let Some(m) = s.site_maps.get_mut(&dest) {
+                            m.current_area = Some(m.entrance.clone());
+                            crate::site_map::flush_threads_on_arrival(m);
+                        }
+                    }
                     mutated = true;
+                    travel_move = Some((from_id.clone(), dest.clone(), false));
                     tracing::info!(
                         from = ?prev,
                         to = %dest,
@@ -6311,13 +7658,109 @@ async fn apply_phase3_bracket_commands(
                     }
                     let prev = s.travel_graph.current_node.clone();
                     s.travel_graph.current_node = Some(dest.clone());
+                    // (2026-08-22 living-world) Same departure digest-clear
+                    // as the auto-link arm above.
+                    if let Some(prev_id) = prev.as_deref() {
+                        // (2026-08-23 hosted interiors) AUTO-COLLAPSE:
+                        // traveling away exits any active building first —
+                        // clear the chain + stamp both levels (you can't
+                        // stand in a tavern forty miles behind you). The
+                        // narrator prose covers the walk-out.
+                        if let Some(building) = s
+                            .site_maps
+                            .get(prev_id)
+                            .and_then(|m| m.current_building.clone())
+                        {
+                            let child_key =
+                                crate::site_map::hosted_key(prev_id, &building);
+                            if let Some(child) = s.site_maps.get_mut(&child_key) {
+                                crate::site_map::exit_building_child_stamp(
+                                    child,
+                                    now_minutes,
+                                );
+                            }
+                            if let Some(m) = s.site_maps.get_mut(prev_id) {
+                                m.current_building = None;
+                            }
+                        }
+                        if let Some(m) = s.site_maps.get_mut(prev_id) {
+                            m.pending_digest.clear();
+                        }
+                    }
+                    // (2026-08-22 multihog WS3) Same arrival pressure-drain
+                    // as the auto-link arm above.
+                    if s.site_maps.contains_key(&dest) {
+                        let drained: Vec<String> = s
+                            .travel_graph
+                            .nodes
+                            .iter_mut()
+                            .find(|n| n.id == dest)
+                            .map(|node| std::mem::take(&mut node.pending_pressure))
+                            .unwrap_or_default();
+                        if !drained.is_empty() {
+                            if let Some(m) = s.site_maps.get_mut(&dest) {
+                                for line in drained {
+                                    let bounded: String = line
+                                        .chars()
+                                        .take(crate::site_map::DIGEST_LINE_CHARS)
+                                        .collect();
+                                    m.pending_digest
+                                        .push(format!("pressure made visible: {bounded}"));
+                                }
+                                let overflow = m
+                                    .pending_digest
+                                    .len()
+                                    .saturating_sub(crate::site_map::DIGEST_LINE_MAX);
+                                if overflow > 0 {
+                                    m.pending_digest.drain(..overflow);
+                                }
+                            }
+                        }
+                        // (2026-08-23 WS5) Same arrival thread-flush +
+                        // entrance re-anchor as the auto-link arm above
+                        // (2026-08-25 stale-anchor fix).
+                        if let Some(m) = s.site_maps.get_mut(&dest) {
+                            m.current_area = Some(m.entrance.clone());
+                            crate::site_map::flush_threads_on_arrival(m);
+                        }
+                    }
                     mutated = true;
+                    travel_move = Some((prev.clone().unwrap_or_default(), dest.clone(), true));
                     tracing::info!(
                         from = ?prev,
                         to = %dest,
                         "[TRAVEL] current_node advanced"
                     );
                 }
+            }
+        }
+
+        // (2026-08-23 hazard referees) ROAD EVENT — one roll per journey,
+        // AFTER a successful move. DC = 14 + distance (adjacent hop 0,
+        // auto-linked long haul −3) + the destination's rumor stack (each
+        // rumor heard there −1, threat-stem rumors −3, clamp −8 —
+        // dangerous roads attract trouble). d20 ≥ DC fires; a second d20
+        // sets the valence band (1–7 negative / 8–14 ambiguous / 15–20
+        // favorable). Rides the event_directives channel (NEVER the
+        // reject channel — a legal referee outcome is not an emission
+        // error) into THIS turn's narrator `<directives>` block.
+        if let Some((from_id, dest, adjacent)) = travel_move {
+            let dest_name = s
+                .travel_graph
+                .find_node(&dest)
+                .map(|n| n.name.clone())
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| dest.clone());
+            if let Some(ev) =
+                hazard::road_event_check(now_minutes, &from_id, &dest, adjacent, &s.rumors)
+            {
+                tracing::info!(
+                    to = %dest,
+                    valence = ?ev.valence,
+                    dc = ev.dc,
+                    "[TRAVEL] road event fired"
+                );
+                event_directives.push(hazard::road_event_directive(ev, &dest_name));
             }
         }
 
@@ -6328,6 +7771,9 @@ async fn apply_phase3_bracket_commands(
         // invent interiors Rust never generated); Visited is terminal (a
         // Visited→Discovered emission is a no-op, never a knowledge
         // downgrade).
+        // (2026-08-23 hazard referees) A visited move across a settlement
+        // ROOT map rolls at most ONE city event per turn (the flag).
+        let mut city_event_fired = false;
         for cmd in &room_cmds {
             if let bracket_parser::BracketCommand::Room { area_id, visited } = cmd {
                 let Some(cur_id) = s.travel_graph.current_node.clone() else {
@@ -6336,8 +7782,202 @@ async fn apply_phase3_bracket_commands(
                     );
                     continue;
                 };
+                // (2026-08-23 hosted interiors) THE RESOLVER LAW: turn
+                // operations target the ACTIVE map — the hosted child while
+                // the player stands in a building, the node map otherwise.
+                let active_key = crate::site_map::active_site_map_key(
+                    &s.site_maps,
+                    Some(cur_id.as_str()),
+                )
+                .unwrap_or_else(|| cur_id.clone());
+                let inside_building = active_key != cur_id;
+
+                // ── Inside a building: child areas first, parent areas
+                //    are the EXIT transition (the lookup-order trick — one
+                //    verb, the resolver owns the semantics).
+                if inside_building {
+                    let child_hit = s
+                        .site_maps
+                        .get(&active_key)
+                        .map(|m| m.areas.iter().any(|a| a.id == *area_id))
+                        .unwrap_or(false);
+                    if !child_hit {
+                        let parent_hit = s
+                            .site_maps
+                            .get(&cur_id)
+                            .map(|m| m.areas.iter().any(|a| a.id == *area_id))
+                            .unwrap_or(false);
+                        if parent_hit && *visited {
+                            // EXIT: back out to a district area. The gate is
+                            // the parent connection from the building's own
+                            // district area (where you emerge) to the target.
+                            let exit_ok = {
+                                let parent =
+                                    s.site_maps.get(&cur_id).expect("parent checked");
+                                let asset_area = parent
+                                    .current_building
+                                    .as_ref()
+                                    .and_then(|b| {
+                                        parent
+                                            .assets
+                                            .iter()
+                                            .find(|a| a.id == *b)
+                                            .map(|a| a.location.clone())
+                                    })
+                                    .unwrap_or_else(|| parent.entrance.clone());
+                                if *area_id == asset_area {
+                                    // Stepping out the front door into the
+                                    // building's own district area — trivially
+                                    // legal (no self-connection edge exists).
+                                    true
+                                } else {
+                                    crate::site_map::connection_state_between(
+                                        parent,
+                                        &asset_area,
+                                        area_id,
+                                    )
+                                    .map(|st| st == crate::site_map::ConnState::Open)
+                                    .unwrap_or(false)
+                                }
+                            };
+                            if !exit_ok {
+                                reject_directives.push(format!(
+                                    "The way from the building into \"{area_id}\" is not open — \
+                                     step out through an open way first.",
+                                ));
+                                continue;
+                            }
+                            if undo_snapshot.is_none() {
+                                undo_snapshot = Some(s.clone());
+                            }
+                            let child_key = active_key.clone();
+                            if let Some(child) = s.site_maps.get_mut(&child_key) {
+                                crate::site_map::exit_building_child_stamp(
+                                    child,
+                                    now_minutes,
+                                );
+                            }
+                            if let Some(parent) = s.site_maps.get_mut(&cur_id) {
+                                crate::site_map::exit_building_parent_stamp(
+                                    parent,
+                                    area_id,
+                                    now_minutes,
+                                );
+                            }
+                            mutated = true;
+                            tracing::info!(
+                                area = %area_id,
+                                "[ROOM] exited hosted building into district area"
+                            );
+                            continue;
+                        }
+                        if parent_hit {
+                            reject_directives.push(format!(
+                                "\"{area_id}\" is a district area outside — use the visited \
+                                 form ([ROOM {area_id} visited]) to exit, or target a room of \
+                                 the building.",
+                            ));
+                            continue;
+                        }
+                        reject_directives.push(format!(
+                            "Area \"{area_id}\" is not part of this building. Use an area id \
+                             from the site block."
+                        ));
+                        continue;
+                    }
+                    // Child-area hit: fall through to the normal move below,
+                    // keyed on the ACTIVE (child) map.
+                } else if !s
+                    .site_maps
+                    .get(&active_key)
+                    .map(|m| m.areas.iter().any(|a| a.id == *area_id))
+                    .unwrap_or(false)
+                {
+                    // No map at all keeps the classic no-map reject (the
+                    // model needs the specific guidance).
+                    if !s.site_maps.contains_key(&active_key) {
+                        reject_directives.push(
+                            "No hidden site map exists at this location — [ROOM] cannot apply here."
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                    // ── Not inside + no area hit: a Building-asset id is
+                    //    the ENTER transition (visited form only).
+                    let building = s
+                        .site_maps
+                        .get(&active_key)
+                        .and_then(|m| crate::site_map::resolve_asset(m, area_id)
+                            .map(|a| (a.id.clone(), a.kind, a.location.clone()))
+                            .filter(|(_, kind, _)| *kind == crate::site_map::AssetKind::Building));
+                    if let Some((asset_id, _, asset_area)) = building {
+                        if !*visited {
+                            reject_directives.push(format!(
+                                "\"{area_id}\" is a building — learning OF it is \
+                                 [ASSET {area_id} suspected|known]; entering it is \
+                                 [ROOM {area_id} visited].",
+                            ));
+                            continue;
+                        }
+                        // Reachability: the player must be able to reach the
+                        // building's district area through OPEN ways.
+                        let reachable = {
+                            let m = s.site_maps.get(&active_key).expect("checked above");
+                            let from = m
+                                .current_area
+                                .clone()
+                                .unwrap_or_else(|| m.entrance.clone());
+                            crate::site_map::open_path_exists(m, &from, &asset_area)
+                        };
+                        if !reachable {
+                            reject_directives.push(format!(
+                                "The building \"{area_id}\" stands in an area beyond locked or \
+                                 blocked ways — open a way there first.",
+                            ));
+                            continue;
+                        }
+                        // Per-settlement cap: the 7th interior REFUSES to map
+                        // (graceful degrade to unmapped improv space).
+                        if crate::site_map::count_hosted_interiors(&s.site_maps, &cur_id)
+                            >= crate::site_map::HOSTED_INTERIORS_MAX_PER_SETTLEMENT
+                        {
+                            reject_directives.push(format!(
+                                "The interior of \"{area_id}\" is unmapped narrative space — \
+                                 narrate only a passing impression; do not track rooms inside it.",
+                            ));
+                            continue;
+                        }
+                        if undo_snapshot.is_none() {
+                            undo_snapshot = Some(s.clone());
+                        }
+                        let child_key = crate::site_map::hosted_key(&cur_id, &asset_id);
+                        if let Some(child) = s.site_maps.get_mut(&child_key) {
+                            crate::site_map::enter_building_child_stamp(child, now_minutes);
+                        }
+                        if let Some(parent) = s.site_maps.get_mut(&cur_id) {
+                            crate::site_map::enter_building_parent_stamp(
+                                parent,
+                                &asset_id,
+                                now_minutes,
+                            );
+                        }
+                        mutated = true;
+                        tracing::info!(
+                            building = %asset_id,
+                            "[ROOM] entered hosted building (child map active)"
+                        );
+                        continue;
+                    }
+                    reject_directives.push(format!(
+                        "Area \"{area_id}\" is not part of this site. Use an area id from the site block."
+                    ));
+                    continue;
+                }
+
+                // ── Normal room move on the ACTIVE map (existing logic,
+                //    re-keyed through the resolver).
                 let (has_map, known): (bool, Option<crate::site_map::AreaKnowledge>) =
-                    match s.site_maps.get(&cur_id) {
+                    match s.site_maps.get(&active_key) {
                         None => (false, None),
                         Some(map) => (
                             true,
@@ -6348,8 +7988,12 @@ async fn apply_phase3_bracket_commands(
                                     // Already visited: re-visit re-emissions are
                                     // no-ops, downgrades never happen.
                                     (crate::site_map::AreaKnowledge::Visited, _) => None,
-                                    (_, true) => Some(crate::site_map::AreaKnowledge::Visited),
-                                    (_, false) => Some(crate::site_map::AreaKnowledge::Discovered),
+                                    (_, true) => {
+                                        Some(crate::site_map::AreaKnowledge::Visited)
+                                    }
+                                    (_, false) => {
+                                        Some(crate::site_map::AreaKnowledge::Discovered)
+                                    }
                                 }),
                         ),
                     };
@@ -6364,10 +8008,35 @@ async fn apply_phase3_bracket_commands(
                     // Unknown area id OR already-visited no-op.
                     if s
                         .site_maps
-                        .get(&cur_id)
+                        .get(&active_key)
                         .map(|m| m.areas.iter().any(|a| a.id == *area_id))
                         .unwrap_or(false)
                     {
+                        // (2026-08-25 stale-anchor repair) Knowledge is a
+                        // no-op on an already-Visited area, but a visited
+                        // re-emission still means the player WALKED here —
+                        // re-stamp current_area (+ the visit clock) when the
+                        // anchor points elsewhere, so re-emitting the
+                        // walk-in heals a stale anchor instead of leaving
+                        // the next traversal gated from a room the player
+                        // is no longer in.
+                        if *visited {
+                            let stale = s
+                                .site_maps
+                                .get(&active_key)
+                                .map(|m| m.current_area.as_deref() != Some(area_id.as_str()))
+                                .unwrap_or(true);
+                            if stale {
+                                if undo_snapshot.is_none() {
+                                    undo_snapshot = Some(s.clone());
+                                }
+                                if let Some(map) = s.site_maps.get_mut(&active_key) {
+                                    map.last_visit_minutes = now_minutes;
+                                    map.current_area = Some(area_id.clone());
+                                }
+                                mutated = true;
+                            }
+                        }
                         tracing::debug!(area = %area_id, "[ROOM] already visited — no-op");
                         continue;
                     }
@@ -6376,19 +8045,168 @@ async fn apply_phase3_bracket_commands(
                     ));
                     continue;
                 };
+                // (2026-08-22 multihog WS2) Traversal gating: the connection
+                // from the player's CURRENT area to the target must be open —
+                // a Locked/Blocked way bars entry until the narrative
+                // establishes its opening ([UNLOCK] once the fiction opens
+                // it). The LOCK is the anti-hallucination gate; UNLOCK
+                // trusts narrated fiction. Legacy maps without a
+                // `current_area` fall back to the entrance (where the player
+                // came in).
+                if *visited {
+                    let from_area = s
+                        .site_maps
+                        .get(&active_key)
+                        .and_then(|m| m.current_area.clone().or_else(|| Some(m.entrance.clone())));
+                    if let Some(from) = from_area {
+                        let barred = s
+                            .site_maps
+                            .get(&active_key)
+                            .and_then(|m| {
+                                crate::site_map::connection_state_between(m, &from, area_id)
+                            })
+                            .filter(|st| *st != crate::site_map::ConnState::Open);
+                        if let Some(state) = barred {
+                            reject_directives.push(format!(
+                                "The way into \"{area_id}\" is {} — establish its opening in \
+                                 the narrative first (once the fiction opens it: [UNLOCK \
+                                 {area_id}]).",
+                                state.word()
+                            ));
+                            continue;
+                        }
+                    }
+                }
+                // (2026-08-23 hazard referees) The pre-move area for the
+                // city-event seed (captured BEFORE the mutation below — the
+                // mutation overwrites current_area).
+                let city_from = s
+                    .site_maps
+                    .get(&active_key)
+                    .and_then(|m| m.current_area.clone().or_else(|| Some(m.entrance.clone())));
                 if undo_snapshot.is_none() {
                     undo_snapshot = Some(s.clone());
                 }
-                if let Some(map) = s.site_maps.get_mut(&cur_id) {
+                if let Some(map) = s.site_maps.get_mut(&active_key) {
                     if let Some(area) = map.areas.iter_mut().find(|a| a.id == *area_id) {
                         area.knowledge = new_knowledge;
                         if *visited {
                             map.last_visit_minutes = now_minutes;
+                            // (2026-08-22 multihog WS2) The player now stands
+                            // here — the traversal gate's + GM block's anchor.
+                            map.current_area = Some(area_id.clone());
                         }
                     }
                 }
                 mutated = true;
                 tracing::info!(area = %area_id, visited, "[ROOM] site area knowledge advanced");
+
+                // (2026-08-23 hazard referees) CITY EVENT — a visited move
+                // through a settlement ROOT map (never a hosted building
+                // child — indoors is the site map's own domain). DC = 14 +
+                // time-of-day (night −4 / dusk-dawn −2 / day 0 — alleys at
+                // 2 AM get you jumped) + prosperity (desperate quarters −2 /
+                // boom town +2). Same dual-roll + event channel as the road
+                // event.
+                if *visited && !inside_building && !city_event_fired {
+                    let node = s.travel_graph.nodes.iter().find(|n| n.id == cur_id);
+                    let root_map = s.site_maps.get(&cur_id);
+                    if hazard::is_settlement(node, root_map) {
+                        let prosperity = node
+                            .map(|n| n.prosperity)
+                            .unwrap_or(economy::PROSPERITY_DEFAULT);
+                        let node_name = node
+                            .map(|n| n.name.clone())
+                            .unwrap_or_else(|| cur_id.clone());
+                        let from = city_from.clone().unwrap_or_default();
+                        if let Some(ev) = hazard::city_event_check(
+                            now_minutes,
+                            &cur_id,
+                            &from,
+                            area_id,
+                            prosperity,
+                        ) {
+                            city_event_fired = true;
+                            tracing::info!(
+                                node = %cur_id,
+                                valence = ?ev.valence,
+                                dc = ev.dc,
+                                "[ROOM] city event fired"
+                            );
+                            event_directives
+                                .push(hazard::city_event_directive(ev, &node_name));
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── (2026-08-22 multihog WS2) [UNLOCK] — the narrated opening of a
+        // barred way: flips Locked → Open on the reciprocal connection pair
+        // from the player's current area. Already-Open is a no-op; Blocked
+        // refuses (an obstruction needs physical change, never a key).
+        // Runs AFTER [ROOM] (the same ordering discipline as ROOM-after-
+        // TRAVEL: enter what is enterable first, then open what was barred).
+        for cmd in &unlock_cmds {
+            if let bracket_parser::BracketCommand::Unlock { area_id } = cmd {
+                let Some(cur_id) = s.travel_graph.current_node.clone() else {
+                    reject_directives.push(
+                        "[UNLOCK] cannot apply — no current location.".to_string(),
+                    );
+                    continue;
+                };
+                // (2026-08-23 hosted interiors) The resolver law: unlock
+                // applies to the ACTIVE map (the room the player stands in
+                // while inside a building).
+                let active_key = crate::site_map::active_site_map_key(
+                    &s.site_maps,
+                    Some(cur_id.as_str()),
+                )
+                .unwrap_or_else(|| cur_id.clone());
+                let Some(m) = s.site_maps.get(&active_key) else {
+                    reject_directives.push(
+                        "No hidden site map exists at this location — [UNLOCK] cannot apply \
+                         here."
+                            .to_string(),
+                    );
+                    continue;
+                };
+                // Classify under the immutable borrow (the pre-mutation
+                // snapshot discipline), then flip.
+                match crate::site_map::classify_unlock(m, area_id) {
+                    crate::site_map::UnlockOutcome::AlreadyOpen => {
+                        tracing::debug!(area = %area_id, "[UNLOCK] already open — no-op");
+                    }
+                    crate::site_map::UnlockOutcome::Flip => {
+                        if undo_snapshot.is_none() {
+                            undo_snapshot = Some(s.clone());
+                        }
+                        if let Some(map) = s.site_maps.get_mut(&active_key) {
+                            crate::site_map::apply_unlock(map, area_id);
+                        }
+                        mutated = true;
+                        tracing::info!(area = %area_id, "[UNLOCK] locked way opened");
+                    }
+                    outcome => {
+                        let target = area_id.clone();
+                        reject_directives.push(match outcome {
+                            crate::site_map::UnlockOutcome::Blocked => format!(
+                                "The way into \"{target}\" is BLOCKED, not locked — rubble \
+                                 and cave-ins need physical change in the narrative, never a \
+                                 key."
+                            ),
+                            crate::site_map::UnlockOutcome::UnknownArea => format!(
+                                "Area \"{target}\" is not part of this site. Use an area id \
+                                 from the site block."
+                            ),
+                            _ => format!(
+                                "\"{target}\" does not connect to the area the player \
+                                 occupies — unlock the next way on the path, not one \
+                                 further off."
+                            ),
+                        });
+                    }
+                }
             }
         }
 
@@ -6407,6 +8225,14 @@ async fn apply_phase3_bracket_commands(
                     );
                     continue;
                 };
+                // (2026-08-23 hosted interiors) The resolver law: asset
+                // mutations target the ACTIVE map (inside a building, its
+                // own creatures/loot — not the district's).
+                let active_key = crate::site_map::active_site_map_key(
+                    &s.site_maps,
+                    Some(cur_id.as_str()),
+                )
+                .unwrap_or_else(|| cur_id.clone());
                 // Local action plan: computed under the immutable borrow,
                 // consumed under the mutable one.
                 enum AssetAct {
@@ -6422,7 +8248,7 @@ async fn apply_phase3_bracket_commands(
                     Mutate(String, &'static str),
                 }
                 let plan = {
-                    let Some(map_ref) = s.site_maps.get(&cur_id) else {
+                    let Some(map_ref) = s.site_maps.get(&active_key) else {
                         reject_directives.push(
                             "No hidden site map exists at this location — [ASSET] cannot apply here."
                                 .to_string(),
@@ -6444,8 +8270,23 @@ async fn apply_phase3_bracket_commands(
                                 "trap" => crate::site_map::AssetKind::Trap,
                                 "hazard" => crate::site_map::AssetKind::Hazard,
                                 "loot" => crate::site_map::AssetKind::Loot,
+                                // (2026-08-23 hosted interiors) Buildings are
+                                // mintable ONLY on node-level maps — the
+                                // depth-2 law (buildings never nest).
+                                "building" => crate::site_map::AssetKind::Building,
                                 _ => crate::site_map::AssetKind::Object,
                             };
+                            if kind_parsed == crate::site_map::AssetKind::Building
+                                && map_ref.host.is_some()
+                            {
+                                reject_directives.push(
+                                    "Buildings exist only on settlement (district) maps — a \
+                                     building interior cannot host another. Track what the \
+                                     room holds with creature/group/loot/object assets."
+                                        .to_string(),
+                                );
+                                continue;
+                            }
                             // A Group minted without an explicit count= defaults
                             // to 1: the bracket mint path skips site_map
                             // validate (which requires 1..=99 for groups — 0
@@ -6528,8 +8369,39 @@ async fn apply_phase3_bracket_commands(
                                 bracket_parser::AssetMutation::Active => "active",
                                 bracket_parser::AssetMutation::Known => "known",
                                 bracket_parser::AssetMutation::Suspected => "suspected",
+                                bracket_parser::AssetMutation::Deactivated => "deactivated",
+                                bracket_parser::AssetMutation::Fleeing => "fleeing",
                                 _ => unreachable!("Add/Count handled in their own arms"),
                             };
+                            // (2026-08-22 living-world) PLAY-CANON LOCK, the
+                            // tracker path: a state-changing mutation that
+                            // walks a terminal state back (dead → active —
+                            // the hallucinated boss resurrection) rejects
+                            // with the remnant-entity directive. Same-state
+                            // writes + the Dead → Taken loot path stay
+                            // legal (`site_map::canon_transition`).
+                            let target_state = match tag {
+                                "dead" => Some(crate::site_map::AssetState::Dead),
+                                "taken" => Some(crate::site_map::AssetState::Taken),
+                                "triggered" => Some(crate::site_map::AssetState::Triggered),
+                                "active" => Some(crate::site_map::AssetState::Active),
+                                "deactivated" => Some(crate::site_map::AssetState::Deactivated),
+                                "fleeing" => Some(crate::site_map::AssetState::Fleeing),
+                                _ => None, // known/suspected: knowledge-only
+                            };
+                            if let Some(target) = target_state {
+                                if let Some(a) = map_ref.assets.iter().find(|a| a.id == rid) {
+                                    if !crate::site_map::canon_transition(a.state, target) {
+                                        reject_directives.push(format!(
+                                            "{} is {} (terminal, play-canon locked) — add a new \
+                                             remnant entity instead of resurrecting.",
+                                            a.name,
+                                            a.state.word()
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            }
                             AssetAct::Mutate(rid, tag)
                         }
                     }
@@ -6537,7 +8409,7 @@ async fn apply_phase3_bracket_commands(
                 if undo_snapshot.is_none() {
                     undo_snapshot = Some(s.clone());
                 }
-                let Some(map) = s.site_maps.get_mut(&cur_id) else {
+                let Some(map) = s.site_maps.get_mut(&active_key) else {
                     continue;
                 };
                 match plan {
@@ -6552,6 +8424,14 @@ async fn apply_phase3_bracket_commands(
                             count,
                             detail,
                             tier: None,
+                            // (2026-08-22 living-world) The tracker minted
+                            // this in front of the player — witnessed
+                            // provenance, no off-screen change stamp.
+                            origin: crate::site_map::AssetOrigin::NarratorEstablished,
+                            changed_at_minutes: 0,
+                            cause: String::new(),
+                            actor: String::new(),
+                            expires_at_minutes: None,
                         });
                         tracing::info!(asset = %id, "[ASSET] minted into the current site");
                     }
@@ -6559,9 +8439,20 @@ async fn apply_phase3_bracket_commands(
                         if let Some(a) = map.assets.iter_mut().find(|a| a.id == rid) {
                             a.count = n;
                         }
+                        // (2026-08-23 WS5) A count change is activity on the
+                        // asset — it resolves the asset's own open thread.
+                        crate::site_map::close_threads_by_subject(map, &rid, "its numbers changed");
                     }
                     AssetAct::Mutate(rid, tag) => {
                         if let Some(a) = map.assets.iter_mut().find(|a| a.id == rid) {
+                            // (2026-08-22 living-world) State changes stamp the
+                            // clock — the same discipline the evolution ops
+                            // follow — so a corpse/disarmed trap the player
+                            // JUST made ages into the `remnants:` line a day
+                            // later instead of rendering forever. Knowledge-
+                            // only writes (known/suspected) leave the stamp
+                            // alone (no state changed).
+                            let state_changing = !matches!(tag, "known" | "suspected");
                             match tag {
                                 "dead" => {
                                     a.state = crate::site_map::AssetState::Dead;
@@ -6584,7 +8475,63 @@ async fn apply_phase3_bracket_commands(
                                 "suspected" => {
                                     a.knowledge = crate::site_map::AssetKnowledge::Suspected;
                                 }
+                                "deactivated" => {
+                                    a.state = crate::site_map::AssetState::Deactivated;
+                                    a.knowledge = crate::site_map::AssetKnowledge::Known;
+                                }
+                                "fleeing" => {
+                                    a.state = crate::site_map::AssetState::Fleeing;
+                                    a.knowledge = crate::site_map::AssetKnowledge::Known;
+                                }
                                 _ => unreachable!("tag set above"),
+                            }
+                            if state_changing {
+                                a.changed_at_minutes = now_minutes;
+                            }
+                        }
+                        // (2026-08-23) Knowledge⇒area invariant: a revealed
+                        // asset reveals its room (Unrevealed → Discovered) —
+                        // a `[ASSET x known]` in a hidden room used to land
+                        // dead (slices render assets only under revealed
+                        // areas). Covers known/suspected + every state word
+                        // that implies Known; the mint path is safe by
+                        // construction.
+                        crate::site_map::promote_area_knowledge_for_asset(map, &rid);
+                        // (2026-08-23 WS5) On-scene causal threads, the
+                        // tracker side — the same deterministic close/open
+                        // discipline the evolution applier follows: activity
+                        // in the asset's area resolves questions rooted
+                        // there, and an on-screen KILL opens a thread
+                        // (actor "the player" — the beat's prose carries the
+                        // cause; knowledge-only writes touch nothing).
+                        if !matches!(tag, "known" | "suspected") {
+                            let (name, loc) = map
+                                .assets
+                                .iter()
+                                .find(|a| a.id == rid)
+                                .map(|a| (a.name.clone(), a.location.clone()))
+                                .unwrap_or_default();
+                            crate::site_map::close_threads_by_area(map, &loc, "the player acted here");
+                            if tag == "dead" {
+                                // The player is the ACTOR — an on-screen kill
+                                // is revealed by construction (hidden=false);
+                                // the re-entry digest may name the subject.
+                                crate::site_map::open_thread(
+                                    map,
+                                    &rid,
+                                    &name,
+                                    &loc,
+                                    "the player",
+                                    "",
+                                    false,
+                                    now_minutes,
+                                );
+                            } else {
+                                crate::site_map::close_threads_by_subject(
+                                    map,
+                                    &rid,
+                                    "the player acted here",
+                                );
                             }
                         }
                     }
@@ -6605,6 +8552,7 @@ async fn apply_phase3_bracket_commands(
                 description,
                 deadline_minutes,
                 remove,
+                area,
             } = cmd
             {
                 let Some(entry) =
@@ -6656,6 +8604,12 @@ async fn apply_phase3_bracket_commands(
                     {
                         p.deadline_minutes = deadline;
                         p.accepted_at_minutes = now_minutes;
+                        // (2026-08-25 quest anchors) A re-emission carrying
+                        // an area re-anchors; an area-less one keeps the
+                        // stored anchor (the reward-refresh contract).
+                        if !area.is_empty() {
+                            p.area_anchor = area.clone();
+                        }
                     }
                     mutated = true;
                     continue;
@@ -6668,6 +8622,7 @@ async fn apply_phase3_bracket_commands(
                     description: description.clone(),
                     deadline_minutes: deadline,
                     accepted_at_minutes: now_minutes,
+                    area_anchor: area.clone(),
                 });
                 let overflow = s.promises.len().saturating_sub(schema::MAX_PROMISES);
                 if overflow > 0 {
@@ -6675,6 +8630,388 @@ async fn apply_phase3_bracket_commands(
                 }
                 mutated = true;
                 tracing::info!(npc = %entry, "[PROMISE] obligation tracked");
+            }
+        }
+
+        // ── (2026-08-22 living-world) [QUEST] — the quest & objective verb.
+        // The PROMISE pattern: giver resolves through the registry (or the
+        // literal player/self for emergent goals); re-emissions refresh
+        // (deadline/reward/objectives), never twin; done/fail REMOVE (v1
+        // keeps no history — the narrator's own beat carries the news).
+        // Anti-Difficulty by construction: objectives are countable text +
+        // counters, and no difficulty field exists to write.
+        for cmd in &quest_cmds {
+            if let bracket_parser::BracketCommand::Quest {
+                op,
+                quest_id,
+                giver,
+                title,
+                objective,
+                objective_done,
+                cur,
+                total,
+                deadline_minutes,
+                reward,
+                area,
+            } = cmd
+            {
+                match op {
+                    bracket_parser::QuestOp::New => {
+                        // (2026-08-24 review P2) A negative deadline is a
+                        // malformed emission — reject it loudly instead of
+                        // silently clamping to "no deadline" (an already-
+                        // overdue quest the moment it is taken reads as a
+                        // tracker bug in play).
+                        if *deadline_minutes < 0 {
+                            reject_directives.push(format!(
+                                "Quest deadline must be positive minutes from now (got \
+                                 {deadline_minutes}). Emit [QUEST new {quest_id} ... | <minutes>]."
+                            ));
+                            continue;
+                        }
+                        let giver_id =
+                            if giver.eq_ignore_ascii_case("player") || giver.eq_ignore_ascii_case("self") {
+                                "player".to_string()
+                            } else {
+                                match schema::resolve_npc_surface(&s.npc_registry.entries, giver) {
+                                    Some(entry) => entry.id.clone(),
+                                    None => {
+                                        reject_directives.push(format!(
+                                            "Quest giver \"{giver}\" is not a registered NPC. Use \
+                                             giver=<npc_id from the cast line> or giver=player for a \
+                                             self-set goal."
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            };
+                        if s.quests.iter().any(|q| q.id == *quest_id) {
+                            // Refresh, never twin (the PROMISE contract).
+                            // Two-phase: snapshot under the shared borrow,
+                            // THEN mutate (a clone while `iter_mut` holds the
+                            // loan won't borrowck).
+                            if *deadline_minutes > 0 || !reward.is_empty() || !area.is_empty() {
+                                if undo_snapshot.is_none() {
+                                    undo_snapshot = Some(s.clone());
+                                }
+                                if let Some(q) = s.quests.iter_mut().find(|q| q.id == *quest_id) {
+                                    if *deadline_minutes > 0 {
+                                        q.deadline_minutes = now_minutes + deadline_minutes;
+                                        q.accepted_at_minutes = now_minutes;
+                                    }
+                                    if !reward.is_empty() {
+                                        q.reward = reward.clone();
+                                    }
+                                    // (2026-08-25 quest anchors) A re-emission
+                                    // carrying an area re-anchors; an area-less
+                                    // one keeps the stored anchor.
+                                    if !area.is_empty() {
+                                        q.area_anchor = area.clone();
+                                    }
+                                }
+                                mutated = true;
+                            }
+                            continue;
+                        }
+                        if undo_snapshot.is_none() {
+                            undo_snapshot = Some(s.clone());
+                        }
+                        s.quests.push(schema::Quest {
+                            id: quest_id.clone(),
+                            giver: giver_id,
+                            title: title.clone(),
+                            objectives: Vec::new(),
+                            reward: reward.clone(),
+                            deadline_minutes: if *deadline_minutes > 0 {
+                                now_minutes + deadline_minutes
+                            } else {
+                                0
+                            },
+                            accepted_at_minutes: now_minutes,
+                            area_anchor: area.clone(),
+                        });
+                        let overflow = s.quests.len().saturating_sub(schema::MAX_QUESTS);
+                        if overflow > 0 {
+                            s.quests.drain(..overflow);
+                        }
+                        mutated = true;
+                        tracing::info!(quest = %quest_id, "[QUEST] thread opened");
+                    }
+                    bracket_parser::QuestOp::Update => {
+                        if !s.quests.iter().any(|q| q.id == *quest_id) {
+                            let live: Vec<&str> =
+                                s.quests.iter().map(|q| q.id.as_str()).collect();
+                            reject_directives.push(format!(
+                                "Quest \"{quest_id}\" is not tracked. Live quest ids: {}.",
+                                if live.is_empty() {
+                                    "(none)".to_string()
+                                } else {
+                                    live.join(", ")
+                                }
+                            ));
+                            continue;
+                        }
+                        // Decision under the shared borrow, THEN snapshot,
+                        // THEN mutate (a clone while `iter_mut` holds the
+                        // loan won't borrowck).
+                        // (2026-08-25 quest anchors) An area-only update (the
+                        // pure re-anchor form, objective empty by parse
+                        // contract) re-anchors + refreshes NOTHING else — the
+                        // objective machinery below never sees an empty text.
+                        if objective.is_empty() {
+                            if !area.is_empty() {
+                                if undo_snapshot.is_none() {
+                                    undo_snapshot = Some(s.clone());
+                                }
+                                if let Some(q) = s.quests.iter_mut().find(|q| q.id == *quest_id) {
+                                    q.area_anchor = area.clone();
+                                }
+                                mutated = true;
+                                tracing::info!(quest = %quest_id, "[QUEST] re-anchored");
+                            }
+                            continue;
+                        }
+                        let key = schema::normalize_quest_objective_key(objective);
+                        let existing = s
+                            .quests
+                            .iter()
+                            .find(|q| q.id == *quest_id)
+                            .map(|q| {
+                                q.objectives
+                                    .iter()
+                                    .find(|o| schema::normalize_quest_objective_key(&o.text) == key)
+                            })
+                            .flatten();
+                        if existing.is_none()
+                            && s
+                                .quests
+                                .iter()
+                                .find(|q| q.id == *quest_id)
+                                .map(|q| q.objectives.len() >= schema::MAX_QUEST_OBJECTIVES)
+                                .unwrap_or(false)
+                        {
+                            reject_directives.push(format!(
+                                "Quest \"{quest_id}\" already holds {} objectives — complete or \
+                                 fail it before adding more.",
+                                schema::MAX_QUEST_OBJECTIVES
+                            ));
+                            continue;
+                        }
+                        if undo_snapshot.is_none() {
+                            undo_snapshot = Some(s.clone());
+                        }
+                        if let Some(q) = s.quests.iter_mut().find(|q| q.id == *quest_id) {
+                            // (2026-08-25 quest anchors) A combined update may
+                            // re-anchor alongside its objective progress.
+                            if !area.is_empty() {
+                                q.area_anchor = area.clone();
+                            }
+                            match q
+                                .objectives
+                                .iter_mut()
+                                .find(|o| schema::normalize_quest_objective_key(&o.text) == key)
+                            {
+                                Some(o) => {
+                                    // (2026-08-24 review P2) `cur` applies on
+                                    // its OWN — the old `if *total > 0` gate
+                                    // around BOTH writes silently dropped a
+                                    // cur-only progress update
+                                    // (`[QUEST update q wolves cur=4]` on an
+                                    // objective created with a total). A
+                                    // provided total replaces; a cur-only
+                                    // emission advances against the KNOWN
+                                    // total (clamped so it can't overrun).
+                                    if *total > 0 {
+                                        o.total = *total;
+                                        o.cur = (*cur).min(*total);
+                                    } else if o.total > 0 {
+                                        o.cur = (*cur).min(o.total);
+                                    } else {
+                                        o.cur = *cur;
+                                    }
+                                    if *objective_done {
+                                        o.done = true;
+                                    }
+                                }
+                                None => {
+                                    q.objectives.push(schema::QuestObjective {
+                                        text: objective.clone(),
+                                        done: *objective_done,
+                                        cur: *cur,
+                                        total: *total,
+                                    });
+                                }
+                            }
+                        }
+                        mutated = true;
+                        tracing::info!(quest = %quest_id, "[QUEST] objective upserted");
+                    }
+                    bracket_parser::QuestOp::Done | bracket_parser::QuestOp::Fail => {
+                        if !s.quests.iter().any(|q| q.id == *quest_id) {
+                            reject_directives.push(format!(
+                                "Quest \"{quest_id}\" is not tracked (already resolved?)."
+                            ));
+                            continue;
+                        }
+                        if undo_snapshot.is_none() {
+                            undo_snapshot = Some(s.clone());
+                        }
+                        s.quests.retain(|q| q.id != *quest_id);
+                        mutated = true;
+                        tracing::info!(
+                            quest = %quest_id,
+                            outcome = ?op,
+                            "[QUEST] resolved + removed (v1 keeps no history)"
+                        );
+                    }
+                }
+            }
+        }
+
+        // ── (2026-08-22 living-world) [ARCANA] — the dormant arcane pool's
+        // activation + step verb. Activation lands the pool at Steady (the
+        // Active-equivalent — narration naming a resource implies a healthy
+        // channel); steps drain/recover exactly like stamina's referee.
+        for cmd in &arcana_cmds {
+            if let bracket_parser::BracketCommand::Arcana { label, delta } = cmd {
+                if *delta != 0 {
+                    if s.player_state.mana.is_none() {
+                        reject_directives.push(
+                            "No arcane pool is active — emit [ARCANA <resource name>] once, when \
+                             narration first names it."
+                                .to_string(),
+                        );
+                        continue;
+                    }
+                    // Snapshot BEFORE the mutable borrow (the two-phase
+                    // discipline every arm here follows).
+                    if undo_snapshot.is_none() {
+                        undo_snapshot = Some(s.clone());
+                    }
+                    if let Some(m) = s.player_state.mana.as_mut() {
+                        for _ in 0..delta.saturating_abs() {
+                            if *delta > 0 {
+                                m.recover();
+                            } else {
+                                m.drain();
+                            }
+                        }
+                    }
+                    mutated = true;
+                    continue;
+                }
+                if s.player_state.mana.is_none() {
+                    if undo_snapshot.is_none() {
+                        undo_snapshot = Some(s.clone());
+                    }
+                    s.player_state.mana = Some(player_state::Mana::Steady);
+                    s.player_state.mana_label = label.clone();
+                    mutated = true;
+                    tracing::info!(label = %label, "[ARCANA] dormant pool activated");
+                }
+                // An activation while already active is a no-op (the label
+                // stays — renaming a resource mid-run is retcon noise).
+            }
+        }
+
+        // ── (2026-08-22 multihog WS1) [EXPIRY] — arm a timed lapse on an
+        // entity key or a site asset. Relative `+N` bodies resolve against
+        // the LIVE clock here (the parser is clock-blind by design, the
+        // [TIME] separation). The deterministic sweep later fires the lapse
+        // on its own; this applier only ARMS. Rejects flow through the
+        // tracker_emit_errors loop like every other verb.
+        for cmd in &expiry_cmds {
+            if let bracket_parser::BracketCommand::Expiry { target, minutes, relative } = cmd {
+                let at = if *relative {
+                    now_minutes.saturating_add(*minutes)
+                } else {
+                    *minutes
+                };
+                if let Some((asset_id, node_raw)) = target.split_once('@') {
+                    // Asset form: `<asset-id>@<node-id>` (empty node half →
+                    // the current node's map).
+                    let node_id = if node_raw.trim().is_empty() {
+                        match s.travel_graph.current_node.as_deref() {
+                            Some(c) => c.to_string(),
+                            None => {
+                                reject_directives.push(
+                                    "[EXPIRY] cannot apply — a bare @target needs a current \
+                                     location."
+                                        .to_string(),
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        node_raw.trim().to_string()
+                    };
+                    // (2026-08-23 hosted interiors) The resolver law: a
+                    // bare @target (or an explicit current-node id) resolves
+                    // into the ACTIVE map — the building the player stands
+                    // in, not the district.
+                    let lookup_key =
+                        if Some(node_id.as_str()) == s.travel_graph.current_node.as_deref() {
+                            crate::site_map::active_site_map_key(&s.site_maps, Some(node_id.as_str()))
+                                .unwrap_or_else(|| node_id.clone())
+                        } else {
+                            node_id.clone()
+                        };
+                    let Some(m) = s.site_maps.get(&lookup_key) else {
+                        reject_directives.push(format!(
+                            "Expiry not armed — no hidden site map exists at \"{node_id}\". \
+                             [EXPIRY <asset>@<node>] needs a mapped site."
+                        ));
+                        continue;
+                    };
+                    let Some(rid) =
+                        crate::site_map::resolve_asset(m, asset_id).map(|a| a.id.clone())
+                    else {
+                        reject_directives.push(format!(
+                            "Expiry not armed — site asset \"{asset_id}\" is not part of \
+                             the site at \"{node_id}\". Use an asset id from its site block."
+                        ));
+                        continue;
+                    };
+                    // `m`'s immutable borrow ends at the owned `rid` — the
+                    // snapshot clone + the mutable re-find below are clean.
+                    if undo_snapshot.is_none() {
+                        undo_snapshot = Some(s.clone());
+                    }
+                    if let Some(map) = s.site_maps.get_mut(&lookup_key) {
+                        if let Some(a) = map.assets.iter_mut().find(|a| a.id == rid) {
+                            a.expires_at_minutes = Some(at);
+                        }
+                    }
+                    mutated = true;
+                    tracing::info!(
+                        asset = %rid,
+                        node = %node_id,
+                        at,
+                        "[EXPIRY] site-asset lapse armed"
+                    );
+                } else {
+                    // Entity form: the key must already exist; locked
+                    // identity keys refuse arming.
+                    if !s.entities.contains_key(target) {
+                        reject_directives.push(format!(
+                            "Expiry not armed — entity key \"{target}\" is not in the schema. \
+                             Arm keys that exist."
+                        ));
+                        continue;
+                    }
+                    if s.immutable_keys.contains(target) || target.starts_with("player.") {
+                        reject_directives.push(format!(
+                            "Expiry not armed — \"{target}\" is locked against timed change."
+                        ));
+                        continue;
+                    }
+                    if undo_snapshot.is_none() {
+                        undo_snapshot = Some(s.clone());
+                    }
+                    s.entity_expiry.insert(target.clone(), at);
+                    mutated = true;
+                    tracing::info!(key = %target, at, "[EXPIRY] entity lapse armed");
+                }
             }
         }
 
@@ -6729,6 +9066,57 @@ async fn apply_phase3_bracket_commands(
                     origin = %cur_id,
                     "[RUMOR] rumor seeded at current node"
                 );
+                // (2026-08-23 hazard referees) THREAT SEEDING — a threat-
+                // stem rumor mints a Suspected asset on the ORIGIN node's
+                // (ROOT) map — invisible truth until encountered, no digest
+                // line (the knowledge-safe channel law). An un-mapped node
+                // takes the label as a NODE SEED instead: the JIT
+                // architect's prompt folds `Node.seeds` ("Established
+                // seeds — honor them"), so the future map grows the threat
+                // organically. Benign rumors seed nothing (the mill only
+                // arms for danger).
+                if crate::hazard::is_threat_rumor(label) {
+                    let seeded = match s.site_maps.get_mut(&cur_id) {
+                        Some(m) => {
+                            crate::site_map::seed_rumor_asset(m, label, now_minutes)
+                        }
+                        None => {
+                            let seed = bracket_parser::clean_free_text(
+                                &format!("rumor: {label}"),
+                                crate::site_map::SITE_SEED_CHAR_MAX,
+                            );
+                            let mut planted = false;
+                            if let Some(node) = s
+                                .travel_graph
+                                .nodes
+                                .iter_mut()
+                                .find(|n| n.id == cur_id)
+                            {
+                                if !seed.is_empty()
+                                    && !node.seeds.iter().any(|existing| *existing == seed)
+                                {
+                                    node.seeds.push(seed);
+                                    let overflow = node
+                                        .seeds
+                                        .len()
+                                        .saturating_sub(crate::site_map::NODE_SEEDS_MAX);
+                                    if overflow > 0 {
+                                        node.seeds.drain(..overflow);
+                                    }
+                                    planted = true;
+                                }
+                            }
+                            planted
+                        }
+                    };
+                    if seeded {
+                        tracing::info!(
+                            label = %label,
+                            node = %cur_id,
+                            "[RUMOR] threat seeded (suspected asset / node seed)"
+                        );
+                    }
+                }
             } else {
                 // No current node → can't root the rumor. Warn-and-skip.
                 tracing::warn!(
@@ -6773,6 +9161,16 @@ async fn apply_phase3_bracket_commands(
             if id.is_empty() {
                 continue;
             }
+            // (2026-08-24 fix) JS-leakage sentinels + bare numerals never
+            // become people — the live test caught NPC "1" registered as a
+            // real cast member. Same reject style as the player-name guard.
+            if schema::is_garbage_identifier(npc_id) {
+                reject_directives.push(format!(
+                    "NPC not registered — \"{npc_id}\" is not a usable id. Use the NPC's name as the id (e.g. [NPC_REGISTER id=marra name=\"Marra\"])."
+                ));
+                tracing::warn!(raw = %npc_id, "[NPC_REGISTER] refused — garbage identifier");
+                continue;
+            }
             let label = if name.trim().is_empty() {
                 id.clone()
             } else {
@@ -6793,6 +9191,30 @@ async fn apply_phase3_bracket_commands(
                     "NPC not registered — \"{label}\" is the player's own name. The player is never an NPC: never register them and never assert their presence."
                 ));
                 tracing::warn!(npc_id = %id, "[NPC_REGISTER] rejected — player-name collision");
+                continue;
+            }
+            // (2026-08-23 near-name guard — the green-lit Kira/Kyra/Kiera
+            // protection) A NEW registration whose name/id is a near-miss of
+            // an already-registered NPC is REFUSED instead of minting a
+            // ghost twin the cast: roster + presence whitelist then carry
+            // forever. One teaching directive flows through the SAME
+            // tracker-feedback channel as the other rejects (the tracker
+            // learns "same person unless clearly distinct"); manual merges
+            // live in the Playground's Registry Management tool, which uses
+            // the same shared resolver (schema::near_name_candidates).
+            // Registration of genuinely-new names is untouched.
+            if let Some((hit_id, hit_name, dist)) =
+                schema::near_name_collision(&label, &s.npc_registry, &id)
+            {
+                reject_directives.push(format!(
+                    "NPC not registered — \"{label}\" resembles the registered {hit_name} [{hit_id}] (near-name). Treat them as the same person unless clearly distinct in the scene; merge or rename existing entries via the Playground instead of registering a near-twin."
+                ));
+                tracing::warn!(
+                    npc_id = %id,
+                    resembles = %hit_id,
+                    distance = dist,
+                    "[NPC_REGISTER] refused — near-name collision"
+                );
                 continue;
             }
             let entry = schema::NpcEntry {
@@ -6862,9 +9284,14 @@ async fn apply_phase3_bracket_commands(
     if !presence_cmds.is_empty() || !s.presences.is_empty() {
         // Snapshot the registry + existing presences out of the immutable
         // borrow before the mutable rebuild (mirrors the TRAVEL/RUMOR clone-
-        // before-mutable-push pattern).
-        let registry_entries: Vec<schema::NpcEntry> = s.npc_registry.entries.clone();
+        // before-mutable-push pattern). `registry_entries` goes mut: the
+        // auto-registration ruling below extends it so the rebuild sees the
+        // freshly-minted stubs this same turn.
+        let mut registry_entries: Vec<schema::NpcEntry> = s.npc_registry.entries.clone();
         let existing: Vec<schema::Presence> = s.presences.clone();
+        // (2026-08-22 Chloe ruling — auto-registration) Grounded unknown
+        // PRESENCE ids collected for the stub write below.
+        let mut auto_registered: Vec<schema::NpcEntry> = Vec::new();
 
         // Resolve this turn's assertions: surface → (canonical id, name, stance).
         // Unknown surfaces collected for reject directives; known ones build
@@ -6916,11 +9343,64 @@ async fn apply_phase3_bracket_commands(
                             reject_directives.push(format!(
                                 "Presence not recorded — \"{npc_id}\" is the player's own name. The player is never an NPC; never register or assert them."
                             ));
+                        } else if narrative_grounded(&narrative_corpus, npc_id, npc_id, npc_id) {
+                            // (2026-08-22 Chloe ruling — auto-registration)
+                            // The window NAMES this NPC (grounded) but the
+                            // registry never met them: mint the stub now and
+                            // assert them this same turn — a new named NPC
+                            // (Rhet, the elf in the pit) costs zero coached
+                            // [NPC_REGISTER] roundtrips. Ungrounded or
+                            // slug-empty surfaces fall through to the reject
+                            // below — the ruling's carve-out keeps coaching
+                            // for hallucinated ids and illegal keys.
+                            if let Some(stub) = auto_register_presence_stub(npc_id) {
+                                asserted.insert(stub.id.clone(), stance_clean.to_string());
+                                auto_registered.push(stub);
+                            } else {
+                                unknown_surfaces.push(npc_id.clone());
+                            }
                         } else {
                             unknown_surfaces.push(npc_id.clone());
                         }
                     }
                 }
+            }
+        }
+
+        // (2026-08-22 Chloe ruling — auto-registration) Write the grounded
+        // stubs into the live registry — the same insertion + cap-relief
+        // discipline as [NPC_REGISTER] (a cap refusal evicts the
+        // least-recently-seen ARCHIVED discovered entry and retries once;
+        // authored core entries are pinned). `registry_entries` (the
+        // rebuild's lookup list below) gains the stubs so the fresh id's
+        // presence row lands THIS turn; a refusal removes the assertion
+        // again — no registry row, no presence.
+        for stub in auto_registered {
+            let stub_id = stub.id.clone();
+            // A same-turn duplicate emission (the tracker asserted the new
+            // name twice) already minted the stub — keep its assertion.
+            if s.npc_registry.find(&stub_id).is_some() {
+                continue;
+            }
+            let pre_schema = s.clone();
+            let mut inserted = s.npc_registry.upsert_entry(stub.clone());
+            if !inserted && s.evict_archived_registry_entry().is_some() {
+                inserted = s.npc_registry.upsert_entry(stub.clone());
+            }
+            if inserted {
+                registry_entries.push(stub);
+                undo_snapshot.get_or_insert(pre_schema);
+                mutated = true;
+                tracing::info!(
+                    npc_id = %stub_id,
+                    "[PRESENCE] auto-registered (grounded unknown id)"
+                );
+            } else {
+                asserted.remove(&stub_id);
+                tracing::warn!(
+                    npc_id = %stub_id,
+                    "[PRESENCE] auto-registration refused — registry cap full even after relief"
+                );
             }
         }
 
@@ -7074,6 +9554,7 @@ async fn apply_phase3_bracket_commands(
             &mut s,
             &ledger_cmds,
             &player_slug,
+            &narrative_corpus,
             &mut reject_directives,
             &mut undo_snapshot,
         );
@@ -7131,7 +9612,9 @@ async fn apply_phase3_bracket_commands(
         //
         // (2026-08-17 E4B follow-up) All stored item names, for one-word
         // fragment resolution below ("rough" → the stored "Rough Mooring
-        // Rope" stack). Built once for all three inventory appliers.
+        // Rope" stack). Built once for all three inventory appliers. The
+        // pouch rides along (2026-08-23 pouch ruling) so a coin fragment
+        // resolves against the wallet's stored names too.
         let existing_item_names: Vec<String> = {
             let mut names: Vec<String> = s
                 .player_state
@@ -7139,6 +9622,7 @@ async fn apply_phase3_bracket_commands(
                 .iter()
                 .map(|i| i.name.clone())
                 .collect();
+            names.extend(s.player_state.pouch.iter().map(|i| i.name.clone()));
             names.extend(s.player_state.pack.iter().map(|i| i.name.clone()));
             for layers in s.player_state.equipment.values() {
                 for item in [&layers.outer, &layers.inner].into_iter().flatten() {
@@ -7161,6 +9645,11 @@ async fn apply_phase3_bracket_commands(
         // loops (see the [PACK] section) so a same-turn acquire+equip pair
         // can't duplicate the item.
         let mut equipped_names: Vec<String> = Vec::new();
+        // (2026-08-22 second playtest pass) The dual-verb echo ledger — every
+        // name that entered the player's racks this turn (tracker adds +
+        // internal parks). Consulted before any player-rack ADD applies;
+        // cleared by removals. See `track_player_item_add`.
+        let mut player_item_adds: Vec<String> = Vec::new();
         for cmd in &equip_cmds {
             if let bracket_parser::BracketCommand::Equip {
                 slot,
@@ -7238,7 +9727,7 @@ async fn apply_phase3_bracket_commands(
                         // (P2 fix) "I take this off" ≠ "this ceases to exist":
                         // the taken item routes to the pack (the same
                         // preserve-existing discipline the Soul Gem UI path
-                        // and migrate_legacy_items follow — the tracker path
+                        // appliers follow — the tracker path
                         // used to silently vaporize it).
                         // (2026-08-19) The layer-less form takes the Outer —
                         // the topmost, observer-visible garment ("takes off
@@ -7266,6 +9755,33 @@ async fn apply_phase3_bracket_commands(
                                     },
                                 );
                                 handed_off_names.push(item.name.trim().to_lowercase());
+                                track_player_item_add(&mut player_item_adds, &item.name);
+                                // (2026-08-24 Part II B7) Gear-borne
+                                // conditions die with the gear: every LIVE
+                                // tag whose kind is this item's
+                                // `equipped:<kebab-slug>` lane leaves with it
+                                // (the disguise-revoke removal pattern —
+                                // kinded lane, mechanical strip, no prompt).
+                                {
+                                    let now = s.world_clock.current_minutes;
+                                    let lane = format!(
+                                        "{}{}",
+                                        consequence::EQUIPPED_TAG_KIND_PREFIX,
+                                        crate::site_map::kebabify(&item.name)
+                                    );
+                                    let before = s.status_tags.len();
+                                    s.status_tags
+                                        .retain(|t| !(t.kind == lane && !t.is_expired(now)));
+                                    if s.status_tags.len() != before {
+                                        notices.push((
+                                            "inventory",
+                                            format!(
+                                                "Unequipping {} released its lingering effects.",
+                                                item.name
+                                            ),
+                                        ));
+                                    }
+                                }
                                 mutated = true;
                                 tracing::info!(
                                     slot = ?slot,
@@ -7309,14 +9825,26 @@ async fn apply_phase3_bracket_commands(
                                 tracing::info!(
                                     slot = ?slot,
                                     name = %d.name,
-                                    "[EQUIP] displaced occupant → pack"
+                                    "[EQUIP] displaced occupant → stash_target"
+                                );
+                                // (2026-08-24 review P2) Displaced items ride
+                                // the SAME router as every acquisition — a
+                                // pouch-fitting name (a displaced signet)
+                                // used to land in the pack while fresh copies
+                                // of it kept routing to the pouch, stacking
+                                // twins across the containers.
+                                let ps = &mut s.player_state;
+                                let (target, label) = equipment::stash_target(
+                                    &d.name,
+                                    &mut ps.pouch,
+                                    &mut ps.pack,
                                 );
                                 notices.push((
                                     "inventory",
-                                    format!("{} was moved to the pack.", d.name),
+                                    format!("{} was moved to the {}.", d.name, label),
                                 ));
                                 equipment::stack_upsert(
-                                    &mut s.player_state.pack,
+                                    target,
                                     equipment::StackItem {
                                         name: d.name.clone(),
                                         qty: 1,
@@ -7325,6 +9853,7 @@ async fn apply_phase3_bracket_commands(
                                         ..equipment::StackItem::default()
                                     },
                                 );
+                                track_player_item_add(&mut player_item_adds, &d.name);
                             }
                             // (2026-08-22 playtest) Equipping PULLS the item
                             // from storage when a matching unit exists there —
@@ -7388,6 +9917,7 @@ async fn apply_phase3_bracket_commands(
                 if *remove {
                     let existed = equipment::stack_remove(&mut s.player_state.belt, item_name, 0);
                     if existed {
+                        untrack_player_item_add(&mut player_item_adds, item_name);
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
                         tracing::info!(name = %item_name, "[BELT] removed");
@@ -7397,6 +9927,17 @@ async fn apply_phase3_bracket_commands(
                         ));
                     }
                 } else {
+                    // (2026-08-22 second playtest pass) Dual-verb echo: a name
+                    // that already entered the player's racks this turn
+                    // (`[PACK +x]` + `[BELT +x]`, or an internal park) is one
+                    // acquisition re-emitted — never a second stack.
+                    if player_item_added_this_turn(&player_item_adds, item_name) {
+                        tracing::debug!(
+                            name = %item_name,
+                            "[BELT] skipped — same-turn echo of an applied add"
+                        );
+                        continue;
+                    }
                     let belt_item = equipment::StackItem {
                         name: item_name.to_string(),
                         qty: *qty,
@@ -7423,28 +9964,42 @@ async fn apply_phase3_bracket_commands(
                     // FIFO eviction: if this added a new entry past the cap,
                     // drop the oldest (index 0) so the rack stays at BELT_MAX.
                     // (#27 2026-08-15) Overflow = SPILL, not destruction: the
-                    // evictee routes to the unbounded pack (the same
+                    // evictee routes to the default stash (the same
                     // "nothing silently vaporized" contract as unequip → pack
                     // and displaced-occupant → pack) + leaves a recent_events
                     // trace so the narrator sees the item move next turn.
+                    // (2026-08-23 pouch ruling) wallet cargo spilled off the
+                    // belt lands in the POUCH, everything else the pack.
                     while s.player_state.belt.len() > equipment::BELT_MAX {
                         let evicted = s.player_state.belt.remove(0);
-                        tracing::info!(name = %evicted.name, "[BELT] rack full — spilling oldest to the pack");
+                        // One re-borrow of player_state, then split its fields —
+                        // two &mut paths through the MutexGuard's DerefMut would
+                        // double-borrow the guard itself.
+                        let ps = &mut s.player_state;
+                        let (stash, stash_label) = equipment::stash_target(
+                            &evicted.name,
+                            &mut ps.pouch,
+                            &mut ps.pack,
+                        );
+                        tracing::info!(name = %evicted.name, to = stash_label, "[BELT] rack full — spilling oldest to the stash");
                         notices.push((
                             "inventory",
-                            format!("{} was moved from the belt to the pack.", evicted.name),
+                            format!("{} was moved from the belt to the {}.", evicted.name, stash_label),
                         ));
-                        let note = format!("stashed {} in the pack (belt full)", evicted.name);
+                        let note = format!("stashed {} in the {} (belt full)", evicted.name, stash_label);
                         let capped: String = if note.chars().count() > EVENT_NOTE_MAX {
                             note.chars().take(EVENT_NOTE_MAX).collect()
                         } else {
                             note
                         };
+                        // Stash the evictee BEFORE the event push — the stash
+                        // borrow must end before push_event takes &mut schema.
+                        equipment::stack_upsert(stash, evicted);
                         // (2026-08-15 audit fix) push_event, not Vec::push: the
                         // 50-entry stored cap must hold between delta passes.
                         s.push_event(capped);
-                        equipment::stack_upsert(&mut s.player_state.pack, evicted);
                     }
+                    track_player_item_add(&mut player_item_adds, item_name);
                     if s.player_state.belt != pre_list {
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
@@ -7458,20 +10013,23 @@ async fn apply_phase3_bracket_commands(
                             .iter()
                             .any(|i| i.name.trim().eq_ignore_ascii_case(item_name.trim()));
                         if !*asserted || was_new {
-                            notices.push(("inventory", format!("{} was pocketed.", item_name)));
+                            notices.push(("inventory", format!("{} was clipped to the belt.", item_name)));
                         }
                     }
                 }
             }
         }
 
-        // [PACK] — deep-storage pack (UNBOUNDED bagged inventory; the
-        // encumbrance/weight system was PERMANENTLY REMOVED 2026-08-09). Add:
-        // upsert by name (stack qty, take the heavier per-unit weight, union
-        // tags). Remove: drop the whole stack. No capacity rejection — the pack
-        // is infinite; `weight` survives only for the narrator-summary text
-        // readout, enforcing nothing. (2026-08-15 audit fix) Snapshot only on
-        // a real list change (same discipline as [BELT]).
+        // [PACK] — the default stash (UNBOUNDED; the encumbrance/weight system
+        // was PERMANENTLY REMOVED 2026-08-09). Add: upsert by name (stack qty,
+        // take the heavier per-unit weight, union tags) — through the
+        // default-stash router (2026-08-23 pouch ruling): wallet cargo
+        // (currency, coins, keys, ID, small valuables — `pouch_fit`) lands in
+        // the POUCH automatically, everything else the pack. Remove: drop the
+        // whole stack (pack first, then the pouch). No capacity rejection —
+        // both stacks are infinite; `weight` survives only for the
+        // narrator-summary text readout, enforcing nothing. (2026-08-15 audit
+        // fix) Snapshot only on a real list change (same discipline as [BELT]).
         for cmd in &pack_cmds {
             if let bracket_parser::BracketCommand::Pack {
                 item_name,
@@ -7500,20 +10058,52 @@ async fn apply_phase3_bracket_commands(
                     );
                 }
                 let item_name: &str = pack_resolved.as_deref().unwrap_or(item_name);
-                let pre_list = s.player_state.pack.clone();
+                // (2026-08-23 pouch ruling) The stash target: wallet cargo
+                // lives in the POUCH, everything else the pack. The
+                // pre-mutation snapshot follows the target so the change gate
+                // below compares the right list.
+                let fits_pouch = equipment::pouch_fit(item_name);
+                let pre_list = if fits_pouch {
+                    s.player_state.pouch.clone()
+                } else {
+                    s.player_state.pack.clone()
+                };
                 let pre_schema = s.clone();
                 if *remove {
-                    let existed = equipment::stack_remove(&mut s.player_state.pack, item_name, 0);
-                    if existed {
+                    // Removals draw pack-first, then the pouch — the tracker
+                    // removes what it READS, and coin/key lines render on the
+                    // pouch: line.
+                    let removed_from = if equipment::stack_remove(&mut s.player_state.pack, item_name, 0)
+                    {
+                        "pack"
+                    } else if equipment::stack_remove(&mut s.player_state.pouch, item_name, 0) {
+                        "pouch"
+                    } else {
+                        ""
+                    };
+                    if !removed_from.is_empty() {
+                        untrack_player_item_add(&mut player_item_adds, item_name);
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
-                        tracing::info!(name = %item_name, "[PACK] removed");
+                        tracing::info!(name = %item_name, from = removed_from, "[PACK] removed");
                         notices.push((
                             "inventory",
-                            format!("{} was removed from the pack.", item_name),
+                            format!("{} was removed from the {}.", item_name, removed_from),
                         ));
                     }
                 } else {
+                    // (2026-08-22 second playtest pass) Dual-verb echo: the
+                    // SAME acquisition re-emitted through a second verb this
+                    // turn (`[PACK +x]` + `[NPC_ITEM player +x]` — the
+                    // playtest's Goblin Ears ×3 landed ×6). Skips BEFORE
+                    // auto-wear so an echo can't churn equipment either.
+                    if player_item_added_this_turn(&player_item_adds, item_name) {
+                        tracing::debug!(
+                            name = %item_name,
+                            "[PACK] skipped — same-turn echo of an applied add"
+                        );
+                        continue;
+                    }
                     // (2026-08-19 clothes-on-person fix, Chloe ruling: the
                     // system KNOWS where things belong — no UI affordance) A
                     // NEWLY-acquired garment WEARS instead of packing when its
@@ -7528,7 +10118,7 @@ async fn apply_phase3_bracket_commands(
                     // equippable tag, so the Soul Gem popup offers manual
                     // EQUIP on it.
                     let mut tags = item_tags.clone();
-                    let routable = equipment::route_legacy_to_slot(&item_name.to_lowercase());
+                    let routable = equipment::route_item_to_slot(&item_name.to_lowercase());
                     if routable.is_some() && !tags.contains(&equipment::ItemTag::Equippable) {
                         tags.push(equipment::ItemTag::Equippable);
                     }
@@ -7551,7 +10141,7 @@ async fn apply_phase3_bracket_commands(
                     // his back). Weapons + shields equip ONLY via an explicit
                     // [EQUIP].
                     let wear_slot = if is_new_stack {
-                        equipment::route_legacy_to_slot(&item_name.to_lowercase()).filter(|slot| {
+                        equipment::route_item_to_slot(&item_name.to_lowercase()).filter(|slot| {
                             !matches!(
                                 slot,
                                 equipment::EquipSlot::MainHand | equipment::EquipSlot::OffHand
@@ -7579,19 +10169,29 @@ async fn apply_phase3_bracket_commands(
                             equipment::Placement::Packed => None,
                         }
                     });
+                    track_player_item_add(&mut player_item_adds, item_name);
                     if let Some((slot, layer, displaced)) = placement {
                         for d in displaced {
                             tracing::info!(
                                 slot = ?slot,
                                 name = %d.name,
-                                "[PACK] auto-wear displaced occupant → pack"
+                                "[PACK] auto-wear displaced occupant → stash_target"
+                            );
+                            // (2026-08-24 review P2) Same router fix as the
+                            // EQUIP applier — displaced cargo never bypasses
+                            // stash_target.
+                            let ps = &mut s.player_state;
+                            let (target, label) = equipment::stash_target(
+                                &d.name,
+                                &mut ps.pouch,
+                                &mut ps.pack,
                             );
                             notices.push((
                                 "inventory",
-                                format!("{} was moved to the pack.", d.name),
+                                format!("{} was moved to the {}.", d.name, label),
                             ));
                             equipment::stack_upsert(
-                                &mut s.player_state.pack,
+                                target,
                                 equipment::StackItem {
                                     name: d.name.clone(),
                                     qty: 1,
@@ -7601,10 +10201,18 @@ async fn apply_phase3_bracket_commands(
                                 },
                             );
                         }
-                        // qty > 1: a slot holds ONE copy; the rest stay packed.
+                        // qty > 1: a slot holds ONE copy; the rest route
+                        // through stash_target like any acquisition
+                        // (2026-08-24 review P2 — they used to bypass it).
                         if *qty > 1 {
+                            let ps = &mut s.player_state;
+                            let (target, _label) = equipment::stash_target(
+                                item_name,
+                                &mut ps.pouch,
+                                &mut ps.pack,
+                            );
                             equipment::stack_upsert(
-                                &mut s.player_state.pack,
+                                target,
                                 equipment::StackItem {
                                     name: item_name.to_string(),
                                     qty: *qty - 1,
@@ -7619,7 +10227,7 @@ async fn apply_phase3_bracket_commands(
                         tracing::info!(name = %item_name, slot = ?slot, layer = ?layer, "[PACK] auto-wore garment");
                         notices.push(("inventory", format!("{} was equipped.", item_name)));
                     } else {
-                        let pack_item = equipment::StackItem {
+                        let stash_item = equipment::StackItem {
                             name: item_name.to_string(),
                             qty: *qty,
                             weight: *weight,
@@ -7635,15 +10243,31 @@ async fn apply_phase3_bracket_commands(
                         // turns). A qty-LESS bare form is existence-only (the
                         // defaulted 1 must not collapse the stack). An
                         // explicit `+` add still stacks.
+                        // (2026-08-23 pouch ruling) The whole upsert/restate
+                        // rides the default-stash router — wallet cargo
+                        // (coins, keys, ID) files itself into the POUCH, the
+                        // read-back loop restates the pouch stack it actually
+                        // holds, and everything else the pack.
+                        let ps = &mut s.player_state;
+                        let (stash, stash_label) = equipment::stash_target(
+                            item_name,
+                            &mut ps.pouch,
+                            &mut ps.pack,
+                        );
                         if *asserted {
-                            equipment::stack_restate(&mut s.player_state.pack, pack_item, *qty_given);
+                            equipment::stack_restate(stash, stash_item, *qty_given);
                         } else {
-                            equipment::stack_upsert(&mut s.player_state.pack, pack_item);
+                            equipment::stack_upsert(stash, stash_item);
                         }
-                        if s.player_state.pack != pre_list {
+                        let now_list: &Vec<equipment::StackItem> = if fits_pouch {
+                            &s.player_state.pouch
+                        } else {
+                            &s.player_state.pack
+                        };
+                        if now_list != &pre_list {
                             undo_snapshot.get_or_insert(pre_schema);
                             mutated = true;
-                            tracing::info!(name = %item_name, qty, weight, "[PACK] added");
+                            tracing::info!(name = %item_name, qty, weight, to = stash_label, "[PACK] added");
                             // Same gate as [BELT]: silent only when restating a
                             // KNOWN item — a first sighting in the bare form is
                             // still an acquisition the player must see.
@@ -7654,9 +10278,9 @@ async fn apply_phase3_bracket_commands(
                                 notices.push((
                                     "inventory",
                                     if *qty > 1 {
-                                        format!("{} ×{} was added to the pack.", item_name, qty)
+                                        format!("{} ×{} was added to the {}.", item_name, qty, stash_label)
                                     } else {
-                                        format!("{} was added to the pack.", item_name)
+                                        format!("{} was added to the {}.", item_name, stash_label)
                                     },
                                 ));
                             }
@@ -7669,12 +10293,14 @@ async fn apply_phase3_bracket_commands(
         // loop runs BEFORE the belt/pack loops, so consuming storage inline
         // missed any unit the SAME turn added (`[PACK +Shield]` +
         // `[EQUIP Shield]` → equipped AND still packed). Names collected
-        // above now draw one unit each — belt before pack (quick-access is
-        // the draw source); stack_remove on an absent name is a no-op, so
-        // narratively-new gear is untouched.
+        // above now draw one unit each — belt before pack before pouch
+        // (quick-access first, the wallet last); stack_remove on an absent
+        // name is a no-op, so narratively-new gear is untouched.
         for name in &equipped_names {
-            if !equipment::stack_remove(&mut s.player_state.belt, name, 1) {
-                equipment::stack_remove(&mut s.player_state.pack, name, 1);
+            if !equipment::stack_remove(&mut s.player_state.belt, name, 1)
+                && !equipment::stack_remove(&mut s.player_state.pack, name, 1)
+            {
+                equipment::stack_remove(&mut s.player_state.pouch, name, 1);
             }
         }
         // (2026-08-18 Dedicated-NPC interior state) [NPC_ITEM] — an NPC's
@@ -7691,6 +10317,7 @@ async fn apply_phase3_bracket_commands(
                 npc_id,
                 item_name,
                 qty,
+                qty_given,
                 remove,
                 item_tags,
             } = cmd
@@ -7705,38 +10332,80 @@ async fn apply_phase3_bracket_commands(
                 let entry_opt = schema::resolve_npc_surface(&s.npc_registry.entries, npc_id);
                 let Some(entry) = entry_opt else {
                     if npc_item_targets_player(npc_id, &player_slug) {
-                        // Pack semantics, the [PACK] discipline in miniature:
-                        // adds fragment-resolve through the narrative window +
-                        // the existing pack names, then upsert; removals match
-                        // stored names only. No auto-wear here — this is the
-                        // forgiveness path, not the taught form ([PACK] owns
-                        // the player's racks).
-                        let pack_names: Vec<String> =
+                        // Default-stash semantics, the [PACK] discipline in
+                        // miniature: adds fragment-resolve through the
+                        // narrative window + the existing stash names (pack +
+                        // pouch — 2026-08-23 pouch ruling), then upsert through
+                        // the stash router (wallet cargo → pouch); removals
+                        // match stored names only (pack, then pouch). No
+                        // auto-wear here — this is the forgiveness path, not
+                        // the taught form ([PACK] owns the player's racks).
+                        let mut stash_names: Vec<String> =
                             s.player_state.pack.iter().map(|i| i.name.clone()).collect();
+                        stash_names.extend(s.player_state.pouch.iter().map(|i| i.name.clone()));
                         let corpus: &[&str] = if *remove { &[] } else { &narrative_corpus };
                         let resolved = equipment::resolve_item_fragment(
                             item_name,
                             corpus,
-                            &pack_names,
+                            &stash_names,
                         );
                         let item_name: &str = resolved.as_deref().unwrap_or(item_name);
                         let pre_schema = s.clone();
-                        let pre_list = s.player_state.pack.clone();
+                        let fits_pouch = equipment::pouch_fit(item_name);
+                        let pre_list = if fits_pouch {
+                            s.player_state.pouch.clone()
+                        } else {
+                            s.player_state.pack.clone()
+                        };
                         if *remove {
-                            let existed =
-                                equipment::stack_remove(&mut s.player_state.pack, item_name, 0);
-                            if existed {
+                            let removed_from = if equipment::stack_remove(&mut s.player_state.pack, item_name, 0)
+                            {
+                                "pack"
+                            } else if equipment::stack_remove(&mut s.player_state.pouch, item_name, 0) {
+                                "pouch"
+                            } else {
+                                ""
+                            };
+                            if !removed_from.is_empty() {
+                                untrack_player_item_add(&mut player_item_adds, item_name);
                                 undo_snapshot.get_or_insert(pre_schema);
                                 mutated = true;
-                                tracing::info!(name = %item_name, "[NPC_ITEM player] removed from pack");
+                                tracing::info!(name = %item_name, from = removed_from, "[NPC_ITEM player] removed from stash");
                                 notices.push((
                                     "inventory",
-                                    format!("{} was removed from the pack.", item_name),
+                                    format!("{} was removed from the {}.", item_name, removed_from),
                                 ));
                             }
                         } else {
+                            // (2026-08-22 second playtest pass) The person guard
+                            // for UNREGISTERED people — the registry half above
+                            // can't see "Elven figure" until it's registered.
+                            if item_name_looks_like_person(item_name) {
+                                reject_directives.push(format!(
+                                    "Item not recorded — \"{item_name}\" is a person, not an object. People are never items; a person's state tracks through [NPC_REGISTER] + [PRESENCE]/[MOOD]/[INTENT]."
+                                ));
+                                tracing::debug!(name = %item_name, "[NPC_ITEM player] rejected — the name reads as a person");
+                                continue;
+                            }
+                            // (2026-08-22 second playtest pass) Dual-verb echo:
+                            // a `[PACK +x]` (or internal park) already landed
+                            // this name this turn — the forgiveness path never
+                            // stacks a second copy of the same acquisition.
+                            if player_item_added_this_turn(&player_item_adds, item_name) {
+                                tracing::debug!(
+                                    name = %item_name,
+                                    "[NPC_ITEM player] skipped — same-turn echo of an applied add"
+                                );
+                                continue;
+                            }
+                            let ps = &mut s.player_state;
+                            let (stash, stash_label) = equipment::stash_target(
+                                item_name,
+                                &mut ps.pouch,
+                                &mut ps.pack,
+                            );
                             equipment::stack_upsert(
-                                &mut s.player_state.pack,
+                                stash,
                                 equipment::StackItem {
                                     name: item_name.to_string(),
                                     qty: *qty,
@@ -7745,13 +10414,19 @@ async fn apply_phase3_bracket_commands(
                                     tags: item_tags.clone(),
                                 },
                             );
-                            if s.player_state.pack != pre_list {
+                            let now_list: &Vec<equipment::StackItem> = if fits_pouch {
+                                &s.player_state.pouch
+                            } else {
+                                &s.player_state.pack
+                            };
+                            if now_list != &pre_list {
                                 undo_snapshot.get_or_insert(pre_schema);
                                 mutated = true;
-                                tracing::info!(name = %item_name, qty, "[NPC_ITEM player] added to pack");
+                                track_player_item_add(&mut player_item_adds, item_name);
+                                tracing::info!(name = %item_name, qty, to = stash_label, "[NPC_ITEM player] added to stash");
                                 notices.push((
                                     "inventory",
-                                    format!("{} was added to the pack.", item_name),
+                                    format!("{} was added to the {}.", item_name, stash_label),
                                 ));
                             }
                         }
@@ -7800,7 +10475,9 @@ async fn apply_phase3_bracket_commands(
                 // Both reject with a teaching directive (they ride the
                 // narrator's <directives> + the tracker_emit_errors loop).
                 if !*remove {
-                    if item_name_is_a_person(&s.npc_registry.entries, item_name) {
+                    if item_name_is_a_person(&s.npc_registry.entries, item_name)
+                        || item_name_looks_like_person(item_name)
+                    {
                         reject_directives.push(format!(
                             "Item not recorded — \"{item_name}\" is a person, not an object. People are never items; a person's state tracks through [PRESENCE]/[MOOD]/[INTENT]."
                         ));
@@ -7829,12 +10506,13 @@ async fn apply_phase3_bracket_commands(
                             // "Iron Dagger" — two people can each hold one).
                             // Body/belt slots hold the player's unique copy —
                             // there the paired-removal teaching is exact.
-                            let pack_held = s
+                            let stash_held = s
                                 .player_state
                                 .pack
                                 .iter()
+                                .chain(s.player_state.pouch.iter())
                                 .any(|i| i.name.trim().to_lowercase() == key);
-                            reject_directives.push(if pack_held {
+                            reject_directives.push(if stash_held {
                                 format!(
                                     "Item not recorded — the player also holds a \"{item_name}\". If this is a TRANSFER of the player's copy: emit the paired removal first ([PACK -{item_name}]), then [NPC_ITEM {id} +{item_name}]. If the NPC acquired its own separate {item_name}: give it a distinguishing name (e.g. \"{id}'s {item_name}\") — NEVER remove the player's copy to describe the NPC's acquisition."
                                 )
@@ -7872,7 +10550,7 @@ async fn apply_phase3_bracket_commands(
                 // Shorts] swaps the outfit the narrator reads next turn.
                 // Removals check BOTH racks (you take off what you wear or
                 // what you hold).
-                let is_garment = equipment::route_legacy_to_slot(
+                let is_garment = equipment::route_item_to_slot(
                     &item_name.to_lowercase(),
                 )
                 .map(|slot| {
@@ -7891,21 +10569,53 @@ async fn apply_phase3_bracket_commands(
                         tracing::info!(npc_id = %id, name = %item_name, "[NPC_ITEM] removed");
                     }
                 } else {
-                    let target: &mut Vec<equipment::StackItem> = if is_garment {
-                        &mut interior.worn
-                    } else {
-                        &mut interior.items
+                    // (2026-08-22 second playtest pass — the rack manifest
+                    // echo) A re-add of a name this NPC ALREADY holds is the
+                    // tracker reading its own `holding:`/`wearing:` lines back
+                    // (the 0.29.1 playtest: ferenc's and wevlan's racks grew
+                    // map/Roy/tea ×N, re-dumped every re-track). RESTATE, never
+                    // stack: an echo with an explicit qty asserts the new TOTAL
+                    // (self-healing accumulated over-counts); a qty-less echo
+                    // keeps the stored count (idempotent). The restate targets
+                    // the rack that already holds the name — garment routing
+                    // only steers FIRST acquisitions.
+                    let held_key = item_name.trim().to_lowercase();
+                    let held_in_items = interior
+                        .items
+                        .iter()
+                        .any(|i| i.name.trim().to_lowercase() == held_key);
+                    let held_in_worn = interior
+                        .worn
+                        .iter()
+                        .any(|i| i.name.trim().to_lowercase() == held_key);
+                    let (target, is_echo): (&mut Vec<equipment::StackItem>, bool) =
+                        if held_in_items {
+                            (&mut interior.items, true)
+                        } else if held_in_worn {
+                            (&mut interior.worn, true)
+                        } else if is_garment {
+                            (&mut interior.worn, false)
+                        } else {
+                            (&mut interior.items, false)
+                        };
+                    let incoming = equipment::StackItem {
+                        name: item_name.to_string(),
+                        qty: *qty,
+                        weight: 1.0,
+                        stats: None,
+                        tags: item_tags.clone(),
                     };
-                    equipment::stack_upsert(
-                        target,
-                        equipment::StackItem {
-                            name: item_name.to_string(),
-                            qty: *qty,
-                            weight: 1.0,
-                            stats: None,
-                            tags: item_tags.clone(),
-                        },
-                    );
+                    if is_echo {
+                        if equipment::stack_restate(target, incoming, *qty_given) {
+                            tracing::debug!(
+                                npc_id = %id,
+                                name = %item_name,
+                                "[NPC_ITEM] re-add treated as restatement (no stack)"
+                            );
+                        }
+                    } else {
+                        equipment::stack_upsert(target, incoming);
+                    }
                     if is_garment {
                         // Per-NPC FIFO cap mirrors the seed path's worn cap.
                         while interior.worn.len() > schema::NPC_WORN_MAX {
@@ -7922,7 +10632,10 @@ async fn apply_phase3_bracket_commands(
                             interior.items.drain(..overflow);
                         }
                     }
-                    if interior.items != pre_items || (is_garment && interior.worn != pre_worn) {
+                    // (2026-08-22 second playtest pass) BOTH lists compared —
+                    // an echo restated onto the WORN rack with is_garment
+                    // false used to escape the old items-only detection.
+                    if interior.items != pre_items || interior.worn != pre_worn {
                         changed = true;
                         tracing::info!(npc_id = %id, name = %item_name, qty, "[NPC_ITEM] added");
                     }
@@ -8019,7 +10732,7 @@ async fn apply_phase3_bracket_commands(
         push_fable_history_snapshot(state, snap).await;
     }
 
-    (mutated, reject_directives)
+    (mutated, reject_directives, event_directives)
 }
 
 /// (2026-08-22 playtest audit) Does this `[NPC_ITEM]` id target the PLAYER?
@@ -8053,6 +10766,7 @@ fn player_holds_item(ps: &player_state::PlayerState, name: &str) -> bool {
         .flat_map(|layers| [&layers.outer, &layers.inner].into_iter().flatten())
         .any(|it| held_by(&it.name))
         || ps.belt.iter().any(|i| held_by(&i.name))
+        || ps.pouch.iter().any(|i| held_by(&i.name))
         || ps.pack.iter().any(|i| held_by(&i.name))
 }
 
@@ -8067,6 +10781,96 @@ fn item_name_is_a_person(entries: &[schema::NpcEntry], item_name: &str) -> bool 
     }
     entries.iter().any(|e| {
         e.name.trim().to_lowercase() == key || e.id.trim().to_lowercase() == key
+    })
+}
+
+/// (2026-08-22 second playtest pass — the person guard, UNREGISTERED half)
+/// Does the item NAME itself read as a person? The registry guard above
+/// catches registered NPCs; the playtest also pocketed people the registry
+/// never knew — `[NPC_ITEM wevlan +Elven figure]` and `+Roy` (a quest person
+/// as a rack object). A name whose FINAL word is an unambiguous person noun
+/// ("figure", "man", "woman", "boy", "girl", "child", "lad", "lass",
+/// "maiden", "captive", "prisoner", "stranger") is a person description, not
+/// an object. Last-word anchored so "straw doll"/"wax seal" style names never
+/// trip it; a bare person noun alone ("Roy") stays out of reach — that half
+/// is the emit_errors coaching loop's job. Pure so the gate is unit-testable.
+fn item_name_looks_like_person(item_name: &str) -> bool {
+    const PERSON_NOUNS: &[&str] = &[
+        "figure", "man", "woman", "boy", "girl", "child", "lad", "lass",
+        "maiden", "captive", "prisoner", "stranger",
+    ];
+    let key = item_name.trim().to_lowercase();
+    if key.is_empty() {
+        return false;
+    }
+    let last_word: String = key
+        .rsplit(|c: char| c.is_whitespace() || c == '-' || c == '_')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    PERSON_NOUNS.contains(&last_word.as_str())
+}
+
+// (2026-08-22 second playtest pass — the dual-verb echo) Names that entered
+// the player's racks THIS TURN: a tracker ADD (`[PACK +x]`, `[BELT +x]`,
+// `[NPC_ITEM player +x]`) or an internal park (unequip / displaced-occupant
+// → pack). The tracker habitually emits ONE acquisition through TWO verbs in
+// the same turn ("[PACK +Goblin Ear qty=3]" + "[NPC_ITEM player +Goblin Ear
+// qty=3]" — the playtest's ears ×3 landed ×6, the Bugbear Head ×1 landed
+// ×2); the appliers consult this set and skip the later same-name add as an
+// echo of an already-applied emission. The known cost (accepted, same turn
+// only): stashing one copy AND genuinely looting a second in a single turn
+// under-counts by one — the "doubled my Dagger" corruption class is the
+// bigger evil. Pure trio so the set logic is unit-testable.
+fn track_player_item_add(tracked: &mut Vec<String>, name: &str) {
+    let key = name.trim().to_lowercase();
+    if !key.is_empty() && !tracked.contains(&key) {
+        tracked.push(key);
+    }
+}
+
+/// `track_player_item_add`'s consult side — has this name already been added
+/// to the player's racks this turn?
+fn player_item_added_this_turn(tracked: &[String], name: &str) -> bool {
+    let key = name.trim().to_lowercase();
+    !key.is_empty() && tracked.contains(&key)
+}
+
+/// A removal re-opens the name: `[PACK -rope]` + `[NPC_ITEM player +rope
+/// qty=2]` is the taught replace pattern, not an echo.
+fn untrack_player_item_add(tracked: &mut Vec<String>, name: &str) {
+    let key = name.trim().to_lowercase();
+    tracked.retain(|n| *n != key);
+}
+
+/// (2026-08-22 Chloe ruling — auto-registration) The stub a GROUNDED but
+/// unknown `[PRESENCE <id>]` mints on the fly: a named NPC the tracker
+/// clearly intends to introduce (Rhet, the elf in the pit) no longer burns
+/// a turn on a coached [NPC_REGISTER] retry. Same shape as [NPC_REGISTER]'s
+/// discovered path — `Named` prominence (full interior, reaper-archivable —
+/// an abandoned auto-stub ages out, unlike authored `core` entries), the
+/// slug as id, the surface as the display name AND the entry's own alias so
+/// every later `[PRESENCE <id>]` resolves. `None` = the surface slugifies
+/// to nothing (an illegal-character key) — that half KEEPS the coached
+/// reject (the ruling's carve-out: rejects stay for malformed syntax and
+/// illegal keys). Pure so the mint is unit-testable.
+fn auto_register_presence_stub(surface: &str) -> Option<schema::NpcEntry> {
+    let id = sanitize_slug(surface);
+    if id.is_empty() {
+        return None;
+    }
+    // (2026-08-24 fix) Garbage surfaces never mint a stub either — an
+    // `undefined` presence stays a coached reject, not a phantom cast member.
+    if schema::is_garbage_identifier(surface) {
+        return None;
+    }
+    Some(schema::NpcEntry {
+        aliases: vec![id.clone()],
+        id,
+        name: surface.trim().to_string(),
+        role: String::new(),
+        tier: None,
+        prominence: schema::NpcProminence::Named,
     })
 }
 
@@ -8105,13 +10909,45 @@ fn narrative_grounded(corpus: &[&str], surface: &str, id: &str, name: &str) -> b
 /// The site brief the architect decodes against (collected under the schema
 /// lock, then released for the decode — the schema lock is NEVER held across
 /// a multi-second LLM wait).
+#[derive(Clone)]
 struct SiteBrief {
     node_id: String,
     node_name: String,
     tone: String,
     elapsed_days: i64,
     seeds: Vec<String>,
+    /// (2026-08-22 multihog WS3) The node's pending pressure lines — the
+    /// accumulated off-screen intent the map is asked to honor (germinated
+    /// truth CONSUMES the queue at the insert below).
+    pressure: Vec<String>,
     premise: String,
+    /// (2026-08-23 hosted interiors) The map's scale — rooms (dungeon /
+    /// interior / building-child) or districts (settlement). Decided by the
+    /// trigger from `setting=settlement` or [`site_map::looks_like_settlement`].
+    scale: ArchitectScale,
+    /// (2026-08-23 hosted interiors) Set ONLY when architecting a hosted
+    /// BUILDING child — the structure's identity + its parent settlement.
+    building: Option<BuildingBrief>,
+}
+
+/// (2026-08-23 hosted interiors) The scale law the architect decodes under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArchitectScale {
+    /// Rooms/passages of one interior — the classic hidden map.
+    Rooms,
+    /// Districts of a settlement; significant structures are Building assets.
+    Districts,
+}
+
+/// (2026-08-23 hosted interiors) The building-side of a hosted-child brief.
+#[derive(Clone)]
+struct BuildingBrief {
+    /// The Building asset's diegetic name ("The Sunken Flagon").
+    building_name: String,
+    /// The Building asset's `detail` (what the district knows about it).
+    building_detail: String,
+    /// The parent settlement's diegetic name (breadcrumb context).
+    parent_name: String,
 }
 
 /// The architect's system contract: ONE fenced ```json object matching the
@@ -8129,31 +10965,76 @@ Schema (enum values lowercase snake_case; ids are kebab-case):
   \"threat\": \"low|moderate|high|deadly\",
   \"entrance\": \"<area_id of the arrival area — knowledge 'visited', the ONLY visited area>\",
   \"areas\": [ {\"id\": \"kebab-id\", \"name\": \"Diegetic Name\", \"knowledge\": \"unrevealed|discovered|visited\", \"geometry\": [\"one terse line\"], \"connections\": [{\"to\": \"<other area id>\", \"state\": \"open|locked|blocked\", \"detail\": \"door or passage detail\"}]}],
-  \"assets\": [ {\"id\": \"kebab-id\", \"name\": \"...\", \"kind\": \"creature|group|trap|hazard|loot|object\", \"location\": \"<area id>\", \"state\": \"active|dead|taken|triggered\", \"knowledge\": \"unrevealed|suspected|known\", \"count\": <group size 1-99, else 0>, \"detail\": \"...\", \"tier\": \"minion|soldier|elite|boss|legendary\"} ]
+  \"assets\": [ {\"id\": \"kebab-id\", \"name\": \"...\", \"kind\": \"creature|group|trap|hazard|loot|object|building\", \"location\": \"<area id>\", \"state\": \"active|dead|taken|triggered|deactivated|fleeing\", \"knowledge\": \"unrevealed|suspected|known\", \"count\": <group size 1-99, else 0>, \"detail\": \"...\", \"tier\": \"minion|soldier|elite|boss|legendary\"} ]
 }
 
 Hard rules:
-- 3 to 8 areas (the output must fit one ~512-token JSON object — never more). Every connection is RECIPROCAL (both areas list it with the same state + detail).
+- 3 to 8 areas — prefer 4-6 (the whole output must fit one ~1024-token JSON object). Every connection is RECIPROCAL (both areas list it with the same state + detail).
 - Every area is reachable from the entrance; locked and blocked routes still count as connections.
 - The entrance is the only 'visited' area; everything else is 'unrevealed' (the player just walked in).
-- Geometry: at most 3 lines of 120 chars each. Details at most 160 chars. Terse, concrete, sensory.
+- Geometry: exactly 1 terse line per area (at most 3 lines of 120 chars, and only when the space truly demands it).
+- Details at most 12 words. Terse, concrete, sensory.
+- At most 2 assets per area — density lives in the map shape, not the inventory.
 - Unseen creatures are 'unrevealed' — their truth is fixed now, discovered later.
 - A group carries count 1-99; every other kind uses count 0.
 - Locked/blocked doors guard real things. Honor the seeds and the tone.
 - Output ONLY the fenced ```json object. No prose before or after.";
+
+/// (2026-08-23 hosted interiors) The DISTRICT scale addendum — appended to
+/// the shared architect contract when the place is a settlement: areas are
+/// districts, and significant structures ride as Building assets (the
+/// enter-able interior hooks).
+const SITE_ARCHITECT_DISTRICT_LAW: &str = "\
+SCALE LAW — this place is a SETTLEMENT mapped at DISTRICT scale:
+- \"areas\" are DISTRICTS (market quarter, temple hill, waterfront…), not rooms.
+- Significant structures worth crawling (a guildhall, temple, grand manor,
+  fortress compound) are assets with \"kind\": \"building\", placed in their
+  district. AT MOST 3 building assets — ordinary shops, inns, and homes stay
+  narrative texture, NEVER assets.
+- A building asset carries state \"active\" and knowledge by fame (a landmark
+  is \"known\"; a back-room front is \"unrevealed\"). Its interior is mapped
+  separately when the player enters — do NOT model rooms inside it here.";
+
+/// (2026-08-23 hosted interiors) The BUILDING-CHILD scale addendum — this
+/// decode is the INTERIOR of one structure inside a settlement: room scale,
+/// and the depth-2 law (no nested buildings).
+const SITE_ARCHITECT_BUILDING_LAW: &str = "\
+SCALE LAW — you are mapping the INTERIOR of ONE structure inside a settlement,
+at ROOM scale. The district outside is a separate map; model only what is
+inside these walls. The asset kind \"building\" is FORBIDDEN here — buildings
+never nest.";
 
 /// Render the architect's `<|turn>` prompt (the Gemma4 protocol shape). Pure.
 pub(crate) fn render_site_architect_prompt(b: &SiteBrief) -> String {
     let mut out = String::with_capacity(2048);
     out.push_str("<|turn>system\n");
     out.push_str(SITE_ARCHITECT_SYSTEM_INSTRUCTION);
+    match b.scale {
+        ArchitectScale::Districts => out.push_str(SITE_ARCHITECT_DISTRICT_LAW),
+        ArchitectScale::Rooms => {
+            if b.building.is_some() {
+                out.push_str(SITE_ARCHITECT_BUILDING_LAW);
+            }
+        }
+    }
     if crate::settings::THINKING_ENABLED {
         out.push_str("<|think|>");
     }
     out.push_str("<turn|>\n");
     out.push_str("<|turn>user\n");
-    out.push_str("Design the hidden interior the player just entered.\n");
-    out.push_str(&format!("Place: {}\n", b.node_name));
+    if let Some(bb) = &b.building {
+        out.push_str(&format!(
+            "Design the hidden interior of one structure the player just stepped inside.\n\
+             Place: {} — inside the district map of {} (the outside world is NOT yours to model).\n",
+            bb.building_name, bb.parent_name
+        ));
+        if !bb.building_detail.trim().is_empty() {
+            out.push_str(&format!("Known about it: {}\n", bb.building_detail.trim()));
+        }
+    } else {
+        out.push_str("Design the hidden interior the player just entered.\n");
+        out.push_str(&format!("Place: {}\n", b.node_name));
+    }
     if !b.tone.trim().is_empty() {
         out.push_str(&format!("Tone: {}\n", b.tone.trim()));
     }
@@ -8165,6 +11046,14 @@ pub(crate) fn render_site_architect_prompt(b: &SiteBrief) -> String {
         out.push_str("Established seeds (honor them):\n");
         for s in &b.seeds {
             out.push_str(&format!("- {}\n", s));
+        }
+    }
+    // (2026-08-22 multihog WS3) The pending-pressure read: where the site
+    // was heading before the player walked in — the map's truth answers it.
+    if !b.pressure.is_empty() {
+        out.push_str("Pending pressure on this place (answer it in the map):\n");
+        for p in &b.pressure {
+            out.push_str(&format!("- {}\n", p));
         }
     }
     out.push_str(&format!("Arrival scene (the premise):\n{}\n", b.premise));
@@ -8186,6 +11075,23 @@ fn render_site_architect_repair(prior_raw: &str, errors: &[String]) -> String {
     for e in errors {
         out.push_str(&format!("- {}\n", e));
     }
+    // (v0.30.0 stall fix) "correct this" alone makes the model re-emit the
+    // SAME oversized map when the failure class was truncation — the repair
+    // prompt never restated the size law. Re-state it always, and when any
+    // error is a `JSON parse:` failure (the truncation signature from
+    // `SiteMap::from_model_output` — the decode hit the token wall mid-JSON)
+    // direct the correction at SMALLER, not just fixed.
+    out.push_str(
+        "Size law: 3-8 areas (prefer 4-6), at most 2 assets per area, details at most \
+         12 words, geometry exactly 1 line — the whole object must fit one ~1024-token \
+         emit.\n",
+    );
+    if errors.iter().any(|e| e.starts_with("JSON parse:")) {
+        out.push_str(
+            "Your previous output was CUT OFF at the token limit — emit a SMALLER map: \
+             fewer areas, terser details.\n",
+        );
+    }
     if crate::settings::THINKING_ENABLED {
         out.push_str("<|think|>");
     }
@@ -8201,7 +11107,7 @@ fn render_site_architect_repair(prior_raw: &str, errors: &[String]) -> String {
 /// (2026-08-19 Hidden site maps) The JIT Architect: on ARRIVAL at a node with
 /// no map whose `setting` is indoor OR that carries seeds, run ONE
 /// deterministic E4B pass (the Tracker profile — the Architect mode shares
-/// it, with a 512-token reserve + hard over-budget refusal) that emits the
+/// it, with a 1024-token reserve + hard over-budget refusal) that emits the
 /// site's objective truth as one fenced JSON object. On success the map is
 /// inserted + the node's seeds consumed; the same turn's Stage-2 narrator
 /// tail then renders the knowledge-filtered `site:` block (schema dictates,
@@ -8211,12 +11117,13 @@ fn render_site_architect_repair(prior_raw: &str, errors: &[String]) -> String {
 /// Arc, the Fable lease, and the turn lock are all still held — a second
 /// `request_turn` on the same engine is a fresh prefill (the dev-narrator
 /// precedent). The schema lock is taken only for the trigger check + the
-/// insert, NEVER across the decode. **Failure contract:** any failure (2
-/// parse/validate passes, engine/channel error, cancel) skips SILENTLY —
-/// the narrator proceeds map-less (today's behavior) and the idempotence
-/// check re-architects next turn. Cost: one ~512-token decode (~8-15s on
-/// the E4B) ONCE per site — the accepted price of objective reality before
-/// narration.
+/// insert, NEVER across the decode. **Failure contract:** any failure (all
+/// repair passes exhausted, engine/channel error, cancel) skips SILENTLY —
+/// the narrator proceeds map-less, and the failure bumps the node's standdown
+/// counter (`record_architect_failure`); at `ARCHITECT_FAIL_STANDDOWN` failed
+/// rounds the node stays map-less for good. Cost: one ~1024-token decode
+/// (~8-15s on the E4B) ONCE per site — the accepted price of objective
+/// reality before narration.
 async fn maybe_run_site_architect(
     state: &tauri::State<'_, AppState>,
     engine: &Arc<fable_engine::FableEngine>,
@@ -8233,13 +11140,44 @@ async fn maybe_run_site_architect(
         if s.site_maps.contains_key(&cur) {
             return;
         }
-        let (node_name, setting, seeds, evolved) =
+        let (node_name, setting, seeds, evolved, fail_rounds) =
             match s.travel_graph.find_node(&cur) {
-                Some(n) => (n.name.clone(), n.setting.clone(), n.seeds.clone(), n.last_evolved_minutes),
-                None => (cur.clone(), String::new(), Vec::new(), 0),
+                Some(n) => (
+                    n.name.clone(),
+                    n.setting.clone(),
+                    n.seeds.clone(),
+                    n.last_evolved_minutes,
+                    n.architect_fail_rounds,
+                ),
+                None => (cur.clone(), String::new(), Vec::new(), 0, 0),
             };
+        // (2026-08-24 stall fix) Per-node standdown: a node whose architect
+        // rounds keep failing (typically an unfixably oversized map) never
+        // re-arms — it stays deliberately map-less instead of taxing every
+        // arrival with the full decode cycle.
+        if fail_rounds >= crate::site_map::ARCHITECT_FAIL_STANDDOWN {
+            tracing::debug!(
+                node = %cur,
+                fail_rounds,
+                "site architect: node stood down after repeated failed rounds — staying map-less"
+            );
+            return;
+        }
+        let pressure = s
+            .travel_graph
+            .find_node(&cur)
+            .map(|n| n.pending_pressure.clone())
+            .unwrap_or_default();
         let indoor = setting.trim().eq_ignore_ascii_case("indoor");
-        if !indoor && seeds.is_empty() {
+        // (2026-08-23 hosted interiors) Settlements map at DISTRICT scale:
+        // the explicit `setting=settlement` classification is primary, the
+        // name heuristic rescues clearly-named older nodes.
+        let settlement = setting.trim().eq_ignore_ascii_case("settlement")
+            || crate::site_map::looks_like_settlement(&node_name);
+        // (2026-08-22 multihog WS3) Pressure broadens the architect trigger:
+        // a node the tick has been pressing on germinates on arrival even
+        // outdoors + seedless — the accumulated intent needs its consumer.
+        if !indoor && !settlement && seeds.is_empty() && pressure.is_empty() {
             return;
         }
         let now = s.world_clock.current_minutes;
@@ -8263,61 +11201,37 @@ async fn maybe_run_site_architect(
             tone: s.tone.clone().unwrap_or_default(),
             elapsed_days,
             seeds,
+            pressure,
             premise,
+            scale: if settlement {
+                ArchitectScale::Districts
+            } else {
+                ArchitectScale::Rooms
+            },
+            building: None,
         })
     };
     let Some(brief) = brief else {
         return;
     };
 
-    // 2. Decode — ONE correction pass on failure (the generate_with_repair
-    //    shape); a second failure skips silently.
-    let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
-    let mut attempt_prompt = render_site_architect_prompt(&brief);
-    let mut parsed_map: Option<crate::site_map::SiteMap> = None;
-    for pass in 1..=2u8 {
-        let reply = match engine.request_turn(
-            attempt_prompt.clone(),
-            noop_chunk.clone(),
-            cancel.clone(),
-            fable_engine::FableTurnMode::Architect,
-        ) {
-            Ok(reply_rx) => match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
-                Ok(Ok(r)) => r,
-                _ => {
-                    return;
-                }
-            },
-            Err(_) => {
-                return;
-            }
-        };
-        if !reply.error.is_empty() || reply.cancelled {
+    // 2. Decode — the shared initial-generation + repair loop. A failed full
+    //    round bumps the node's standdown counter (2 rounds → this node never
+    //    re-architects; a cancel-driven failure counts too — two aborted
+    //    architect decodes at the same node mean the same wait the player
+    //    keeps refusing).
+    let mut map = match decode_site_map_with_repair(
+        engine,
+        cancel,
+        render_site_architect_prompt(&brief),
+    )
+    .await
+    {
+        Some(m) => m,
+        None => {
+            record_architect_failure(state, &brief.node_id).await;
             return;
         }
-        let raw = reply.raw_output;
-        // Pass 1's errors feed the ONE correction prompt; a pass-2 failure
-        // falls through and skips silently (the documented shape).
-        let parsed = match crate::site_map::SiteMap::from_model_output(&raw) {
-            Err(e) => Err(vec![e]),
-            Ok(m) => match crate::site_map::validate(&m) {
-                Ok(()) => Ok(m),
-                Err(errs) => Err(errs),
-            },
-        };
-        match parsed {
-            Ok(m) => {
-                parsed_map = Some(m);
-                break;
-            }
-            Err(errors) if pass == 1 => {
-                attempt_prompt = render_site_architect_repair(&raw, &errors);
-            }
-            Err(_) => {}
-        }
-    }
-    let Some(mut map) = parsed_map else {
-        return;
     };
 
     // 3. Insert under the schema lock. Re-verify idempotence + arrival (a
@@ -8338,10 +11252,16 @@ async fn maybe_run_site_architect(
         }
         map.node_id = cur.clone();
         map.last_visit_minutes = s.world_clock.current_minutes;
+        // (2026-08-22 multihog WS2) The player stands at the entrance — the
+        // traversal gate's + GM block's anchor.
+        map.current_area = Some(map.entrance.clone());
         let snap = s.clone();
-        // The seeds just germinated into a map — consume them.
+        // The seeds just germinated into a map — consume them. (2026-08-22
+        // multihog WS3) So did the pending pressure: germinated truth IS
+        // the commit.
         if let Some(node) = s.travel_graph.nodes.iter_mut().find(|n| n.id == cur) {
             node.seeds.clear();
+            node.pending_pressure.clear();
         }
         crate::site_map::evict_lru_site_map(&mut s.site_maps, &cur);
         s.site_maps.insert(cur, map);
@@ -8352,6 +11272,243 @@ async fn maybe_run_site_architect(
             assets = asset_count,
             threat = %threat.word(),
             "site architect: interior map inserted"
+        );
+        push_fable_history_snapshot(&state, snap).await;
+    }
+}
+
+/// The shared architect decode: initial generation + up to
+/// `SITE_ARCHITECT_REPAIR_PASSES` correction passes (the
+/// generate_with_repair shape; the repair budget was raised 1 → 2 on
+/// 2026-08-22 — a reciprocity or reachability slip on the first repair used
+/// to be the whole budget). `None` on ANY failure (engine/channel error,
+/// cancel, or all passes invalid) — both callers skip silently.
+async fn decode_site_map_with_repair(
+    engine: &Arc<fable_engine::FableEngine>,
+    cancel: &llm::CancelToken,
+    initial_prompt: String,
+) -> Option<crate::site_map::SiteMap> {
+    let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
+    let mut attempt_prompt = initial_prompt;
+    let total_passes = 1 + crate::site_map::SITE_ARCHITECT_REPAIR_PASSES;
+    for pass in 1..=total_passes {
+        let reply = match engine.request_turn(
+            attempt_prompt.clone(),
+            noop_chunk.clone(),
+            cancel.clone(),
+            fable_engine::FableTurnMode::Architect,
+        ) {
+            Ok(reply_rx) => match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
+                Ok(Ok(r)) => r,
+                _ => return None,
+            },
+            Err(_) => return None,
+        };
+        if !reply.error.is_empty() || reply.cancelled {
+            return None;
+        }
+        let raw = reply.raw_output;
+        let parsed = match crate::site_map::SiteMap::from_model_output(&raw) {
+            Err(e) => Err(vec![e]),
+            Ok(m) => match crate::site_map::validate(&m) {
+                Ok(()) => Ok(m),
+                Err(errs) => Err(errs),
+            },
+        };
+        match parsed {
+            Ok(m) => return Some(m),
+            Err(errors) if pass < total_passes => {
+                attempt_prompt = render_site_architect_repair(&raw, &errors);
+            }
+            Err(_) => {}
+        }
+    }
+    None
+}
+
+/// (2026-08-24 stall fix) Record a failed FULL architect round on the node —
+/// after `ARCHITECT_FAIL_STANDDOWN` rounds both architects stop re-arming
+/// (the node stays deliberately map-less instead of re-burning the whole
+/// decode cycle every turn through the idempotence gate). A short
+/// schema-lock take, the same discipline as the seed-consume write: never
+/// held across a decode, and no snapshot push — the counter is Rust-owned
+/// infra state, deliberately outside the undo ring (a reverted turn must
+/// not resurrect the retry loop).
+async fn record_architect_failure(state: &tauri::State<'_, AppState>, node_id: &str) {
+    let mut s = state.fable_schema.lock().await;
+    if let Some(node) = s.travel_graph.nodes.iter_mut().find(|n| n.id == node_id) {
+        node.architect_fail_rounds = node.architect_fail_rounds.saturating_add(1);
+        tracing::warn!(
+            node = %node_id,
+            fail_rounds = node.architect_fail_rounds,
+            standdown_at = crate::site_map::ARCHITECT_FAIL_STANDDOWN,
+            "site architect: full round failed (all passes) — node failure counter bumped"
+        );
+    }
+}
+
+/// (2026-08-23 hosted interiors) The BUILDING-child JIT architect — the
+/// derived companion of [`maybe_run_site_architect`]. The `[ROOM]` enter
+/// transition sets the parent map's `current_building` as PURE state (the
+/// resolver falls back to the parent while no child exists); this fn,
+/// called in the same `fable_send` window right after the node architect,
+/// notices a `current_building` with no hosted child and architects it.
+/// The trigger is fully DERIVED — no pending flag of its own — so a silent
+/// failure re-attempts naturally next turn (until the parent node's
+/// standdown counter says stop), and an exit/travel mid-decode is caught by
+/// the insert re-verification.
+async fn maybe_run_hosted_interior_architect(
+    state: &tauri::State<'_, AppState>,
+    engine: &Arc<fable_engine::FableEngine>,
+    cancel: &llm::CancelToken,
+    tracker_window: &[session::Message],
+) {
+    // 1. Derived trigger under the schema lock.
+    let armed: Option<(SiteBrief, String, String, String)> = {
+        let s = state.fable_schema.lock().await;
+        let Some(node) = s.travel_graph.current_node.clone() else {
+            return;
+        };
+        let Some(parent) = s.site_maps.get(&node) else {
+            return;
+        };
+        let Some(asset_id) = parent.current_building.clone() else {
+            return;
+        };
+        let child_key = crate::site_map::hosted_key(&node, &asset_id);
+        if s.site_maps.contains_key(&child_key) {
+            return; // write-once: a mapped building never re-architects
+        }
+        // (2026-08-24 stall fix) The parent node's standdown counter guards
+        // the hosted architect too — one counter per settlement (a
+        // settlement whose maps keep failing likely can't map its buildings
+        // either; accepted tradeoff).
+        if s
+            .travel_graph
+            .find_node(&node)
+            .is_some_and(|n| n.architect_fail_rounds >= crate::site_map::ARCHITECT_FAIL_STANDDOWN)
+        {
+            return;
+        }
+        // The Building asset must still exist with Building kind (a stale
+        // pointer after an asset removal waits for the exit/travel clear).
+        let Some(asset) = parent.assets.iter().find(|a| a.id == asset_id) else {
+            return;
+        };
+        if asset.kind != crate::site_map::AssetKind::Building {
+            return;
+        }
+        // Per-settlement cap backstop (the `[ROOM]` enter refuses first).
+        if crate::site_map::count_hosted_interiors(&s.site_maps, &node)
+            >= crate::site_map::HOSTED_INTERIORS_MAX_PER_SETTLEMENT
+        {
+            return;
+        }
+        let parent_name = s
+            .travel_graph
+            .find_node(&node)
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| node.clone());
+        let premise: String = {
+            let mut acc = String::new();
+            for m in tracker_window {
+                let t = m.content.trim();
+                if !t.is_empty() {
+                    if !acc.is_empty() {
+                        acc.push(' ');
+                    }
+                    acc.push_str(t);
+                }
+            }
+            acc.chars().take(1200).collect()
+        };
+        Some((
+            SiteBrief {
+                node_id: node.clone(),
+                node_name: asset.name.clone(),
+                tone: s.tone.clone().unwrap_or_default(),
+                elapsed_days: 0,
+                seeds: Vec::new(),
+                pressure: Vec::new(),
+                premise,
+                scale: ArchitectScale::Rooms,
+                building: Some(BuildingBrief {
+                    building_name: asset.name.clone(),
+                    building_detail: asset.detail.clone(),
+                    parent_name,
+                }),
+            },
+            child_key,
+            asset_id,
+            asset.location.clone(),
+        ))
+    };
+    let Some((brief, child_key, asset_id, exit_area_id)) = armed else {
+        return;
+    };
+
+    // 2. Decode (the shared repair loop). Failure bumps the PARENT node's
+    //    standdown counter (the hosted architect shares it).
+    let mut map = match decode_site_map_with_repair(
+        engine,
+        cancel,
+        render_site_architect_prompt(&brief),
+    )
+    .await
+    {
+        Some(m) => m,
+        None => {
+            record_architect_failure(state, &brief.node_id).await;
+            return;
+        }
+    };
+    // Depth-2 law: strip any Building assets the model slipped in —
+    // deterministic, convergent (no re-decode loop over a forbidden kind).
+    let before = map.assets.len();
+    map.assets
+        .retain(|a| a.kind != crate::site_map::AssetKind::Building);
+    if map.assets.len() != before {
+        tracing::warn!(
+            stripped = before - map.assets.len(),
+            "building-child architect: nested building assets stripped (depth-2 law)"
+        );
+    }
+
+    // 3. Insert under the schema lock. Re-verify the derived trigger — the
+    //    player may have exited or traveled during the decode.
+    {
+        let mut s = state.fable_schema.lock().await;
+        let Some(node) = s.travel_graph.current_node.clone() else {
+            return;
+        };
+        let still_inside = s
+            .site_maps
+            .get(&node)
+            .and_then(|m| m.current_building.clone())
+            .is_some_and(|b| crate::site_map::hosted_key(&node, &b) == child_key);
+        if !still_inside || s.site_maps.contains_key(&child_key) {
+            return;
+        }
+        map.node_id = node.clone(); // ROOT node — travel correlations stay correct
+        map.host = Some(crate::site_map::HostRef {
+            parent_key: node.clone(),
+            building_asset_id: asset_id,
+            exit_area_id,
+        });
+        // Threat is INHERITED from the settlement — the structure's danger
+        // rides its district's band; the model's own field is not authoritative.
+        if let Some(parent) = s.site_maps.get(&node) {
+            map.threat = parent.threat;
+        }
+        map.last_visit_minutes = s.world_clock.current_minutes;
+        map.current_area = Some(map.entrance.clone());
+        let snap = s.clone();
+        crate::site_map::evict_lru_site_map(&mut s.site_maps, &node);
+        s.site_maps.insert(child_key.clone(), map);
+        drop(s);
+        tracing::info!(
+            child = %child_key,
+            "site architect: hosted building interior inserted"
         );
         push_fable_history_snapshot(&state, snap).await;
     }
@@ -8375,6 +11532,17 @@ async fn maybe_run_site_architect(
 /// the returned `tick_armed` flag and fire [`fire_world_progression_tick`]
 /// ONLY after dropping the turn lock, lease, and engine Arc.
 ///
+/// Returns `(tick_armed, event_directives, rest_notice)` —
+/// (2026-08-23 hazard referees) the latter two carry THIS-turn narrator
+/// directives (the rest-interruption outcome, the ≥6h time-skip event) +
+/// the player-facing rest bubble text. The MAIN `fable_send` call site
+/// merges the directives into `turn_directives` BEFORE the narrator render
+/// (bracket-time events reach the same turn's narrator) + pushes the
+/// notice through the commit-flush channel; the re-track call site (no
+/// narrator render there) forwards both into `pending_tick_directives` for
+/// the NEXT turn and drops the notice. The P1d clamp/day-crossing
+/// directives stay in `pending_tick_directives` (next-turn semantics).
+///
 /// # Best-effort
 ///
 /// Errors are logged + dropped: a failed tick must never block the gameplay
@@ -8385,7 +11553,21 @@ async fn maybe_run_site_architect(
 async fn apply_time_command_and_maybe_tick(
     parsed: &bracket_parser::ParsedNarration,
     state: &tauri::State<'_, AppState>,
-) -> bool {
+) -> (bool, Vec<String>, Option<String>) {
+    // (2026-08-23 hazard referees) THIS-turn event directives + the rest
+    // bubble — see the fn doc. The P1d `time_directives` vec below is the
+    // SEPARATE next-turn channel (pending_tick_directives).
+    let mut out_directives: Vec<String> = Vec::new();
+    let mut rest_notice: Option<String> = None;
+    // (2026-08-23 Playground) God-mode flags for the whole time/rest funnel —
+    // read ONCE at the top so both rest branches (zero-advance + advance)
+    // + the fatigue clamp below share one consistent snapshot.
+    let playground_auto_pass = state
+        .playground_auto_pass
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let playground_freeze_clamps = state
+        .playground_freeze_clamps
+        .load(std::sync::atomic::Ordering::Relaxed);
     // 1. Extract the last `[TIME ...]` command (if any). Multiple in one turn
     //    is unusual but legal (the narrator might emit time mid-turn then
     //    again at the end); the LAST one is the most recent + authoritative.
@@ -8401,8 +11583,94 @@ async fn apply_time_command_and_maybe_tick(
             _ => None,
         });
 
+    // (2026-08-22 living-world) The rest signal: the tracker's [REST]
+    // bracket OR the Recovery Referee's deterministic backstop flag
+    // (consume-once either way). Computed BEFORE the [TIME] early-out so a
+    // rest-only turn still stamps the anchor.
+    let has_rest = parsed.commands.iter().any(|c| {
+        matches!(c, bracket_parser::BracketCommand::Rest)
+    }) || state
+        .pending_rest
+        .swap(false, std::sync::atomic::Ordering::Relaxed);
+
     let Some((parsed_minutes, time_raw)) = last_time_cmd else {
-        return false; // no [TIME] this turn — clock unchanged, no tick.
+        // No [TIME] this turn — clock unchanged, no tick. A rest with no
+        // time advance still lands the anchor at the CURRENT clock (zero
+        // advance = zero mechanical recovery; the anchor is for the band)
+        // — unless the rest is INTERRUPTED (2026-08-23 hazard referees):
+        // a failed check skips the anchor stamp too and stamps the
+        // 30-minute Impaired debuff instead.
+        if has_rest {
+            let mut s = state.fable_schema.lock().await;
+            if s.world_clock.is_set() {
+                // (2026-08-23 Playground) God flags (hoisted at fn top):
+                // AUTO-PASS treats the interruption check as None
+                // (auto-successful rest); FREEZE CLAMPS suppresses the
+                // Impaired stamp (the roll itself still resolves for
+                // testing — recovery math is unaffected by the tag).
+                let interrupt = if playground_auto_pass {
+                    None
+                } else {
+                    let cur = s.travel_graph.current_node.clone();
+                    let node = cur
+                        .as_deref()
+                        .and_then(|c| s.travel_graph.nodes.iter().find(|n| n.id == c));
+                    let map = cur
+                        .as_deref()
+                        .and_then(|c| {
+                            crate::site_map::active_site_map_key(&s.site_maps, Some(c))
+                        })
+                        .and_then(|k| s.site_maps.get(&k));
+                    hazard::rest_interruption_check(
+                        s.world_clock.current_minutes,
+                        cur.as_deref().unwrap_or(""),
+                        node,
+                        map,
+                    )
+                };
+                match interrupt {
+                    Some(r) => {
+                        let pre = s.clone();
+                        let impaired_until = s.world_clock.current_minutes
+                            + hazard::IMPAIRED_TAG_MINUTES;
+                        let changed = if playground_freeze_clamps {
+                            false
+                        } else {
+                            consequence::upsert_tag(
+                                &mut s.status_tags,
+                                consequence::StatusTag {
+                                    label: "Impaired".to_string(),
+                                    polarity: consequence::Polarity::Debuff,
+                                    expires_at: impaired_until,
+                                    source: "interrupted rest".to_string(),
+                                    kind: String::new(),
+                                },
+                                settings::FABLE_STATUS_TAG_CAP,
+                            )
+                        };
+                        drop(s);
+                        if changed {
+                            push_fable_history_snapshot(&state, pre).await;
+                        }
+                        tracing::info!(
+                            "[REST] interrupted (zero-advance) — Impaired tag, no anchor stamp"
+                        );
+                        out_directives.push(r.directive);
+                        rest_notice = Some(r.notice);
+                    }
+                    None => {
+                        if s.last_rest_minutes != s.world_clock.current_minutes {
+                            let snap = s.clone();
+                            s.last_rest_minutes = s.world_clock.current_minutes;
+                            drop(s);
+                            push_fable_history_snapshot(&state, snap).await;
+                            tracing::info!("[REST] rested anchor stamped (no [TIME] this turn)");
+                        }
+                    }
+                }
+            }
+        }
+        return (false, out_directives, rest_notice);
     };
 
     // 2. Apply the clock advance under the schema lock. Monotonic guard:
@@ -8444,7 +11712,18 @@ async fn apply_time_command_and_maybe_tick(
                 prev_minutes = prev,
                 "ignoring [TIME] regression: clock only moves forward"
             );
-            return false;
+            // (2026-08-24 review P2) The consume-once rest signal must not
+            // die with the rejected bracket — `has_rest` above already
+            // SWAPPED the flag to false. Re-arm it so the next turn's time
+            // funnel applies the rest instead of silently eating it (a
+            // bracket-[REST] rides the same re-arm: one turn later at
+            // whatever clock then rules).
+            if has_rest {
+                state
+                    .pending_rest
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            return (false, out_directives, rest_notice);
         }
         // (P1d) Pacing-aware clamp + directive derivation (pure core in
         // schema::clamp_time_advance). The first-set baseline takes the
@@ -8478,18 +11757,166 @@ async fn apply_time_command_and_maybe_tick(
         // not a meaningful "undo" target); skip the snapshot to keep the
         // ring clean. The clone is dropped into the history push after we
         // release this lock.
-        let undo_snapshot = if !was_first && effective_minutes != prev {
+        let undo_snapshot = if (!was_first && effective_minutes != prev) || (has_rest && !was_first)
+        {
             Some(s.clone())
         } else {
             None
         };
         s.world_clock.current_minutes = effective_minutes;
+        // (2026-08-22 living-world) THE REST STAMP + THE MECHANICAL FATIGUE
+        // CLAMP — cold, hard math (Chloe ruling, 2026-08-22):
+        //   • A rest this turn stamps `last_rest_minutes` on the POST-
+        //     advance clock (the morning after the sleep), and the sleep's
+        //     LENGTH (this turn's advance) drives recovery steps for
+        //     stamina + the active mana pool — rest is a real, mechanical
+        //     decision, not narrative suggestion.
+        //   • The since-rest delta then floors the pools at the fatigue
+        //     band's ceiling: 'weary' (16-24h) caps at Winded/Strained,
+        //     'exhausted' (>24h) at Exhausted/Drained. Idempotent min()
+        //     clamps — no marker state, and a [REST] lifts them instantly
+        //     via the recovery steps above.
+        if has_rest {
+            // (2026-08-23 hazard referees) THE INTERRUPTION ROLL — before
+            // any recovery applies. Settlements auto-rest (DC 0); elsewhere
+            // the ACTIVE site map's mob tier sets the DC (the resolver
+            // law: inside a building, ITS creatures set the stakes).
+            // Failure: HALF the recovery steps, NO anchor stamp (the
+            // fatigue clamp below stays engaged — since-rest keeps
+            // growing), and the 30-minute "Impaired" pure Debuff (it
+            // counts in the lethality condition_penalty for the ensuing
+            // bleary-eyed encounter — bleary, never Sick: the label is
+            // pinned against the illness cascade in consequence's tests).
+            let rest_interrupt = if playground_auto_pass {
+                // (2026-08-23 Playground) AUTO-PASS — auto-successful rest.
+                None
+            } else {
+                let cur = s.travel_graph.current_node.clone();
+                let node = cur
+                    .as_deref()
+                    .and_then(|c| s.travel_graph.nodes.iter().find(|n| n.id == c));
+                let map = cur
+                    .as_deref()
+                    .and_then(|c| {
+                        crate::site_map::active_site_map_key(&s.site_maps, Some(c))
+                    })
+                    .and_then(|k| s.site_maps.get(&k));
+                hazard::rest_interruption_check(
+                    effective_minutes,
+                    cur.as_deref().unwrap_or(""),
+                    node,
+                    map,
+                )
+            };
+            let slept_hours = (effective_minutes - prev).max(0) / 60;
+            match rest_interrupt {
+                Some(r) => {
+                    let steps = schema::rest_recovery_steps(slept_hours) / 2;
+                    for _ in 0..steps {
+                        s.player_state.stamina.recover();
+                        if let Some(m) = s.player_state.mana.as_mut() {
+                            m.recover();
+                        }
+                    }
+                    // (2026-08-23 Playground) FREEZE CLAMPS — the roll still
+                    // resolved (half recovery + directive + notice all
+                    // apply), but the Impaired tag itself is suppressed.
+                    if !playground_freeze_clamps {
+                        consequence::upsert_tag(
+                            &mut s.status_tags,
+                            consequence::StatusTag {
+                                label: "Impaired".to_string(),
+                                polarity: consequence::Polarity::Debuff,
+                                expires_at: effective_minutes + hazard::IMPAIRED_TAG_MINUTES,
+                                source: "interrupted rest".to_string(),
+                                kind: String::new(),
+                            },
+                            settings::FABLE_STATUS_TAG_CAP,
+                        );
+                    }
+                    out_directives.push(r.directive);
+                    rest_notice = Some(r.notice);
+                    tracing::info!(
+                        slept_hours,
+                        half_steps = steps,
+                        dc = r.dc,
+                        roll = r.roll,
+                        "[REST] interrupted — half recovery, no anchor, Impaired tag"
+                    );
+                }
+                None => {
+                    let steps = schema::rest_recovery_steps(slept_hours);
+                    for _ in 0..steps {
+                        s.player_state.stamina.recover();
+                        if let Some(m) = s.player_state.mana.as_mut() {
+                            m.recover();
+                        }
+                    }
+                    s.last_rest_minutes = effective_minutes;
+                    tracing::info!(
+                        slept_hours,
+                        steps,
+                        "[REST] anchor stamped + recovery applied"
+                    );
+                }
+            }
+        }
+        // (2026-08-23 Playground) FREEZE CLAMPS — the weary/exhausted fatigue
+        // floors do not apply while frozen (the god player never tires).
+        if s.last_rest_minutes > 0 && !playground_freeze_clamps {
+            let delta = effective_minutes.saturating_sub(s.last_rest_minutes);
+            if let Some(band) = schema::rested_band(delta) {
+                let (stamina_floor, mana_floor) = player_state::fatigue_floors(band);
+                if s.player_state.stamina > stamina_floor {
+                    s.player_state.stamina = stamina_floor;
+                }
+                if let Some(m) = s.player_state.mana {
+                    if m > mana_floor {
+                        s.player_state.mana = Some(mana_floor);
+                    }
+                }
+            }
+        }
+        // (2026-08-23 hazard referees) TIME-SKIP EVENT — a [TIME] advance
+        // of ≥ 6h with no rest is hours moving through dangerous country:
+        // one road-scope roll anchored at the CURRENT node (its rumors
+        // apply). Skipped on the first-set baseline (a campaign's first
+        // clock stamp is not a skip) and whenever the player rested (rest
+        // carries its own interruption roll above).
+        if !was_first && !has_rest && effective_minutes - prev >= 6 * 60 {
+            let cur = s.travel_graph.current_node.clone();
+            if let Some(node_id) = cur.as_deref() {
+                if let Some(ev) =
+                    hazard::time_skip_event_check(effective_minutes, node_id, &s.rumors)
+                {
+                    let node_name = s
+                        .travel_graph
+                        .nodes
+                        .iter()
+                        .find(|n| n.id == node_id)
+                        .map(|n| n.name.clone())
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| node_id.to_string());
+                    tracing::info!(
+                        node = %node_id,
+                        valence = ?ev.valence,
+                        "[TIME] skip event fired (≥6h unresisted advance)"
+                    );
+                    out_directives.push(hazard::time_skip_event_directive(ev, &node_name));
+                }
+            }
+        }
         let live_snapshot = s.clone();
         if let Some(snap) = undo_snapshot {
             drop(s);
             push_fable_history_snapshot(&state, snap).await;
         }
-        (was_first, prev, new_minutes, live_snapshot)
+        // (2026-08-22 second playtest pass) Return the POST-CLAMP minutes —
+        // the parse-side value (a hallucinated "[TIME Day 9 …]") used to
+        // reach the log line and read as an 8-day jump that never applied
+        // (the pacing clamp had already capped it). Downstream uses are all
+        // inside the first-set branch, where effective == parsed.
+        (was_first, prev, effective_minutes, live_snapshot)
     };
     // Surface the P1d clamp/staleness directives to the next fable_send (the
     // same <directives> block the tick directives use).
@@ -8522,12 +11949,18 @@ async fn apply_time_command_and_maybe_tick(
             j.last_settled_minutes = new_minutes;
         }
         s.player_state.lifestyle_settled_minutes = new_minutes;
+        // (2026-08-22 living-world) Fresh campaigns start RESTED — the
+        // anchor baselines with the clock (the economy-stamp precedent:
+        // the campaign owes no fatigue for days it never simulated).
+        if s.last_rest_minutes == 0 {
+            s.last_rest_minutes = new_minutes;
+        }
         let snap = s.clone();
         s.world_clock.last_tick_minutes = new_minutes;
         drop(s);
         push_fable_history_snapshot(&state, snap).await;
         tracing::info!(baseline = new_minutes, "clock baseline stamped (no tick this turn)");
-        return false;
+        return (false, out_directives, rest_notice);
     }
 
     // 3a. (2026-08-20 Economy) Daily settlement — pure Rust, keyed on
@@ -8549,7 +11982,13 @@ async fn apply_time_command_and_maybe_tick(
                 let mut s = state.fable_schema.lock().await;
                 let pre = s.clone();
                 let now = s.world_clock.current_minutes;
-                let (dirs, mutated_economy) = economy::settle_daily_economy(&mut s, now);
+                let (dirs, mutated_economy) = economy::settle_daily_economy(
+                    &mut s,
+                    now,
+                    // (2026-08-23 Playground) FREEZE CLAMPS — the Starving
+                    // stamp + stamina drain are suppressed while frozen.
+                    playground_freeze_clamps,
+                );
                 (dirs, mutated_economy, pre)
             };
             if mutated_economy {
@@ -8562,20 +12001,69 @@ async fn apply_time_command_and_maybe_tick(
         }
     }
 
+    // 3b. (2026-08-22 multihog WS1) Deterministic timestamp expiry — the
+    //     clock-gated sweep for armed entity + site-asset lapses, PRE-tick-
+    //     gate (the economy-settle precedent: cheap deterministic math must
+    //     not wait for the LLM gate; a Downtime sleep still lapses its wards
+    //     even when the progression pass fires hours later). Directives land
+    //     in the same `pending_tick_directives` well. Status-tag expiry
+    //     deliberately stays in step 5a BELOW the gate — changing its timing
+    //     alters game feel; the two sweeps run on different clocks by
+    //     decision, not by accident.
+    {
+        let (dirs, snap) = {
+            let mut s = state.fable_schema.lock().await;
+            // Fast path: nothing armed anywhere → zero work, zero clone
+            // (this runs on EVERY clock advance).
+            let armed = !s.entity_expiry.is_empty()
+                || s.site_maps.values().any(|m| {
+                    m.assets.iter().any(|a| a.expires_at_minutes.is_some())
+                })
+                // (2026-08-23 WS5) Open causal threads age-collapse on this
+                // same clock — the armed check must see them.
+                || s.site_maps.values().any(|m| !m.threads.is_empty());
+            if !armed {
+                (Vec::new(), None)
+            } else {
+                let now = s.world_clock.current_minutes;
+                // Pre-mutation snapshot (the uniform undo-ring discipline).
+                let pre = s.clone();
+                let (mut dirs, mut n) = s.sweep_entity_expiry(now);
+                let (asset_dirs, asset_n) =
+                    crate::site_map::sweep_asset_expiry(&mut s.site_maps, now);
+                dirs.extend(asset_dirs);
+                n += asset_n;
+                // (2026-08-23 WS5) Deterministic thread age-collapse — an
+                // open plot question older than THREAD_COLLAPSE_MINUTES
+                // fades (one digest line, thread closed).
+                n += crate::site_map::sweep_stale_threads(&mut s.site_maps, now);
+                if n == 0 {
+                    (dirs, None)
+                } else {
+                    (dirs, Some(pre))
+                }
+            }
+        };
+        if let Some(snap) = snap {
+            push_fable_history_snapshot(&state, snap).await;
+        }
+        if !dirs.is_empty() {
+            let mut td = state.pending_tick_directives.lock().await;
+            td.extend(dirs);
+        }
+    }
+
     // 4. Tick gate: has enough in-world time elapsed since the last tick?
     //    The interval is now ScenePacing-driven (Fable Seam #4 expansion,
     //    2026-07-27): Combat → 0 (never fire mid-fight), Downtime → 1h (world
-    //    moves fast while you rest), Exploration → 4h (balanced). The legacy
-    //    const WORLD_PROGRESSION_INTERVAL_HOURS (24h) is retained as the
-    //    fallback for any future "fixed-interval" mode but no longer used by
-    //    the live gate.
+    //    moves fast while you rest), Exploration → 4h (balanced).
     let interval_hours = schema_snapshot.scene_pacing.mode.progression_interval_hours();
     if interval_hours == 0 {
         tracing::debug!(
             mode = ?schema_snapshot.scene_pacing.mode,
             "world progression tick skipped: scene mode suspends background sim (combat)"
         );
-        return false;
+        return (false, out_directives, rest_notice);
     }
     let interval_minutes = (interval_hours as i64) * 60;
     let elapsed = schema_snapshot.world_clock.minutes_since_last_tick();
@@ -8586,7 +12074,7 @@ async fn apply_time_command_and_maybe_tick(
             mode = ?schema_snapshot.scene_pacing.mode,
             "clock tick gate not met (no fire)"
         );
-        return false;
+        return (false, out_directives, rest_notice);
     }
 
     // 5. Gate met — the off-screen simulation pass is due. The LLM pass is
@@ -8635,8 +12123,20 @@ async fn apply_time_command_and_maybe_tick(
         // tasks are removed from the queue after directive emission (the
         // mechanic is one-shot per task; we don't re-roll).
         if !s.offscreen_tasks.is_empty() {
-            let resolutions =
-                offscreen_task::resolve_expired_tasks(&s.offscreen_tasks, now_minutes);
+            // (2026-08-24 reaped-owner fix) Tasks whose NPC the reaper has
+            // archived never resolve or narrate — the ungated path kept
+            // resurrecting reaped characters in [DIRECTIVE] lines.
+            let stale_owners: std::collections::HashSet<String> = s
+                .npc_interior
+                .iter()
+                .filter(|(_, interior)| interior.archived.is_some())
+                .map(|(id, _)| id.clone())
+                .collect();
+            let resolutions = offscreen_task::resolve_expired_tasks_gated(
+                &mut s.offscreen_tasks,
+                now_minutes,
+                &stale_owners,
+            );
             if !resolutions.is_empty() {
                 if tick_snapshot.is_none() {
                     tick_snapshot = Some(s.clone());
@@ -8671,6 +12171,65 @@ async fn apply_time_command_and_maybe_tick(
                     remaining = s.offscreen_tasks.len(),
                     "[tick] off-screen tasks drained"
                 );
+            }
+        }
+
+        // (2026-08-22 living-world) QUEST DEADLINES — Rust auto-fails
+        // overdue quests on the giver's patience curve: the SAME
+        // volatility-scaled frustration math promises use, so deadlines
+        // are deterministic clock law, never fuzzy LLM guessing. Fires at
+        // score ≥ 1.0 ("Frustrated"): a patient giver (0.4) outlasts a
+        // volatile one (3.0) past the same deadline. Self-imposed goals
+        // (giver = player) + no-deadline quests are exempt by construction
+        // (`quest_deadline_frustration` returns -∞). Removed with a
+        // directive for the next turn's <directives> block.
+        if !s.quests.is_empty() {
+            let overdue: Vec<schema::Quest> = s
+                .quests
+                .iter()
+                .filter(|q| {
+                    schema::quest_deadline_frustration(
+                        q,
+                        s.relationships.get(&q.giver).map(|r| r.volatility),
+                        now_minutes,
+                    ) >= 1.0
+                })
+                .cloned()
+                .collect();
+            if !overdue.is_empty() {
+                if tick_snapshot.is_none() {
+                    tick_snapshot = Some(s.clone());
+                }
+                tick_mutated = true;
+                for q in &overdue {
+                    let giver = if q.giver == "player" {
+                        "the arrangement's maker".to_string()
+                    } else {
+                        s.npc_registry
+                            .resolve(&q.giver)
+                            .map(|e| e.name.clone())
+                            .unwrap_or_else(|| q.giver.clone())
+                    };
+                    tick_directives.push(format!(
+                        "Quest failed: {} — {} abandoned the arrangement (the deadline passed \
+                         and patience ran out). Narrate the consequence.",
+                        q.title, giver
+                    ));
+                    tracing::info!(quest = %q.id, "[tick] quest auto-failed (deadline overrun)");
+                }
+                let keep_ids: std::collections::HashSet<String> = s
+                    .quests
+                    .iter()
+                    .filter(|q| {
+                        schema::quest_deadline_frustration(
+                            q,
+                            s.relationships.get(&q.giver).map(|r| r.volatility),
+                            now_minutes,
+                        ) < 1.0
+                    })
+                    .map(|q| q.id.clone())
+                    .collect();
+                s.quests.retain(|q| keep_ids.contains(&q.id));
             }
         }
 
@@ -8728,6 +12287,73 @@ async fn apply_time_command_and_maybe_tick(
                     spread_events = spread_count,
                     "[tick] rumors propagated to adjacent nodes"
                 );
+                // (2026-08-23 hazard referees) THREAT SEEDING — a threat-
+                // stem rumor newly reaching a node plants a Suspected
+                // asset on that node's map (or a node seed when the node
+                // is un-mapped — the future architect grows the threat
+                // organically from its seeds). The OLD known set is read
+                // here, BEFORE the assignment below (two-phase so the
+                // immutable rumor borrow ends before the map/node
+                // mutations begin).
+                let mut threat_spreads: Vec<(String, Vec<String>)> = Vec::new();
+                for (old, new) in s.rumors.iter().zip(new_rumors.iter()) {
+                    if !crate::hazard::is_threat_rumor(&new.label) {
+                        continue;
+                    }
+                    let reached: Vec<String> = new
+                        .known_nodes
+                        .iter()
+                        .filter(|n| !old.known_nodes.iter().any(|o| o == *n))
+                        .cloned()
+                        .collect();
+                    if !reached.is_empty() {
+                        threat_spreads.push((new.label.clone(), reached));
+                    }
+                }
+                for (label, reached) in &threat_spreads {
+                    for node_id in reached {
+                        let seeded = match s.site_maps.get_mut(node_id) {
+                            Some(m) => {
+                                crate::site_map::seed_rumor_asset(m, label, now_minutes)
+                            }
+                            None => {
+                                let seed = bracket_parser::clean_free_text(
+                                    &format!("rumor: {label}"),
+                                    crate::site_map::SITE_SEED_CHAR_MAX,
+                                );
+                                let mut planted = false;
+                                if let Some(node) = s
+                                    .travel_graph
+                                    .nodes
+                                    .iter_mut()
+                                    .find(|n| n.id == *node_id)
+                                {
+                                    if !seed.is_empty()
+                                        && !node.seeds.iter().any(|existing| *existing == seed)
+                                    {
+                                        node.seeds.push(seed);
+                                        let overflow = node
+                                            .seeds
+                                            .len()
+                                            .saturating_sub(crate::site_map::NODE_SEEDS_MAX);
+                                        if overflow > 0 {
+                                            node.seeds.drain(..overflow);
+                                        }
+                                        planted = true;
+                                    }
+                                }
+                                planted
+                            }
+                        };
+                        if seeded {
+                            tracing::info!(
+                                label = %label,
+                                node = %node_id,
+                                "[tick] threat rumor seeded at newly-reached node"
+                            );
+                        }
+                    }
+                }
                 s.rumors = new_rumors;
             }
         }
@@ -8770,7 +12396,7 @@ async fn apply_time_command_and_maybe_tick(
         push_fable_history_snapshot(&state, snap).await;
     }
     let _ = tick_mutated; // (kept for clarity; the snapshot push above is the real effect)
-    true
+    (true, out_directives, rest_notice)
 }
 
 /// Fires the off-screen world-progression LLM pass via the schema engine.
@@ -8816,11 +12442,284 @@ async fn tick_session_live(
     live
 }
 
-async fn fire_world_progression_tick(
+/// (2026-08-23 WS6) Run ONE consolidation batch: the extraction decode under
+/// the locks (turn lock FIRST, then the Fable lease — the uniform order),
+/// both DROPPED before the memory transaction (the decode is the only local
+/// pass; the SQL + re-embed never contend for the engine). One initial pass
+/// + at most ONE repair (the architect loop). Returns `Ok(true)` = committed,
+/// `Ok(false)` = validation failed after the repair pass (skip batch, end
+/// the run — this is ALSO the deferred API-heavy-lifter hook point), `Err` =
+/// infrastructure failure.
+async fn run_consolidation_batch<E: memory_embedder::Embedder>(
     state: &tauri::State<'_, AppState>,
+    app: &tauri::AppHandle,
+    memory_engine: &memory::MemoryEngine<E>,
+    card_id: &str,
+    batch: &[memory::UnconsolidatedTurn],
+) -> anyhow::Result<bool> {
+    let extracted: anyhow::Result<Option<consolidation::ConsolidatedRecord>> = async {
+        // (Plain `lock()` — the fable_send Stage-1 pattern: the guard is
+        // Send, and `state` outlives it for the whole fn body.)
+        let _model_guard = state.local_model_lock.lock().await;
+        let (_lease, engine) = acquire_fable_engine_leased(state, app)
+            .await
+            .map_err(|e| anyhow::anyhow!("consolidation engine acquire: {e}"))?;
+        let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
+        let cancel: llm::CancelToken = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut attempt_prompt = consolidation::render_consolidation_prompt(batch);
+        for pass in 0..2 {
+            let reply_rx = engine
+                .request_turn(
+                    attempt_prompt.clone(),
+                    noop_chunk.clone(),
+                    cancel.clone(),
+                    fable_engine::FableTurnMode::Consolidator,
+                )
+                .map_err(|e| anyhow::anyhow!("consolidation request post: {e}"))?;
+            let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
+                .await
+                .map_err(|e| anyhow::anyhow!("consolidation join: {e}"))?
+                .map_err(|e| anyhow::anyhow!("consolidation channel: {e}"))?;
+            if !reply.error.is_empty() {
+                anyhow::bail!("consolidation engine error: {}", reply.error);
+            }
+            if reply.cancelled {
+                anyhow::bail!("consolidation pass cancelled");
+            }
+            let raw = reply.raw_output;
+            match consolidation::parse_consolidation_output(&raw) {
+                Ok(rec) => return Ok(Some(rec)),
+                Err(errors) if pass == 0 => {
+                    attempt_prompt = consolidation::render_consolidation_repair(&raw, &errors);
+                }
+                Err(_) => return Ok(None),
+            }
+        }
+        unreachable!("the pass loop returns on its second iteration at the latest")
+    }
+    .await;
+    let record = extracted?;
+    let Some(record) = record else {
+        return Ok(false);
+    };
+    let batch_id = consolidation::new_batch_turn_uuid();
+    let sources: Vec<String> = batch.iter().map(|t| t.turn_uuid.clone()).collect();
+    memory_engine
+        .consolidate_apply(card_id, record.to_row_text(batch.len()), &sources, &batch_id)
+        .await?;
+    Ok(true)
+}
+
+/// (2026-08-25) RAII clearer for `consolidation_in_flight`: the flag resets
+/// on EVERY drop — normal return AND panic unwind. A plain `store(false)`
+/// after the await wedged the flag `true` forever if the worker panicked,
+/// silently disabling consolidation until restart.
+struct ConsolidationInFlightGuard<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for ConsolidationInFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// (2026-08-23 WS6) The deferred memory-consolidation worker — the
+/// world-tick discipline applied to the ARCHIVE: fired detached off the end
+/// of a fully-finalized Fable turn (post-lock-drop, never blocking the
+/// turn), session-identity-guarded between batches, watermark-resumable by
+/// construction (a failed batch commits NOTHING, so the next trigger
+/// retries from the surviving un-consolidated set). Guards, in order:
+/// in-flight (one worker per process) → fail-streak stand-down → memory
+/// present → session live → trigger threshold (>
+/// [`consolidation::TRIGGER_UNCONSOLIDATED_TURNS`]) → pre-scored redundant
+/// batches. Per batch: turn lock → Fable lease → one Consolidator decode
+/// (+1 repair) → the single consolidate transaction. A player turn arriving
+/// mid-run waits at most ONE batch decode.
+async fn fire_memory_consolidation(
+    app: &tauri::AppHandle,
     turn_card_id: &str,
     turn_generation: u64,
 ) {
+    let state = app.state::<AppState>();
+    // (2026-08-23 audit) ONE worker per process — a second spawn while a run
+    // is mid-flight would only re-decode batches the first commits (safe,
+    // wasted). The RAII guard clears the flag on every exit path INCLUDING
+    // a panic unwind.
+    if state
+        .consolidation_in_flight
+        .swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        return;
+    }
+    let _guard = ConsolidationInFlightGuard(state.consolidation_in_flight.as_ref());
+    fire_memory_consolidation_inner(&state, app, turn_card_id, turn_generation).await;
+}
+
+async fn fire_memory_consolidation_inner(
+    state: &tauri::State<'_, AppState>,
+    app: &tauri::AppHandle,
+    turn_card_id: &str,
+    turn_generation: u64,
+) {
+    // Bounded burn: repeated all-fail runs stand down (a success resets).
+    if state
+        .consolidation_fail_streak
+        .load(std::sync::atomic::Ordering::Relaxed)
+        >= consolidation::FAIL_STREAK_LIMIT
+    {
+        return;
+    }
+    let Some(memory_engine) = state.memory.get() else {
+        return;
+    };
+    let memory_engine = Arc::clone(memory_engine);
+    if !tick_session_live(&state, turn_card_id, turn_generation).await {
+        return;
+    }
+    // (2026-08-24 Part II D1) The memory side routes through the ACTIVE
+    // PARTITION (a branch's `card#session` key); the guard above still keys
+    // on the card id + generation — any swap mid-worker fails the guard
+    // between batches, so this read is always the live timeline's key.
+    let partition = state
+        .active_memory_partition
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let count = match memory_engine.count_unconsolidated_turns(&partition).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "[consolidation] count failed (worker exits)");
+            return;
+        }
+    };
+    if count <= consolidation::TRIGGER_UNCONSOLIDATED_TURNS {
+        return;
+    }
+    // Oldest backlog first, bounded scan; only pre-scored redundant batches
+    // spend tokens (distinct-event runs stay raw by design).
+    let turns = match memory_engine.fetch_unconsolidated_turns(&partition, 600).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %format!("{e:#}"), "[consolidation] fetch failed (worker exits)");
+            return;
+        }
+    };
+    let batches: Vec<_> = consolidation::build_batches(turns)
+        .into_iter()
+        .filter(|b| consolidation::batch_redundant(b))
+        .take(consolidation::MAX_BATCHES_PER_RUN)
+        .collect();
+    if batches.is_empty() {
+        return;
+    }
+    tracing::info!(
+        card_id = %turn_card_id,
+        unconsolidated = count,
+        batches = batches.len(),
+        "[consolidation] worker run"
+    );
+    let mut committed = 0usize;
+    let mut validation_failed = false;
+    let mut infra_failed = false;
+    for batch in &batches {
+        // Session guard BETWEEN batches — a Load/End/Start mid-run stops
+        // the worker; the archive it was eating belongs to the old timeline's
+        // card partition either way, but the local engine belongs to NOW.
+        if !tick_session_live(&state, turn_card_id, turn_generation).await {
+            break;
+        }
+        match run_consolidation_batch(&state, app, memory_engine.as_ref(), &partition, batch)
+            .await
+        {
+            Ok(true) => committed += 1,
+            Ok(false) => {
+                // Validation failed after the repair pass — end the run
+                // (bounded burn); the next trigger retries.
+                validation_failed = true;
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "[consolidation] batch failed (run ends, nothing committed for it)"
+                );
+                infra_failed = true;
+                break;
+            }
+        }
+    }
+    if committed > 0 {
+        state
+            .consolidation_fail_streak
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(committed, "[consolidation] batches committed (sources superseded)");
+    } else if validation_failed || infra_failed {
+        // (2026-08-23 audit fix) BOTH failure classes count toward the
+        // stand-down — an Err-broken run (engine acquire, prompt-overflow
+        // refusal, channel/join) is an all-fail run too; before, only
+        // validation failures incremented and persistent infra failures
+        // retried forever.
+        let streak = state
+            .consolidation_fail_streak
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        tracing::warn!(
+            streak,
+            validation_failed,
+            "[consolidation] run failed — retrying on a later trigger"
+        );
+    }
+}
+
+async fn fire_world_progression_tick(
+    state: &tauri::State<'_, AppState>,
+    app: &tauri::AppHandle,
+    turn_card_id: &str,
+    turn_generation: u64,
+) {
+    // (2026-08-24) SINGLE-FLIGHT TICK. The natural deferred tick, the
+    // re-track's tick, and the playground force-tick/tick-loop all land
+    // here; two running concurrently double-advance the world (interleaved
+    // mutations on the same schema). A second tick WAITS (bounded, 15s,
+    // session-guarded) for the live one — a natural tick is never dropped,
+    // and the playground's serializes behind it. The guard also feeds the
+    // frontend busy signal: begin/end events ride acquire/drop so the Soul
+    // Gem / raw editor gate stays red through the whole post-`done` window
+    // (they used to install a pre-tick schema over the tick's mutations
+    // because `narrator.isGenerating()` was already false).
+    let mut waited = 0u32;
+    loop {
+        if state
+            .world_tick_in_flight
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            break;
+        }
+        if !tick_session_live(state, turn_card_id, turn_generation).await {
+            // Session died while waiting — this tick belongs to a dead
+            // timeline; dropping it is exactly what the identity guard
+            // would have done next anyway.
+            return;
+        }
+        waited += 1;
+        if waited >= 100 {
+            // 15s of contention means the live tick is wedged (its own
+            // timeouts should have fired long before) — drop THIS one with
+            // a loud log rather than double-advance the world.
+            tracing::error!(
+                turn_card_id,
+                "world tick gave up waiting for the in-flight tick (15s) — dropped"
+            );
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    let _tick_guard = WorldTickFlightGuard::new(app, Arc::clone(&state.world_tick_in_flight));
     // (2026-08-16 audit fix #4) Session-identity guard. This tick runs for
     // ~1-3s AFTER the turn's cancel slot was cleared and after `done`
     // unlocked the frontend — `fable_turn_in_flight` is already false, so a
@@ -8858,18 +12757,116 @@ async fn fire_world_progression_tick(
     .map(|id| {
         let node = schema_snapshot.travel_graph.find_node(&id);
         let evolved = node.map(|n| n.last_evolved_minutes).unwrap_or(0);
+        // (2026-08-23 starvation fix) The material-change watermark — only
+        // the seed-plant stamp moves it, so a chain of no-op designations
+        // can't launder a month of inaction into "1 day since touched".
+        let material = node.map(|n| n.last_material_minutes).unwrap_or(0);
         schema_engine::DesignatedSite {
             elapsed_days: if evolved > 0 {
                 (schema_snapshot.world_clock.current_minutes - evolved).max(0) / 1440
             } else {
                 0
             },
+            idle_days: if material > 0 {
+                Some((schema_snapshot.world_clock.current_minutes - material).max(0) / 1440)
+            } else {
+                None
+            },
             seeds: node.map(|n| n.seeds.clone()).unwrap_or_default(),
+            // (2026-08-22 multihog WS3) The pending-pressure read: the
+            // pass sees what previous ticks accumulated for this site.
+            pressure: node.map(|n| n.pending_pressure.clone()).unwrap_or_default(),
             name: node.map(|n| n.name.clone()).unwrap_or_else(|| id.clone()),
             id,
         }
     })
     .collect();
+    // (2026-08-22 living-world) SITE EVOLUTION designation — the 2 stalest
+    // MAPPED sites the player has DEPARTED (the PLAYER-BUBBLE FREEZE — a
+    // room never changes while the player stands in it, eliminating
+    // quantum-state bugs wholesale). (2026-08-23 hosted interiors) The
+    // freeze is CHAIN-AWARE: the current node's map, the hosted child the
+    // player stands in, AND its parent are all excluded — a child key like
+    // "oakhaven::tavern" never equals the current node key, so the old
+    // exact-key filter would happily evolve the room under the player.
+    // Hosted children otherwise participate like any departed map (their
+    // `site_ops` are per-map already). These ride the SAME single decode as
+    // the seeds; the pass may emit constrained `site_ops` for them
+    // (set/move/remove asset only — no node creation, no new assets, no
+    // lore leakage).
+    let evolution_sites: Vec<schema_engine::EvolutionSite> = {
+        let now = schema_snapshot.world_clock.current_minutes;
+        let current = schema_snapshot.travel_graph.current_node.clone();
+        let frozen = site_map::player_frozen_keys(
+            &schema_snapshot.site_maps,
+            current.as_deref(),
+        );
+        let mut cands: Vec<(i64, &String)> = schema_snapshot
+            .site_maps
+            .keys()
+            .filter(|k| !frozen.contains(*k))
+            .map(|k| {
+                (
+                    schema_snapshot
+                        .site_maps
+                        .get(k)
+                        .map(|m| m.last_visit_minutes)
+                        .unwrap_or(0),
+                    k,
+                )
+            })
+            .collect();
+        // Deterministic: stalest first, id as the tiebreak.
+        cands.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        cands
+            .into_iter()
+            .take(2)
+            .map(|(_, k)| {
+                let map = schema_snapshot.site_maps.get(k).expect("key came from the map");
+                // (2026-08-23 hosted interiors) A hosted child key never
+                // resolves in the travel graph: its pressure rides the ROOT
+                // node's queue and its display name is the breadcrumb.
+                let hosted = site_map::parse_hosted_key(k);
+                schema_engine::EvolutionSite {
+                    elapsed_days: (now - map.last_visit_minutes).max(0) / 1440,
+                    slice: site_map::render_tracker_slice(map, now).unwrap_or_default(),
+                    // (2026-08-22 multihog WS3) The departing side of the
+                    // pressure read: ops for this site are asked to honor it.
+                    // (2026-08-23 hosted interiors) Hosted children carry NO
+                    // pressure — the root node's queue belongs to the
+                    // SETTLEMENT's own evolution designation, not the
+                    // building's.
+                    pressure: if hosted.is_some() {
+                        Vec::new()
+                    } else {
+                        schema_snapshot
+                            .travel_graph
+                            .find_node(k)
+                            .map(|n| n.pending_pressure.clone())
+                            .unwrap_or_default()
+                    },
+                    // (2026-08-23 WS5) The site's OPEN causal threads —
+                    // bounded pre-rendered lines the pass is asked to
+                    // advance or resolve (empty ledger = zero prompt cost).
+                    threads: site_map::render_thread_lines(map, now),
+                    name: match &hosted {
+                        Some(_) => site_map::hosted_breadcrumb(
+                            &schema_snapshot.site_maps,
+                            &schema_snapshot.travel_graph,
+                            k,
+                        )
+                        .unwrap_or_else(|| k.clone()),
+                        None => schema_snapshot
+                            .travel_graph
+                            .find_node(k)
+                            .map(|n| n.name.clone())
+                            .unwrap_or_else(|| k.clone()),
+                    },
+                    id: k.clone(),
+                }
+            })
+            .collect()
+    };
     let deferred = {
         let mut q = state.failed_progression_queue.lock().await;
         std::mem::take(&mut *q)
@@ -8906,6 +12903,7 @@ async fn fire_world_progression_tick(
         interval_hours,
         deferred.clone(),
         designated.clone(),
+        evolution_sites.clone(),
     ) {
         Ok(rx) => rx,
         Err(e) => {
@@ -8916,7 +12914,7 @@ async fn fire_world_progression_tick(
             return;
         }
     };
-    let reply = match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
+    let mut reply = match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             tracing::warn!(error = %format!("{e}"), "world progression reply channel closed");
@@ -8983,12 +12981,17 @@ async fn fire_world_progression_tick(
     //     (cap 2 FIFO). Stamping ALL designated sites (seeds or not) is the
     //     rotation guarantee: a quiet site still rotates out of the next
     //     tick's stalest-3.
+    //     (2026-08-22 multihog WS3) A planted seed is a COMMIT for that
+    //     site: its pending pressure clears (consume-on-commit; a no-op
+    //     tick retains it — the anti-starvation rule).
     if !designated.is_empty() {
         let seeds_taken: Option<std::collections::HashMap<String, String>> =
             reply.delta.as_ref().and_then(|d| d.site_seeds.clone());
         {
             let mut s = state.fable_schema.lock().await;
             let snap = s.clone();
+            let mut planted: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             if let Some(seeds) = seeds_taken {
                 for (node_id, seed_raw) in seeds {
                     let Some(node) = s.travel_graph.nodes.iter_mut().find(|n| n.id == node_id)
@@ -9010,9 +13013,21 @@ async fn fire_world_progression_tick(
                     if overflow > 0 {
                         node.seeds.drain(..overflow);
                     }
+                    planted.insert(node_id);
                 }
             }
+            // (WS3) Consume-on-commit: a site whose seed planted owes no
+            // pending pressure anymore. (2026-08-23 starvation fix) A plant
+            // is also the MATERIAL moment — only here does the
+            // last_material_minutes watermark move, so no-op designations
+            // can't reset the site's real idle clock.
             let now = s.world_clock.current_minutes;
+            for node in s.travel_graph.nodes.iter_mut() {
+                if planted.contains(&node.id) {
+                    node.pending_pressure.clear();
+                    node.last_material_minutes = now;
+                }
+            }
             for d in &designated {
                 if let Some(node) = s.travel_graph.nodes.iter_mut().find(|n| n.id == d.id) {
                     node.last_evolved_minutes = now;
@@ -9020,6 +13035,179 @@ async fn fire_world_progression_tick(
             }
             drop(s);
             push_fable_history_snapshot(&state, snap).await;
+        }
+    }
+
+    // 7d. (2026-08-22 multihog WS3) SITE PRESSURE — consume the delta's
+    //     `site_pressure` (taken, never left for `apply_delta`: the
+    //     site_seeds/site_ops pattern, pinned by the delta-isolation
+    //     tests). Validation mirrors 7b/7c: known-node check,
+    //     `clean_free_text`, per-node cap 3 FIFO via
+    //     `site_map::push_node_pressure`; ≤
+    //     `SITE_PRESSURE_MAX_PER_TICK` entries total. A pressure-only
+    //     delta still accumulates (has_changes() deliberately ignores the
+    //     field).
+    {
+        let pressure_taken: Option<std::collections::HashMap<String, String>> =
+            reply.delta.as_mut().and_then(|d| d.site_pressure.take());
+        if let Some(pressure) = pressure_taken {
+            if !pressure.is_empty() {
+                let mut pushed_any = false;
+                {
+                    let mut s = state.fable_schema.lock().await;
+                    let snap = s.clone();
+                    for (node_id, line) in pressure
+                        .into_iter()
+                        .take(schema_engine::SITE_PRESSURE_MAX_PER_TICK)
+                    {
+                        let Some(node) =
+                            s.travel_graph.nodes.iter_mut().find(|n| n.id == node_id)
+                        else {
+                            // Unknown node — pressure never mints nodes.
+                            continue;
+                        };
+                        if site_map::push_node_pressure(node, &line) {
+                            pushed_any = true;
+                        }
+                    }
+                    if pushed_any {
+                        drop(s);
+                        push_fable_history_snapshot(&state, snap).await;
+                    }
+                }
+                if pushed_any {
+                    tracing::debug!(
+                        "[tick] site pressure accumulated (consume-on-commit discipline applies at the next pass)"
+                    );
+                }
+            }
+        }
+    }
+
+    // 7e. (2026-08-24 Part II A6) WIDER CURRENTS — consume the delta's
+    //     `wider_currents` (taken, never left for `apply_delta`: the
+    //     site_seeds pattern) and land it as ONE bounded
+    //     `pending_tick_directives` line the next narrator turn renders.
+    //     `clean_free_text`-capped at 160 chars; an empty/cleaned-out line
+    //     skips. Rumor-seeding from the line is deferred.
+    {
+        let currents_taken: Option<String> =
+            reply.delta.as_mut().and_then(|d| d.wider_currents.take());
+        if let Some(currents) = currents_taken {
+            let line = bracket_parser::clean_free_text(&currents, 160);
+            if !line.is_empty() {
+                let mut td = state.pending_tick_directives.lock().await;
+                td.push(format!("Wider currents: {line}"));
+                tracing::debug!("[tick] wider currents recorded for the next narrator turn");
+            }
+        }
+    }
+
+    // 7c. (2026-08-22 living-world) SITE EVOLUTION — consume the delta's
+    //     `site_ops` and run them through the constrained applier
+    //     (`site_map::apply_evolution_ops`). The PLAY-CANON LOCKS live in
+    //     the applier: dead stays dead, looted stays looted, disarmed
+    //     stays disarmed — a resurrection attempt rejects with the
+    //     remnant-entity directive, folded into a failed attempt so the
+    //     NEXT tick's prompt carries the correction. The PLAYER-BUBBLE
+    //     FREEZE is re-checked HERE (the designation excluded the current
+    //     node, but a [TRAVEL] mid-tick can have moved the player — an op
+    //     for where they now stand skips + rejects). Applied ops stamp
+    //     provenance + write the re-entry digest the next arrival renders.
+    {
+        let site_ops_taken: Option<
+            std::collections::HashMap<String, Vec<crate::site_map::SiteEvolutionOp>>,
+        > = reply.delta.as_ref().and_then(|d| d.site_ops.clone());
+        if let Some(ops_by_node) = site_ops_taken {
+            if !ops_by_node.is_empty() {
+                let mut applied_total = 0usize;
+                let mut rejects: Vec<String> = Vec::new();
+                let mut evolved_any = false;
+                // (2026-08-22 multihog WS3) Sites whose ops APPLIED — a
+                // commit that consumes their pending pressure.
+                let mut committed: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                {
+                    let mut s = state.fable_schema.lock().await;
+                    // (2026-08-23 hosted interiors) The CHAIN-AWARE freeze
+                    // re-check: the player may have entered a building or
+                    // traveled mid-decode — the frozen set (node + active
+                    // child + parent) is derived fresh HERE, never carried
+                    // from designation time.
+                    let frozen = crate::site_map::player_frozen_keys(
+                        &s.site_maps,
+                        s.travel_graph.current_node.as_deref(),
+                    );
+                    // Snapshot BEFORE the first mutation (the uniform
+                    // pre-mutation discipline — only pushed when something
+                    // actually applied).
+                    let snap = s.clone();
+                    let now = s.world_clock.current_minutes;
+                    for (node_id, ops) in &ops_by_node {
+                        if frozen.contains(node_id) {
+                            rejects.push(format!(
+                                "site {node_id}: the player stands there — evolution skipped \
+                                 (player-bubble freeze)."
+                            ));
+                            continue;
+                        }
+                        let Some(map) = s.site_maps.get_mut(node_id) else {
+                            rejects.push(format!(
+                                "site {node_id}: no mapped interior exists there — site_ops \
+                                 need a departed MAPPED site."
+                            ));
+                            continue;
+                        };
+                        let (applied, mut r) =
+                            crate::site_map::apply_evolution_ops(map, ops, now);
+                        applied_total += applied;
+                        if applied > 0 {
+                            evolved_any = true;
+                            committed.insert(node_id.clone());
+                        }
+                        rejects.append(&mut r);
+                    }
+                    // (WS3) Consume-on-commit: applied ops clear the site's
+                    // pending pressure (a no-op tick retains it) — same
+                    // lock, before the async snapshot push releases it.
+                    for node in s.travel_graph.nodes.iter_mut() {
+                        if committed.contains(&node.id) {
+                            node.pending_pressure.clear();
+                        }
+                    }
+                    if evolved_any {
+                        drop(s);
+                        push_fable_history_snapshot(&state, snap).await;
+                    }
+                }
+                if applied_total > 0 {
+                    tracing::info!(
+                        ops_applied = applied_total,
+                        "[tick] departed sites evolved (digest written for the next arrival)"
+                    );
+                }
+                if !rejects.is_empty() {
+                    tracing::warn!(
+                        count = rejects.len(),
+                        "[tick] site evolution ops rejected — correction queued for the next tick"
+                    );
+                    enqueue_failed_progression(
+                        state,
+                        schema_engine::FailedAttempt {
+                            exchange: None,
+                            trigger: Some("site evolution ops".to_string()),
+                            errors: rejects
+                                .join(" | ")
+                                .chars()
+                                .take(800)
+                                .collect(),
+                            passes_used: 1,
+                            surface: schema_engine::DeltaSurface::Fable,
+                        },
+                    )
+                    .await;
+                }
+            }
         }
     }
 
@@ -9086,6 +13274,44 @@ async fn chat_stop(state: tauri::State<'_, AppState>) -> Result<(), String> {
     let slot = state.active_cancel.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(cancel) = slot.as_ref() {
         cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// (2026-08-24 Chloe ruling) History reset for the Wupi chat: exiting the
+/// chat surface (closing the OS chat window / leaving Fable) clears the
+/// conversation so the next sitting starts clean — the 16-message window
+/// spans one sitting, never the process lifetime. Memory (memory.sqlite) is
+/// UNTOUCHED: recall survives; only the live conversation dies. The KV cache
+/// cold-resets naturally on the next turn (empty-session render diverges).
+///
+/// A live turn is signalled to stop first and given a brief unwind window
+/// (the `fable_end` retry discipline) so a cancelled turn's final commit
+/// can't land in the fresh session; then any pending schema-delta task is
+/// awaited (it re-acquires locks we don't hold — safe to wait) before the
+/// clear.
+#[tauri::command]
+async fn chat_reset(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    tracing::info!("chat_reset requested");
+    for _ in 0..10 {
+        // The guard is a match-scrutinee temporary so it drops at the end of
+        // this statement — structurally before the await below (a named
+        // binding that `break` can skip past keeps the MutexGuard live
+        // across the sleep and makes the command future !Send).
+        match state.active_cancel.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(cancel) => {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            None => break,
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    if let Some(handle) = state.pending_delta.lock().await.take() {
+        let _ = handle.await;
+    }
+    {
+        let mut s = state.session.lock().await;
+        *s = session::Conversation::new();
     }
     Ok(())
 }
@@ -9208,6 +13434,112 @@ async fn memory_wipe_card(state: tauri::State<'_, AppState>) -> Result<usize, St
         .clone();
     engine
         .wipe_episodic_card(&card_id)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// (2026-08-22 multihog WS4) Roll back ONE archived turn of the active
+/// card's episodic memory (the manager/debug surface — the enforcement
+/// half of the turn journal). Strings only across the IPC boundary.
+#[tauri::command]
+async fn memory_rollback_turn(
+    turn_uuid: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    let engine = state
+        .memory
+        .get()
+        .ok_or_else(|| "memory engine not initialized".to_string())?;
+    // (2026-08-24 Part II D1) routes through the ACTIVE PARTITION (a
+    // branch's fork key), never the raw card id.
+    let card_id = state
+        .active_memory_partition
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    engine
+        .rollback_turn(&card_id, &turn_uuid)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// (2026-08-22 multihog WS4) Pin/unpin ONE archived turn of the active
+/// card (pinned rows survive the retention prune + never count toward the
+/// cap — Multihog's no-eviction-cascade rule). Frontend wiring into the
+/// debug panel is an optional follow-up; the IPC is the surface.
+#[tauri::command]
+async fn memory_set_pinned(
+    turn_uuid: String,
+    pinned: bool,
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    let engine = state
+        .memory
+        .get()
+        .ok_or_else(|| "memory engine not initialized".to_string())?;
+    // (2026-08-24 Part II D1) routes through the ACTIVE PARTITION (a
+    // branch's fork key), never the raw card id.
+    let card_id = state
+        .active_memory_partition
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    engine
+        .set_turn_pinned(&card_id, &turn_uuid, pinned)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// (2026-08-25) Reverse ONE consolidation batch of the active partition:
+/// the `rollback_turn` refusal points here for `consol_*` keys, and until
+/// now nothing in the app could reach the engine method. Same shape as the
+/// other memory IPCs — strings across the boundary, ACTIVE partition
+/// routing (a branch's fork key), never the raw card id. Returns 0 when the
+/// batch is permanent (sources pruned — the engine refuses as a clean no-op).
+#[tauri::command]
+async fn memory_rollback_consolidation(
+    batch_turn_uuid: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<usize, String> {
+    let engine = state
+        .memory
+        .get()
+        .ok_or_else(|| "memory engine not initialized".to_string())?;
+    let card_id = state
+        .active_memory_partition
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    engine
+        .rollback_consolidation(&card_id, &batch_turn_uuid)
+        .await
+        .map_err(|e| format!("{e:#}"))
+}
+
+/// (2026-08-24 Part II C3) List the ACTIVE card's archived episodic TURNS
+/// (newest first, turn-uuid-grouped — the raw memory list is chunk-granular;
+/// the Chronicle panel needs the grouping the journal + rollback + pin all
+/// operate at). Consolidation batches are excluded (system artifacts —
+/// `rollback_consolidation` is their reversal, never the turn rollback the
+/// panel exposes). `limit` defaults to 100, clamped 1..=500.
+#[tauri::command]
+async fn memory_turns_list(
+    limit: Option<u32>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<memory::TurnListRow>, String> {
+    let engine = state
+        .memory
+        .get()
+        .ok_or_else(|| "memory engine not initialized".to_string())?;
+    // (2026-08-24 Part II D1) routes through the ACTIVE PARTITION (a
+    // branch's fork key), never the raw card id.
+    let card_id = state
+        .active_memory_partition
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    engine
+        .list_turns(&card_id, limit.unwrap_or(100) as usize)
         .await
         .map_err(|e| format!("{e:#}"))
 }
@@ -9631,7 +13963,12 @@ async fn debug_schema_delta(
     // reply so an engineer can see when the validator + 3-pass fail is the
     // right scope for this surface.
     let reply_rx = engine
-        .request_delta((user_exchange, assistant_exchange), &current, Vec::new())
+        .request_delta(
+            (user_exchange, assistant_exchange),
+            &current,
+            Vec::new(),
+            schema_engine::DeltaSurface::Chat,
+        )
         .map_err(|e| format!("{e:#}"))?;
     let reply = tokio::task::spawn_blocking(move || reply_rx.recv())
         .await
@@ -9700,17 +14037,21 @@ struct FableCardMeta {
     card_type: String,
     /// The polymorphic SIM Wizard discriminator (2026-08-13): "npc" |
     /// "scenario" | "world" | None. Surfaced so a future picker can badge/group
-    /// cards by type; `<card_type>` stays "roleplay" for all playable cards.
+    /// cards by type; `<card_type>` is "simulation" for all playable cards
+    /// (v0.30.0: "roleplay" no longer normalizes onto it — pre-v2 shapes are
+    /// skipped outright).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subtype: Option<String>,
     setting_preview: String,
     tone: Option<String>,
-    /// First ~240 chars of `<scenario><opening_scene>`: the launcher card
+    /// First ~240 chars of the card's `<intro>` sibling: the launcher card
     /// uses this as the evocative "what's this about" blurb below the title.
     /// None when the card doesn't declare one.
     opening_scene_preview: Option<String>,
-    /// Declared player name. The launcher shows this so the player
-    /// knows whose shoes they're stepping into before they start.
+    /// The attached SavedPlayer's name, stamped onto the in-memory card at
+    /// session entry (`attach_saved_player`). Always `None` in the parsed/
+    /// on-disk shape (v0.30.0: cards no longer author a player name — the
+    /// Player Picker owns the binding).
     player_name: Option<String>,
     /// Whether the player has any saves for this card (autosave counts).
     /// Lets the launcher show Continue vs New Game intelligently. Best-effort:
@@ -9756,9 +14097,14 @@ fn fable_cards_list(app: tauri::AppHandle) -> Result<Vec<FableCardMeta>, String>
         }
         // Only list simulation cards in this registry: the system card
         // (wupi.sim) lives in `data/`, not `apps/fable/cards/`, so this is
-        // belt-and-suspenders against a misplaced file. ("simulation" is the
-        // 2026-08-19 rename of "roleplay" — parse normalizes both.)
+        // belt-and-suspenders against a misplaced file.
         if card.card_type != "simulation" {
+            continue;
+        }
+        // (v0.30.0 clean break) Pre-v2-format cards are UNSUPPORTED — skip
+        // with a warn. The user re-creates the card through the Creator.
+        if !card.format_v2 {
+            tracing::warn!(path = %path.display(), "skipping pre-v2 card (recreate it via the Creator)");
             continue;
         }
         // Best-effort: has the user got any saves for this card (any
@@ -9769,11 +14115,9 @@ fn fable_cards_list(app: tauri::AppHandle) -> Result<Vec<FableCardMeta>, String>
             .map(|sessions| sessions.iter().any(|s| s.save_count > 0))
             .unwrap_or(false);
         let mut meta = card_to_meta(&card, has_saves);
-        // The launcher blurb: the in-file `<intro>` sibling (canonical,
-        // 2026-08-13) preferred, falling back to a legacy `.intro` sibling FILE
-        // for cards authored before the in-file move. Capped to 240 chars.
-        meta.opening_scene_preview = preview_from_intro(&card.intro)
-            .or_else(|| intro_preview_for(&dir, &card.id));
+        // The launcher blurb: the in-file `<intro>` sibling, capped to 240
+        // chars.
+        meta.opening_scene_preview = preview_from_intro(&card.intro);
         // The portrait sibling (`<Name>.png`/`.jpg`, namesake — see
         // `find_portrait_sibling`) drives the launcher's mini-card + modal
         // portrait (2026-08-05). `portrait` is the relative name;
@@ -9799,15 +14143,11 @@ fn card_to_meta(card: &sim_card::SimCard, has_saves: bool) -> FableCardMeta {
         .as_deref()
         .map(|s| s.chars().take(160).collect::<String>())
         .unwrap_or_default();
-    // opening_scene_preview (the launcher blurb) now reads the sibling `.intro`
-    // file (capped at 240 chars). The intro moved out of the cached `<sim_card>`
-    // 2026-08-05 — `card.opening_scene` no longer exists. The `.intro` is the
-    // evocative beat; if absent, the launcher falls back to the setting blurb
-    // (handled client-side via `setting_preview || opening_scene_preview`).
-    // NOTE: card_to_meta doesn't have the cards dir in scope, so the `.intro`
-    // read happens at the fable_cards_list call site (which does) via
-    // `intro_preview_for`. This fn leaves opening_scene_preview = None; the
-    // caller patches it in.
+    // opening_scene_preview (the launcher blurb) reads the parsed `<intro>`
+    // sibling (capped at 240 chars) at the fable_cards_list call site; this
+    // fn leaves it None and the caller patches it in. When absent the
+    // launcher falls back to the setting blurb (client-side via
+    // `setting_preview || opening_scene_preview`).
     FableCardMeta {
         id: card.id.clone(),
         name: card.name.clone(),
@@ -9833,8 +14173,6 @@ fn card_to_meta(card: &sim_card::SimCard, has_saves: bool) -> FableCardMeta {
 /// effort: a read error degrades to None.
 /// Cap an in-file `<intro>` block (from the parsed `SimCard.intro` field) to
 /// the 240-char launcher-blurb preview. None when the card carries no intro.
-/// This is the canonical source (2026-08-13); `intro_preview_for` (the legacy
-/// `.intro` FILE read) is the back-compat fallback.
 fn preview_from_intro(intro: &str) -> Option<String> {
     let t = intro.trim();
     if t.is_empty() {
@@ -9844,30 +14182,13 @@ fn preview_from_intro(intro: &str) -> Option<String> {
     }
 }
 
-fn intro_preview_for(cards_root: &std::path::Path, card_id: &str) -> Option<String> {
-    let path = resolve_card_file(cards_root, card_id, "intro");
-    match std::fs::read_to_string(&path) {
-        Ok(t) => {
-            let t = t.trim();
-            if t.is_empty() {
-                None
-            } else {
-                Some(t.chars().take(240).collect::<String>())
-            }
-        }
-        Err(_) => None,
-    }
-}
-
 /// The portrait naming convention (2026-08-19): a portrait is a NAMESAKE
 /// sibling of the identity file — `<Name>.png` / `<Name>.jpg` beside the
 /// `<Name>.sim` / `<Name>.player` (the folder's display stem + the real
 /// ext), exactly like every other per-entity file in the folder. Discovery
-/// order: png > jpg > jpeg, namesake first, then the legacy fixed
-/// `portrait.<ext>` name as a read-side fallback for folders the boot
-/// migration couldn't fold (unparseable identity files). Returns the
-/// RELATIVE filename within the folder; None when no portrait exists.
-/// Best-effort: a stat error degrades to None.
+/// order: png > jpg > jpeg. Returns the RELATIVE filename within the
+/// folder; None when no portrait exists. Best-effort: a stat error degrades
+/// to None.
 fn find_portrait_sibling(dir: &std::path::Path) -> Option<String> {
     if let Some(stem) = dir.file_name().and_then(|n| n.to_str()) {
         if !stem.is_empty() {
@@ -9879,12 +14200,6 @@ fn find_portrait_sibling(dir: &std::path::Path) -> Option<String> {
             }
         }
     }
-    for ext in ["png", "jpg", "jpeg"] {
-        let name = format!("portrait.{ext}");
-        if dir.join(&name).is_file() {
-            return Some(name);
-        }
-    }
     None
 }
 
@@ -9893,22 +14208,6 @@ fn find_portrait_sibling(dir: &std::path::Path) -> Option<String> {
 /// present (the common case).
 fn portrait_path_for(cards_root: &std::path::Path, card_id: &str) -> Option<String> {
     find_portrait_sibling(&resolve_card_dir(cards_root, card_id))
-}
-
-/// Read a card's full `.intro` text (the one-shot first narrator beat). None
-/// when the card has no `.intro`. The intro is read ONCE at game start +
-/// surfaced on `FableLoadResult.intro` (NEVER injected into the cached system
-/// prompt — it's a single-turn seed). Best-effort: a read error degrades to
-/// None (the game starts without an opening beat).
-fn load_card_intro(cards_root: &std::path::Path, card_id: &str) -> Option<String> {
-    let path = resolve_card_file(cards_root, card_id, "intro");
-    match std::fs::read_to_string(&path) {
-        Ok(t) => {
-            let t = t.trim();
-            if t.is_empty() { None } else { Some(t.to_string()) }
-        }
-        Err(_) => None,
-    }
 }
 
 /// Slugify a card name into a filesystem-safe stem (lowercase, non-alphanumerics
@@ -9972,6 +14271,56 @@ fn slugify_card_stem(name: &str) -> Option<String> {
     if stem.is_empty() { None } else { Some(stem) }
 }
 
+/// The memory-partition sentinel ids are RESERVED identities: a card whose
+/// id (or name-derived slug) lands on `__wupi__` / `__wupi_system__` /
+/// `__fable_system__` / `__codex__` would hijack the Wupi-chat memory
+/// partition (game prose archiving over the copilot's episodic store) AND
+/// `fable_end`'s `roleplay_card_id != WUPI_CARD_ID` guard would silently
+/// skip every session persist for that "card" — forever. The parser
+/// filters sentinels out of derived ids already; this predicate is the
+/// WRITE-boundary gate so the invariant never depends on that filter alone.
+pub(crate) fn is_memory_sentinel_id(s: &str) -> bool {
+    matches!(
+        s,
+        crate::memory::WUPI_CARD_ID
+            | crate::memory::WUPI_SYSTEM_CARD_ID
+            | crate::memory::FABLE_SYSTEM_CARD_ID
+            | crate::memory::CODEX_CARD_ID
+    )
+}
+
+/// (v0.30.0 clean break) Every `.sim` write/validate path enforces the same
+/// playability contract the walkers do: `card_type == "simulation"` AND the
+/// v2 format. A pre-v2 shape still PARSES (the parser reads the legacy
+/// elements for `wupi.sim`) but is invisible to every Fable load path —
+/// rejecting at the write boundary surfaces that immediately, instead of a
+/// saved card silently vanishing from the list (e.g. a pre-v2 backup
+/// restored through the raw editor).
+pub(crate) fn ensure_playable_v2(card: &sim_card::SimCard) -> Result<(), String> {
+    if card.card_type != "simulation" {
+        return Err(format!(
+            "card <type> must be \"simulation\" for a playable card (found \"{}\") — fix the <metadata><type> element; the pre-v0.30 \"roleplay\" type no longer normalizes",
+            card.card_type
+        ));
+    }
+    if !card.format_v2 {
+        return Err(
+            "card XML must use the v2 format (<type>simulation</type> + line-block <identity>/<persona> + the sibling tail) — pre-v2 shapes are unsupported since v0.30.0; re-create the card through the Creator".into(),
+        );
+    }
+    // Belt-and-braces: the parser's id derivation filters sentinels, so a
+    // parsed card landing here shouldn't carry one — but this is the SHARED
+    // write/validate contract, and the cost of a leak (the Wupi-chat memory
+    // partition hijack + the fable_end persist skip) is total.
+    if is_memory_sentinel_id(&card.id) {
+        return Err(format!(
+            "card id {:?} is a reserved memory sentinel — pick another name/id",
+            card.id
+        ));
+    }
+    Ok(())
+}
+
 /// Validate a `.sim` card XML string against the real parser. Returns the
 /// parsed card's metadata on success, or an error string on failure. This is
 /// the single validation authority for the Creator's save path AND any
@@ -9986,6 +14335,7 @@ fn slugify_card_stem(name: &str) -> Option<String> {
 fn fable_validate_card_xml(xml: String) -> Result<FableCardMeta, String> {
     let card = sim_card::parse_from_xml_str(&xml)
         .map_err(|e| format!("Invalid card format: {e}"))?;
+    ensure_playable_v2(&card)?;
     Ok(card_to_meta(&card, false))
 }
 
@@ -10026,6 +14376,10 @@ async fn fable_write_card(
     }
     let validated = sim_card::parse_from_xml_str(&xml)
         .map_err(|e| format!("Invalid card format: {e}"))?;
+    // (v0.30.0 clean break) a playable card must be v2 — see
+    // `ensure_playable_v2`. Checked before any disk touch so a legacy-shaped
+    // payload can never land on disk as an unwalkable ghost.
+    ensure_playable_v2(&validated)?;
 
     // 2. Resolve the cards dir. The FOLDER stem is the card's DISPLAY name
     //    (spaces + capitals preserved — 2026-08-19); the partition id stays
@@ -10048,6 +14402,16 @@ async fn fable_write_card(
     // deleting the old card (campaign loss).
     let name_slug = slugify_card_stem(&validated.name)
         .ok_or_else(|| "card name produces no usable id".to_string())?;
+    // Sentinel gate on the NAME-derived slug — the fresh-create identity
+    // source. Without this, a card named `__wupi__` etc. fails only the
+    // id==slug contract below with an OPAQUE mismatch error (the parser
+    // filters the sentinel out of `validated.id`); refuse it clearly here.
+    if is_memory_sentinel_id(&name_slug) || is_memory_sentinel_id(&validated.id) {
+        return Err(format!(
+            "the name {:?} slugs to the reserved id {:?}: memory-partition sentinels (__wupi__, __wupi_system__, __fable_system__, __codex__) can never be a card identity — pick another name",
+            validated.name, name_slug
+        ));
+    }
     // The card's CURRENT folder (walker-resolved by parsed id) — Some for an
     // edit/rename (the write's own home), None for a fresh create.
     let existing_folder = resolve_card_folder(&dir, &validated.id);
@@ -10203,7 +14567,7 @@ async fn fable_write_card(
     if is_fresh_create {
         if let Some(engine) = state.memory.get() {
             for key in [reloaded.id.as_str()] {
-                match engine.purge_card_partition(key).await {
+                match engine.purge_card_family(key).await {
                     Ok(0) => {}
                     Ok(n) => tracing::info!(
                         card_id = %key,
@@ -10299,6 +14663,15 @@ async fn fable_start(
     //     orders stop-before-start; this is the backend backstop.
     if fable_turn_in_flight(&state) {
         return Err("a narrator turn is still in flight: stop it (or wait) before starting another game".into());
+    }
+    // Sentinel gate: a reserved memory-partition id is never a startable
+    // card — entering one would hijack the Wupi-chat memory partition and
+    // fable_end would silently skip every session persist (its
+    // `roleplay_card_id != WUPI_CARD_ID` guard).
+    if is_memory_sentinel_id(&card_id) {
+        return Err(format!(
+            "card id {card_id:?} is a reserved memory sentinel — not a startable card"
+        ));
     }
     // (2026-08-16 bug 8) Bump the session generation NOW, deliberately
     // before any fallible work: from this point on, in-flight ticks +
@@ -10521,13 +14894,15 @@ fn attach_saved_player(
                 Some(cache_block);
             // The `<inventory>` sibling is mutable state seed (NEVER cached):
             // clothing → the garment router, Equipped → readied hands,
-            // Accessories/Stored → the pack. FRESH runs only — a resumed
-            // campaign's inventory is authoritative.
+            // Accessories/Stored → the default stash (wallet cargo → the
+            // pouch, 2026-08-23; everything else the pack). FRESH runs only —
+            // a resumed campaign's inventory is authoritative.
             if fresh {
                 if let Some(inv) = sp.inventory.as_ref().filter(|i| !i.is_empty()) {
                     let seeded = equipment::seed_player_inventory(
                         inv,
                         &mut prior_schema.player_state.equipment,
+                        &mut prior_schema.player_state.pouch,
                         &mut prior_schema.player_state.pack,
                     );
                     tracing::info!(seeded, "player inventory seeded into typed model");
@@ -10637,7 +15012,10 @@ async fn enter_fable_session(
             .collect();
         let card_id_owned = card.id.clone();
         tokio::spawn(async move {
-            match codex::seed_linked_codices(&me, &links, &card_id_owned).await {
+            // (2026-08-24) Family seed: the base partition AND every branch
+            // fork key — forked sessions otherwise froze their codex lore at
+            // branch time (edits/unlinks never reconciled at the fork).
+            match codex::seed_linked_codices_family(&me, &links, &card_id_owned).await {
                 Ok(r) => tracing::info!(
                     card_id = %card_id_owned,
                     files = links.len(),
@@ -10656,22 +15034,6 @@ async fn enter_fable_session(
         });
     }
 
-    // (RETIRED 2026-08-21 — the Cinderfen playtest's observed-once slug-rename
-    // bug) The 2026-08-15 "P1" legacy migration that used to live here did a
-    // raw `fs::rename(cards/<name.to_lowercase()>, cards/<card.id>)`. On
-    // Windows (case-insensitive FS) the lowercased display name MATCHED the
-    // 2026-08-19 display-named card folder, and `legacy_id != card.id` is
-    // true for every multi-word name (spaces vs dashes) — so the first
-    // `fable_start` after the folder existed renamed
-    // `Stranded in Cinderfen/` to `stranded-in-cinderfen/` with the display
-    // `.sim`/`.codex` still inside (a directory rename moves nothing), the
-    // namesake walker went blind (empty card list), and every by-id write
-    // fell back to slug-stemmed split JSONs. One-shot per card — which is
-    // exactly why it did not reproduce on retry. Genuine pre-normalization
-    // legacy folders are handled by the boot migration (`migrate_cards_v2`,
-    // display-stemmed); this block predates the display-folder redesign and
-    // is deleted, not gated.
-
     // Resolve initial state. Priority: explicit save_id → fresh → fallback.
     // (2026-08-21 resume-attach fix) The SavedPlayer binding rides the
     // conversation (`Conversation::attached_player_id`), so capture whatever
@@ -10688,8 +15050,6 @@ async fn enter_fable_session(
     //   fresh + no session  → mint a new isolated playthrough folder.
     //   explicit session    → use it verbatim (fresh + Some = reset-in-place
     //                         of that playthrough).
-    //   bare save_id        → legacy payload (old .lnk): find the owning
-    //                         session by walking the card's sessions.
     //   nothing + !fresh    → resume the most-recently-played session (the
     //                         .lnk `--card` direct boot; Continue passes an
     //                         explicit target).
@@ -10704,9 +15064,11 @@ async fn enter_fable_session(
         manifest.session_id
     } else if let Some(sid) = session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         sid.to_owned()
-    } else if let Some(sid) = save_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        find_session_owning_save(&fable_root, &card.id, sid)
-            .ok_or_else(|| format!("no session owns save '{sid}'"))?
+    } else if save_id.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+        // A bare save_id with no session context is a stale payload (old
+        // .lnk shapes) — refuse rather than guess a session.
+        let sid = save_id.unwrap_or_default();
+        return Err(format!("no session context for save '{sid}' — resume via the session manager"));
     } else {
         fable_save::list_sessions(&fable_root, &card.id)
             .map_err(|e| format!("session listing failed: {e}"))?
@@ -10750,12 +15112,6 @@ async fn enter_fable_session(
         stored_player_id = c.attached_player_id.clone();
         (s, c, None)
     };
-    // (2026-08-18 clothing-as-inventory ruling) The explicit-save branch
-    // installs a save slot's schema directly (bypassing load_split), so run
-    // the one-shot legacy `outfit` delta → typed inventory migration on
-    // whatever resolved. Idempotent — the resume branch already migrated
-    // through load_split.
-    prior_schema.migrate_legacy_outfit();
     // (2026-08-16, Chloe ruling + audit #2) Seed the card's `<intro>` as
     // session message 0 (an assistant beat) whenever we're entering a card
     // with an EMPTY conversation (fresh New Game, or a first entry with no
@@ -10782,25 +15138,12 @@ async fn enter_fable_session(
             // model raw — the honest value IS the text); variant_schemas
             // stays EMPTY, so a swipe installs no schema (these openings were
             // never tracked — the graceful no-op path by design).
-            let mut intro_variants: Vec<String> = card
+            let intro_variants: Vec<String> = card
                 .intro_variants
                 .iter()
                 .map(|s| s.trim().to_owned())
                 .filter(|s| !s.is_empty())
                 .collect();
-            if intro_variants.is_empty() {
-                let fallback = if !card.intro.trim().is_empty() {
-                    Some(card.intro.clone())
-                } else {
-                    resolve_fable_cards_dir(app).and_then(|root| load_card_intro(&root, &card.id))
-                };
-                intro_variants = fallback
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(|s| vec![s.to_owned()])
-                    .unwrap_or_default();
-            }
             // NO dedupe here, deliberately: session variant indexes must
             // stay 1:1 with the card's `<intro>` siblings (in-game edits
             // write through BY INDEX — `write_intro_variant_to_card`). The
@@ -10863,39 +15206,6 @@ async fn enter_fable_session(
         effective_player_id.as_deref(),
         fresh,
     );
-    // Fable Phase 4 Component 3 (2026-07-28): seed the travel graph from the
-    // card's `<locations>` block IF the resolved schema has no graph yet.
-    // This is the load-bearing fix for Components 3 + 4 being dead in live
-    // play (see docs/phase4-fix-travel-graph-seeding.md). Runs for ALL three
-    // branches (fresh / resume / explicit save): the card's geography is
-    // authoritative; a resumed save whose graph is empty (a pre-Phase-4
-    // save, or a card whose graph was added in a later edit) picks up the
-    // current card's graph. A save that already carries a seeded graph is
-    // left alone (the player's current_node + any Tracker-added state is
-    // preserved). Without this, `[TRAVEL]` is always rejected ("unknown
-    // destination" — nodes is empty) + `[RUMOR]` is always dropped
-    // (no-current-node path) → Components 3 + 4 never fire in live play.
-    if prior_schema.travel_graph.nodes.is_empty() && !card.locations.is_empty() {
-        prior_schema.travel_graph = schema::TravelGraph {
-            nodes: card
-                .locations
-                .iter()
-                .map(|cn| schema::Node {
-                    id: cn.id.clone(),
-                    name: cn.name.clone(),
-                    neighbors: cn.neighbors.clone(),
-                    setting: cn.setting.clone(), ..Default::default()
-                })
-                .collect(),
-            // The first <node> in document order is the seed location.
-            current_node: card.locations.first().map(|cn| cn.id.clone()),
-        };
-        tracing::info!(
-            node_count = card.locations.len(),
-            seed = ?card.locations.first().map(|n| n.id.as_str()),
-            "fable_start: seeded travel_graph from card <locations>"
-        );
-    }
     // (2026-08-19 v2) The `<location>` SIBLING — the single authored starting
     // location. The graph grows organically from it ([DISCOVER]/[TRAVEL]
     // mint + auto-link). Seeds only when the graph is empty AND the card
@@ -10903,10 +15213,18 @@ async fn enter_fable_session(
     // for [DISCOVER]).
     if prior_schema.travel_graph.nodes.is_empty() {
         if let Some(loc) = card.location.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            let node_id = crate::slugify_card_stem(loc).unwrap_or_else(|| "start".into());
+            // (2026-08-26 location-hygiene ruling) Parentheses never appear
+            // in a location: strip authored parenthetical/meta qualifiers
+            // ("Earth (variable by scene)" → "Earth") BEFORE the node is
+            // minted, so both the diegetic name AND the slug id derive from
+            // the clean label. A name that cleans to nothing keeps the raw
+            // authored text (the seed must never blank).
+            let cleaned = schema::clean_location_label(loc);
+            let name = if cleaned.is_empty() { loc.to_owned() } else { cleaned };
+            let node_id = crate::slugify_card_stem(&name).unwrap_or_else(|| "start".into());
             let node = schema::Node {
                 id: node_id.clone(),
-                name: loc.to_owned(),
+                name,
                 neighbors: vec![],
                 setting: String::new(), ..Default::default()
             };
@@ -10916,54 +15234,16 @@ async fn enter_fable_session(
             }
         }
     }
-    // Fable Phase 5A (2026-07-29): seed the named-NPC registry from a LEGACY
-    // card's <cast> block (v2 cards carry no cast). Mirrors the travel_graph
-    // seed above (same gate shape: only seed when the schema's registry is
-    // empty AND the card declares a cast — a resumed save with a populated
-    // registry is left alone, preserving the player's [PRESENCE] state).
     // (2026-08-19 player-name guard, entry seam) Authored registry seeds are
     // written blind to whichever player attaches later — an entry whose id
     // or name IS the player would put the player on-camera as an NPC from
-    // turn 1 (the twin-Lacey corruption, authored-data edition). Both seed
-    // sites below skip such collisions loudly (SYS), never fatally.
+    // turn 1 (the twin-Lacey corruption, authored-data edition). The
+    // self-register below skips such collisions loudly (SYS), never fatally.
     let entry_player_slug = card
         .player_name
         .as_deref()
         .map(|n| sanitize_slug(n))
         .unwrap_or_default();
-    if prior_schema.npc_registry.entries.is_empty() && !card.cast.is_empty() {
-        prior_schema.npc_registry = schema::NpcRegistry {
-            entries: card
-                .cast
-                .iter()
-                .filter_map(|cn| {
-                    if !entry_player_slug.is_empty()
-                        && (sanitize_slug(&cn.id) == entry_player_slug
-                            || sanitize_slug(&cn.name) == entry_player_slug)
-                    {
-                        return None;
-                    }
-                    Some(schema::NpcEntry {
-                        id: cn.id.clone(),
-                        name: cn.name.clone(),
-                        role: cn.role.clone(),
-                        tier: cn.tier.clone(),
-                        aliases: cn.aliases.clone(),
-                        // (2026-08-18) Authored cast = Core prominence: full
-                        // interior, reaper-immune, registry-pinned (§ the 3-tier
-                        // ruling — the card author put them in the world
-                        // deliberately).
-                        prominence: schema::NpcProminence::Core,
-                    })
-                })
-                .collect(),
-        };
-        tracing::info!(
-            npc_count = card.cast.len(),
-            ids = ?card.cast.iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
-            "fable_start: seeded npc_registry from legacy card <cast>"
-        );
-    }
     // (2026-08-19 v2) An npc-subtype card IS the character: self-register it
     // in the npc_registry (Core prominence — the card author authored THEM
     // deliberately) + seed its `<inventory>` sibling into the interior item
@@ -11010,9 +15290,7 @@ async fn enter_fable_session(
             // the held rack: Clothing + garment-routable Equipped/Accessories
             // WEAR (`worn` — renders as the `wearing:` line); weapon-ish
             // Equipped + non-specific Accessories + Stored stay HELD (the
-            // `[NPC_ITEM]` theft loop's rack). A legacy interior that seeded
-            // everything onto `items` migrates: worn-class names move across,
-            // so an outfit never renders as a shopping bag twice.
+            // `[NPC_ITEM]` theft loop's rack).
             let weaponish = |name: &str| {
                 const WEAPON_TERMS: [&str; 14] = [
                     "sword", "blade", "axe", "bow", "dagger", "staff", "spear",
@@ -11029,22 +15307,8 @@ async fn enter_fable_session(
                 // non-specific accessories stay held (Chloe: "if something
                 // isn't specific then going into inventory is perfectly fine").
                 let lower = name.to_lowercase();
-                !weaponish(name) && equipment::route_legacy_to_slot(&lower).is_some()
+                !weaponish(name) && equipment::route_item_to_slot(&lower).is_some()
             };
-            // Legacy migration first: worn-class names already on the held
-            // rack (pre-split saves) move to `worn`.
-            let legacy_moves: Vec<equipment::StackItem> = rack
-                .items
-                .iter()
-                .filter(|it| worn_class(&it.name, false))
-                .cloned()
-                .collect();
-            if !legacy_moves.is_empty() {
-                rack.items.retain(|it| !worn_class(&it.name, false));
-                for it in legacy_moves {
-                    equipment::stack_upsert(&mut rack.worn, it);
-                }
-            }
             for (name, line) in card
                 .inventory
                 .clothing
@@ -11100,10 +15364,8 @@ async fn enter_fable_session(
         }
     }
     // Cold-start anchors (2026-08-19 v2): seed clock / weather / calendar /
-    // TONE from the card's `<world>` sibling (the parser maps a legacy
-    // `<start>` + `<tone>` into the same model, so both generations flow
-    // through here). Dormancy-gated so a resumed save that advanced any
-    // anchor is preserved.
+    // TONE from the card's `<world>` sibling. Dormancy-gated so a resumed
+    // save that advanced any anchor is preserved.
     //
     // Clock: write BOTH current_minutes AND last_tick_minutes so the seed
     // counts as the baseline — the World Progression tick's first-call rule
@@ -11174,17 +15436,16 @@ async fn enter_fable_session(
     // → it has nothing to maintain → [TIME]/[WEATHER] never fire. Seeding from
     // the intro gives the tracker its baseline from turn 1. Best-effort +
     // detached from game-entry: a failure falls through to sensible defaults
-    // below, never blocks the launch. (The .intro is normally read once for the
-    // UI at line ~7077; for the bootstrap we re-read here — cheap, small file.)
-    if !prior_schema.world_clock.is_set() || !prior_schema.weather.is_set() {
-        // The opening beat now lives in-file as the `<intro>` sibling
-        // (2026-08-13); fall back to a legacy `.intro` FILE for old cards.
-        let intro_text = if !card.intro.trim().is_empty() {
-            Some(card.intro.clone())
-        } else {
-            resolve_fable_cards_dir(app)
-                .and_then(|root| load_card_intro(&root, &card.id))
-        };
+    // below, never blocks the launch.
+    if !prior_schema.world_clock.is_set()
+        || !prior_schema.weather.is_set()
+        // (2026-08-22 living-world) The Auto-Harvest: a dormant arcane pool
+        // also justifies the bootstrap pass — the opening may NAME the
+        // resource ("mana", "biotics") even when time/weather are seeded.
+        || prior_schema.player_state.mana.is_none()
+    {
+        // The opening beat lives in-file as the `<intro>` sibling.
+        let intro_text = Some(card.intro.clone());
         let derived = if let Some(intro) = intro_text.as_deref().filter(|s| !s.trim().is_empty()) {
             bootstrap_anchors_from_intro(
                 state,
@@ -11228,6 +15489,18 @@ async fn enter_fable_session(
                         prior_schema.travel_graph.current_node = Some(id.clone());
                         tracing::info!(node_id = %id, "bootstrap: seeded opening location from intro");
                     }
+                }
+            }
+            // (2026-08-22 living-world, the Auto-Harvest Dormancy ruling) An
+            // arcane resource the opening NAMES activates the dormant pool
+            // (Steady — a healthy channel). Only to a dormant field: a
+            // resumed save with the pool already active (or labeled by a
+            // prior harvest) keeps its state.
+            if let Some(ref label) = a.arcana_label {
+                if prior_schema.player_state.mana.is_none() {
+                    prior_schema.player_state.mana = Some(player_state::Mana::Steady);
+                    prior_schema.player_state.mana_label = label.clone();
+                    tracing::info!(label = %label, "bootstrap: arcane pool harvested from intro");
                 }
             }
         }
@@ -11283,6 +15556,22 @@ async fn enter_fable_session(
     // persistence path (autosave, split files, session.json, save slots)
     // keys off it.
     *state.active_session_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id.clone());
+    // (2026-08-24 Part II D1) The MEMORY partition installs from the
+    // session's manifest: absent = the plain card partition (every
+    // original session); present = a BRANCHED playthrough's
+    // `card#session` fork — full post-branch episodic isolation while the
+    // codex partitions stay card-scoped.
+    let memory_partition = fable_save::load_manifest(&fable_root, &card.id, &session_id)
+        .and_then(|m| m.memory_partition)
+        .unwrap_or_else(|| card.id.clone());
+    {
+        let mut slot = state
+            .active_memory_partition
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        tracing::info!(from = %slot.clone(), next = %memory_partition, "memory partition install");
+        *slot = memory_partition;
+    }
     *state.fable_schema.lock().await = prior_schema;
     clear_fable_history(&state).await;
     // (2026-08-22 desync fix) A save-slot entry restores the snapshot's undo
@@ -11321,6 +15610,9 @@ async fn enter_fable_session(
     // player_action from the previous game never fires in this one's first
     // turn. fable_load_save + fable_end run the same clear.
     *state.pending_player_action.lock().await = None;
+    // (2026-08-24 Part II B3) The armed pinned skill DC is the same
+    // one-shot tactile intent — never inherited across a boundary.
+    *state.pending_pinned_skill_dc.lock().await = None;
     // (2026-08-20) The SAME session-boundary drains fable_end runs —
     // entering a game is ALSO a boundary. A previous session that ended
     // while a turn was still unwinding (fable_end refused, the app moved on)
@@ -11338,9 +15630,27 @@ async fn enter_fable_session(
     }
     state.failed_progression_queue.lock().await.clear();
     state.failed_translation_queue.lock().await.clear();
+    // (2026-08-24 fix) The delta queue joins the boundary drains — the
+    // AGENTS contract always claimed it; the clear never existed.
+    state.failed_delta_queue.lock().await.clear();
     // (2026-08-22 tracker feedback loop) Same stale-timeline rule: the prior
     // session's rejected emissions never teach this one's tracker.
     state.tracker_emit_errors.lock().await.clear();
+    // (2026-08-22 living-world) The rest backstop flag is one-shot per
+    // timeline too — a dead session's referee signal never stamps a rest
+    // onto this one's clock.
+    state
+        .pending_rest
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    // (2026-08-23 Playground) Same session-boundary rule for the god flags:
+    // entering a game — fresh OR resumed — never inherits another timeline's
+    // auto-pass/freeze clamps.
+    state
+        .playground_auto_pass
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    state
+        .playground_freeze_clamps
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     // (2026-08-22 desync fix) A save-slot entry OVERWRITES the session
     // folder's live schemas + conversation with the loaded snapshot
     // IMMEDIATELY — the loaded timeline becomes the session's on-disk
@@ -11405,8 +15715,7 @@ async fn enter_fable_session(
     // WINDOW_API_FABLE=16 slice once 16 messages have gone through. Returning
     // it here too would invite a double render (messages + DOM-only path).
     // The beat lives in-file as the `<intro>` sibling after </sim_card>
-    // (2026-08-13); the legacy `.intro` FILE fallback is handled by the seed
-    // block.
+    // (2026-08-13).
     *state.active_fable_card.lock().unwrap_or_else(|e| e.into_inner()) = Some(card);
 
     tracing::info!(?resumed_save_label, session_id = %session_id, "game started: narrator engine live, memory scoped to card, state loaded");
@@ -11435,6 +15744,9 @@ async fn enter_fable_session(
 /// refuse while this is true: a turn finalizing onto a swapped session
 /// appends a ghost beat + restores a schema onto the wrong timeline.
 fn fable_turn_in_flight(state: &AppState) -> bool {
+    if state.retrack_armed.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
     let narrator = state.active_fable_cancel.lock().unwrap_or_else(|e| e.into_inner());
     if narrator.is_some() {
         return true;
@@ -11442,24 +15754,6 @@ fn fable_turn_in_flight(state: &AppState) -> bool {
     drop(narrator);
     let retrack = state.active_retrack_cancel.lock().unwrap_or_else(|e| e.into_inner());
     retrack.is_some()
-}
-
-/// Resolve a bare save_id (no session context — a legacy `.lnk` or an old
-/// frontend payload) to the session folder that owns it: walk the card's
-/// sessions, first hit wins (save ids are ms-stamped; cross-session
-/// collisions are practically impossible).
-fn find_session_owning_save(
-    fable_root: &std::path::Path,
-    card_id: &str,
-    save_id: &str,
-) -> Option<String> {
-    let sessions = fable_save::list_sessions(fable_root, card_id).ok()?;
-    sessions
-        .iter()
-        .find(|s| {
-            fable_save::resolve_save_path(fable_root, card_id, &s.session_id, save_id).exists()
-        })
-        .map(|s| s.session_id.clone())
 }
 
 /// The title-screen CONTINUE button's resume target. Scans every New Game
@@ -11506,6 +15800,24 @@ fn most_recent_continue_target(fable_root: &std::path::Path) -> Option<fable_sav
             continue;
         }
         let card_folder = entry.file_name().to_string_lossy().to_string();
+        // (2026-08-26) The continue target carries the card's PARSED id, not
+        // the display folder name — the display form only ever worked through
+        // fable_start's launch-shortcut folder fallback (and leaked into the
+        // session log as card_id="The Fire Rises — …"). Parse the namesake
+        // .sim once per folder (the same walker cost class as
+        // fable_cards_list). A legacy/non-v2 namesake is INVISIBLE to every
+        // start path, so its saves can't be continued — skip the folder
+        // entirely. A missing/unparseable namesake falls back to the old
+        // folder-name behavior (a saves tree whose card was hand-moved).
+        let namesake = entry.path().join(format!("{card_folder}.sim"));
+        let card = sim_card::load_or_fallback(&namesake);
+        let card_id = if card.id.is_empty() {
+            card_folder.clone()
+        } else if card.card_type == "simulation" && card.format_v2 {
+            card.id.clone()
+        } else {
+            continue;
+        };
         let sessions_dir = fable_root.join("data").join("saves").join(&card_folder);
         let Ok(session_entries) = std::fs::read_dir(&sessions_dir) else {
             continue;
@@ -11525,7 +15837,7 @@ fn most_recent_continue_target(fable_root: &std::path::Path) -> Option<fable_sav
                     continue;
                 }
                 let save_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_owned();
-                if let Some(meta) = read_save_meta_at(&path, &card_folder, &session_id, &save_id) {
+                if let Some(meta) = read_save_meta_at(&path, &card_id, &session_id, &save_id) {
                     // Track the global newest. Autosaves ARE eligible (see
                     // the command doc above).
                     if best.as_ref().map_or(true, |b| meta.timestamp > b.timestamp) {
@@ -11893,12 +16205,13 @@ fn build_narrator_system_prompt(
     out.push_str("Track changes with these brackets (emit one per genuine change this turn — see <emit_order> for exactly when each fires):\n");
     out.push_str("- [TIME Day N, HH:MM] — 24-hour clock; real elapsed time, never a placeholder.\n");
     out.push_str("- [DATE <new calendar label>] — emit the NEW full label verbatim (e.g. \"4th of Harvest, Year 1247, Market Day\") — the whole label is rewritten, no arithmetic. Only when a `date:` anchor is in use.\n");
+    out.push_str("- [REST] — a genuine sleep or long recuperation ended this turn (bare form, no payload).\n");
     out.push_str("- [WEATHER <condition>] — one word: fog, rain, snow, clear, overcast, storm, etc.\n");
     out.push_str("- [TRAVEL <node_id>] — use a node_id from the exits, or name a new destination when leaving the map; the engine links it.\n");
     out.push_str("- [RUMOR <rumor_text>] — the whole phrase is the rumor.\n");
     out.push_str("- [NPC_REGISTER <npc_id> name=<name> (role=<role>) (tier=minion|soldier|elite|boss|legendary)] — the npc_id is the bare first token (never `id=`). Omit tier for civilians.\n");
     out.push_str("- [PRESENCE <npc_id> <stance or micro-location>] — resolves names from the cast line. Example: [PRESENCE mara \"behind the bar, drying a glass\"].\n");
-    out.push_str("- [DISCOVER <node_id> name=<name> (setting=indoor|outdoor) (neighbors=<ids>)] — node_id is the bare first token (never `id=`). Adds a travelable node.\n");
+    out.push_str("- [DISCOVER <node_id> name=<name> (setting=indoor|outdoor|settlement) (neighbors=<ids>)] — node_id is the bare first token (never `id=`). Adds a travelable node. A town, city, or village is setting=settlement (it gets a district-scale site map; ordinary places stay unset).\n");
     // (2026-08-16 audit fix #19) Teach the grammar the parser actually reads:
     // the old `[kind=disguise]` notation (literal brackets) tokenizes as key
     // `[kind` → kind stayed empty → the §7.2 disguise gate NEVER engaged. The
@@ -11906,15 +16219,15 @@ fn build_narrator_system_prompt(
     // form (bracket_parser.rs hoists it before the kv/positional split).
     out.push_str("- [EFFECT <label> buff|debuff <minutes>] — minutes (0 = permanent). Disguises add a trailing kind token: [EFFECT <label> buff <minutes> kind=disguise].\n");
     out.push_str("- [MILESTONE <npc_id> <event_id>] — a relationship meaningfully shifts.\n");
-    out.push_str("- [TASK <npc_id> <description> | <difficulty> <suitability> <eta-minutes>] — all five fields; the pipe separates description from the three trailing fields.\n");
+    out.push_str("- [TASK <npc_id> <description> | <difficulty> <suitability> <eta-minutes>] — all five fields; the pipe separates description from the three trailing fields. A wrong dispatch is worse than a missed one — dispatch only what the NPC is demonstrably doing.\n");
     out.push_str("- [APPEARANCE key=value] — keys: hair_color, eye_color, scars, wounds, tattoos, disguise, body_type, skin_complexion, hair_length, hair_style, breast_size, ears, tail, horn. Bare [APPEARANCE key] clears.\n");
     // (2026-08-19 NPC-perception upgrade) layer= is deliberately NOT taught:
     // the applier's common-sense placement owns layering (cloak over shirt,
     // socks under boots, footwear swaps). The parser still accepts an explicit
     // layer=outer|inner (respected verbatim) for training-residue emissions.
     out.push_str("- [EQUIP slot=<slot> name=<item> (stats=<note>) (tags=<tags>)] — slots: head, neck, chest, arms, hands, main_hand, off_hand, legs, feet (necklace → neck, bracers/gloves → arms/hands). main_hand/off_hand are READIED weapons only — belt-hung blades go in [BELT]. Bare [EQUIP slot=<slot>] unequips. Quote multi-word names.\n");
-    out.push_str("- [BELT name=<item> (qty=N) (tags=<tags>)] / [BELT -<name>] — quick-access items (a belt knife, a potion, a pouch).\n");
-    out.push_str("- [PACK name=<item> (qty=N) (tags=<tags>)] / [PACK -<name>] — deep storage add/remove; check the pack line first.\n");
+    out.push_str("- [BELT name=<item> (qty=N) (tags=<tags>)] / [BELT -<name>] — quick-access items hung on the belt (a belt knife, a potion, a whetstone).\n");
+    out.push_str("- [PACK name=<item> (qty=N) (tags=<tags>)] / [PACK -<name>] — storage add/remove; wallet cargo (coin, keys, ID, gems) files itself into the pouch automatically; check the pack and pouch lines first.\n");
     // (2026-08-18 Dedicated-NPC interior state) The NPC-interior verbs —
     // what an on-camera NPC holds, feels, and is about. Emit only for
     // REGISTERED NPCs (the cast line); the applier rejects unknown ids.
@@ -11931,9 +16244,22 @@ fn build_narrator_system_prompt(
     // (2026-08-21 Chloe ruling) The core-tier degrade that conditionally
     // stripped these blocks is REMOVED — the teaching is unconditional;
     // overflow fails loudly instead of silently degrading.
-    out.push_str("- [ROOM <area_id> visited|discovered] — the player entered (bare form = visited) or learned of a room of the current site. Ids come from the site block.\n");
-    out.push_str("- [ASSET <asset_id> dead|taken|triggered|active|known|suspected|count=N] — a site creature/trap/loot/object changed; add form: [ASSET +<name> kind=<creature|group|trap|hazard|loot|object> loc=<area_id> (count=N) (detail=…)].\n");
-    out.push_str("- [PROMISE <npc_id> <description> | <minutes>] — the player accepted an obligation; fulfilled/reneged: [PROMISE <npc_id> -<description>].\n");
+    out.push_str("- [ROOM <area_id> visited|discovered] — the player entered (bare form = visited) or learned of a room of the current site. Ids come from the site block. A building id in visited form enters that structure (its rooms then replace the district in the site block); targeting a district area from inside exits back out.\n");
+    // (2026-08-22 multihog WS2) The barred-way verb — the [ROOM] gate's
+    // counterpart: entering a locked room REJECTS until the narrative
+    // establishes the opening and [UNLOCK] flips it.
+    out.push_str("- [UNLOCK <area_id>] — the narrative opened a locked way (a key turned, a bar lifted). Blocked passages need physical change, never this; an open way needs nothing.\n");
+    out.push_str("- [ASSET <asset_id> dead|taken|triggered|deactivated|disarmed|fleeing|fled|active|known|suspected|count=N] — a site creature/trap/loot/object changed (disarmed/deactivated = a trap or mechanism neutralized; fleeing/fled = broke off); add form: [ASSET +<name> kind=<creature|group|trap|hazard|loot|object|building> loc=<area_id> (count=N) (detail=…)] (building = a significant structure on a district map, entered via [ROOM]).\n");
+    out.push_str("- [PROMISE <npc_id> <description> | <minutes>] — the player accepted an obligation; fulfilled/reneged: [PROMISE <npc_id> -<description>]. When the obligation targets a mapped room, add area=<that room id from the site block> to the form.\n");
+    // (2026-08-22 living-world) The quest verb + the arcane-pool verb — one
+    // TIGHT line each (the always-on bracket list pays per byte; the
+    // objectives law rides compactly here, not as a separate block).
+    out.push_str("- [QUEST new <id> giver=<npc_id|player> (area=<room id from the site block>) <title> | <minutes>] (reward=<text>) / [QUEST update <id> <objective> (cur=N total=M)] / [QUEST update <id> done <objective>] / [QUEST update <id> area=<room id>] (re-anchor when the target moves) / [QUEST done|fail <id>] — objectives are countable acts; difficulty lives in the world's situation, never in a number; objectives are multiple, countable, immediately obtainable acts whose completion is clearly determinable — never vague long-term goals; on acceptance the beat states giver, location, task, objective count, time pressure, and reward.\n");
+    out.push_str("- [ARCANA <label>] — emit ONCE when narration first names the arcane resource (mana, biotics, rage); afterwards steps: [ARCANA +1] / [ARCANA -1].\n");
+    // (2026-08-22 multihog WS1) The timed-lapse verb — one TIGHT line (the
+    // always-on bracket list pays per byte). The engine fires the lapse on
+    // the clock; the tracker only ARMS it.
+    out.push_str("- [EXPIRY <entity-key|asset_id@node> | +<minutes> or <absolute time>] — arm a timed lapse (a disguise wears off, a repair holds until dusk); the engine expires it on its own, never re-emit.\n");
     // (2026-08-20 Economy) The money & management verb — property tills,
     // jobs, lifestyle, prosperity. Till ops AND buy are NODE-GATED (be there
     // to transact); the ledger line in <world_state> lists live properties
@@ -11943,7 +16269,7 @@ fn build_narrator_system_prompt(
     // incl. the owner= kv kept.)
     out.push_str("- [LEDGER found <id> node=<n> kind=<business|estate|settlement> revenue=<r> upkeep=<u> (owner=<npc_id>)] — a property enters play where the player stands or a listed exit leads.\n");
     out.push_str("- [LEDGER deposit|withdraw|invest <amount> <id>] / [LEDGER buy <id>] — pocket↔till + purchase, standing at its node; invest raises revenue. [LEDGER wealth +<n>|-<n>] — pocket coin gained or spent (payments, tips, loot, rewards; spend only what the wealth line holds). [LEDGER lifestyle <squatter|modest|comfortable|aristocratic>] / [LEDGER job <title> node=<n> wage=<w>] / [LEDGER job -<title>] / [LEDGER prosperity <node_id> <pct>] — upkeep tier, work taken or left, or a location's fortunes (25-200). [LEDGER currency <name>] — emit ONCE when narration first names the money unit (dollars, or tiers highest-first gold/silver/copper); all amounts are the lowest unit, the engine formats them.\n");
-    out.push_str("Tags (EQUIP/BELT/PACK): consumable, equippable, pocketable — see <item_rules> above.\n");
+    out.push_str("Tags (EQUIP/BELT/PACK): consumable, equippable, pouchable — see <item_rules> above.\n");
     // NOTE (#26c, 2026-08-15): `CharacterTurn` / `Object` / `Fx` are
     // LEGACY-RECOGNIZED only — the parser + streaming filter still accept +
     // strip them (a safety net for model-training residue), but they are
@@ -12179,7 +16505,7 @@ fn normalize_dialogue(span: &str) -> String {
 /// [`detect_repeated_dialogue`] (≥3 occurrences, ≥2 distinct assistant
 /// messages) but over the QUOTE-STRIPPED narration body — dialogue is the
 /// other detector's domain, a beat never double-fires both. Non-verbatim
-/// family repetition (smirk → grin) is `<freshness>`'s prompt law; this
+/// family repetition (smirk → grin) is `<variation>`'s prompt law; this
 /// catches only word-exact recurrence, normalized case/punctuation-
 /// insensitively (the same contract as `normalize_dialogue`).
 pub(crate) fn detect_repeated_narration(window: &[session::Message]) -> Option<(String, usize)> {
@@ -12369,7 +16695,12 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
              \"09:00\" or \"late morning\"), weather (e.g. \"clear\", \"heavy rain\"), \
              tone (the STORY's narrative atmosphere of the whole card, e.g. \"grim low \
              fantasy\", \"cozy slice-of-life\" — NEVER a character's personal speaking \
-             voice), location (the opening place name).\n\
+             voice), location (the opening place name — ONE specific concrete place \
+             the first scene actually stands in: a room, building, landmark, street, \
+             or town at most; NEVER a planet, continent, country, or any other \
+             region-scale label, and NEVER parenthetical qualifiers or meta-notes \
+             like \"(variable by scene)\" — the plain name alone, nothing more; the \
+             wider world emerges in play).\n\
              NPC BRANCH (card_type \"npc\") — the character IS the card: the identity \
              fields (gender, age, race, skin_complexion, height, weight, body_type, \
              hair_color, hair_length, hair_style, eye_color, + contextual breast_size \
@@ -12408,8 +16739,10 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
              whether they want an INTRO (the opening narrator beat that starts the \
              game). If yes, ask what they'd like it to be — or offer to write one \
              yourself from the card's tone and anchors if they have no preference — \
-             and set draft.intro to the agreed 2-4 sentence opening (second person, \
-             present tense, no dialogue tags or bracket commands). If the player \
+             and set draft.intro to the agreed 2-4 sentence opening (third person \
+             limited on the player character, past tense, no dialogue tags or \
+             bracket commands; the player character carries no name or identity \
+             here, plain references like \"the newcomer\" only). If the player \
              declines, leave intro empty AND set draft.intro_answered to false (a \
              missing intro with no intro_answered marker means you never asked — \
              that draft is invalid). An imported card's first_mes / \
@@ -12442,7 +16775,7 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
     out.push_str(
         "INPUT CURATION — format the user's words into game-ready fields, never \
          transcribe them raw:\n\
-         - Array/chip fields (clothing, gear, tools, weapons): parse \
+         - Array/chip fields (clothing, equipped, accessories, stored): parse \
          conversational input into clean title-cased items. \"a worn-out iron \
          broadsword with a notched hilt\" becomes \"Notched Iron Broadsword\".\n\
          - Prose fields (backstory, job, goal, personality, likes, dislikes, \
@@ -12494,8 +16827,33 @@ fn render_fable_world_state(
     s: &schema::WorldSchema,
     turn_directives: &[String],
     reveal_beneath: bool,
+    gm_hidden: bool,
 ) -> String {
     let mut rendered = s.render_for_prompt_with_beneath(reveal_beneath);
+
+    // (2026-08-22 multihog WS2) The GM hidden-contents block — HER eyes
+    // only. Appended directly after the standard `site:` slice (never
+    // inside it — the tracker's site-slice SWAP must not carry it). The
+    // flag is the leak gate: the API narrator's turn tail + the dev
+    // local-narrator arm pass `true`; the TRACKER path passes `false` (the
+    // E4B tracker may never see hidden truth — it would leak it into
+    // brackets), and `to_json_prompt`/saves/session messages never render
+    // world_state at all.
+    if gm_hidden {
+        // (2026-08-23 hosted interiors) The resolver law: the hidden-truth
+        // block anchors on the ACTIVE map (1-hop from the room the player
+        // stands in, building included).
+        if let Some(block) = s
+            .travel_graph
+            .current_node
+            .as_deref()
+            .and_then(|cur| site_map::active_site_map_key(&s.site_maps, Some(cur)))
+            .and_then(|k| s.site_maps.get(&k).map(|m| (k, m)))
+            .and_then(|(_, m)| site_map::render_gm_hidden_slice(m, s.world_clock.current_minutes))
+        {
+            rendered = insert_after_site_block(&rendered, &block);
+        }
+    }
 
     // Condition + active status tags (Phase 3 Slice 2 + 4 render). Expired
     // tags don't count (2026-08-16 audit M1) — the tick's sweep is suspended
@@ -12536,6 +16894,48 @@ fn render_fable_world_state(
     }
 
     rendered
+}
+
+/// (2026-08-22 multihog WS2) Insert the GM hidden-contents block directly
+/// after the rich render's `site:` slice (the multi-line indented block),
+/// so the hidden truth rides beside the knowledge-filtered interior it
+/// augments. A no-op passthrough when no site block exists (a GM block
+/// without the site it annotates would float contextlessly). Pure.
+fn insert_after_site_block(rendered: &str, block: &str) -> String {
+    let mut out = String::with_capacity(rendered.len() + block.len() + 2);
+    let mut inserted = false;
+    let mut in_site = false;
+    for line in rendered.lines() {
+        if in_site {
+            if line.starts_with("  ") {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            in_site = false;
+            if !inserted {
+                out.push_str(block);
+                out.push('\n');
+                inserted = true;
+            }
+        }
+        if line == "site:" {
+            in_site = true;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    if in_site && !inserted {
+        // The site block ran to the end of the render.
+        out.push_str(block);
+        out.push('\n');
+        inserted = true;
+    }
+    if inserted {
+        out
+    } else {
+        rendered.to_string()
+    }
 }
 
 /// (2026-08-16 tracker-budget fix; caps RAISED 2026-08-21 on the Chloe
@@ -12595,6 +16995,10 @@ struct LeanCaps {
     events_shown: usize,
     event_chars: usize,
     pack: usize,
+    /// (2026-08-23 pouch ruling) The `pouch:` line cap — mirrors the pack
+    /// tiers (the wallet is bounded at 16 rendered entries, ≈ the pack line's
+    /// worst case).
+    pouch: usize,
     custom: usize,
     /// (2026-08-19 Hidden site maps) The `site:` line cap — the tracker's
     /// slice is ids, not prose, but a full 8-area site with doors + 16
@@ -12607,6 +17011,10 @@ struct LeanCaps {
     /// id + numbers (light), but 8 holdings × deficit markers is still a
     /// long single line.
     ledger: usize,
+    /// (2026-08-22 living-world) The `quests:` line cap — entries are title
+    /// + giver + objectives; the render shows 5 + marker, and this cap is
+    /// the hand-edited-save backstop (the render's own bound comes first).
+    quests: usize,
     /// `None` = the cast line passes through uncapped (stage 0 — it is
     /// the [PRESENCE] id whitelist, clipped only under real pressure).
     cast: Option<usize>,
@@ -12621,8 +17029,10 @@ struct LeanCaps {
 // at the count caps: 16 presences ×120-char stances, 16 minds entries ×
 // 200-char cap, 6 wearing / 6 holding rack-holders, 8 promises, 10 rumors,
 // 6 events, 20 cast, 16 pack, 10 bonds, 8 ledger, and the FULL compact
-// site slice (8 areas × 6 doors + 16 assets ≈ 2.4k with long ids). A real
-// campaign at stage 0 sees everything the schema tracks — no ellipsis.
+// site slice (8 areas × 6 doors + 16 assets ≈ 2.4k with long ids).
+// (2026-08-23 hosted interiors) +200 for the `in <settlement> >
+// <building>; ` breadcrumb prefix while inside — the no-ellipsis stage-0
+// contract covers the building composition too.
 const STAGE0: LeanCaps = LeanCaps {
     present: 2_400,
     minds: 3_300,
@@ -12633,11 +17043,13 @@ const STAGE0: LeanCaps = LeanCaps {
     events_shown: 6,
     event_chars: 300,
     pack: 650,
+    pouch: 650,
     custom: 800,
-    site: 2_400,
+    site: 2_600,
     bonds: 500,
     owed: 1_800,
     ledger: 550,
+    quests: 1_100,
     cast: None,
 };
 // Stage 1 — pathological composition: narrative context shrinks first.
@@ -12652,11 +17064,13 @@ const STAGE1: LeanCaps = LeanCaps {
     events_shown: 5,
     event_chars: 260,
     pack: 500,
+    pouch: 500,
     custom: 500,
     site: 1_600,
     bonds: 400,
     owed: 1_300,
     ledger: 400,
+    quests: 800,
     cast: None,
 };
 // Stage 2 — extreme composition: everything clipped, cast included.
@@ -12670,11 +17084,13 @@ const STAGE2: LeanCaps = LeanCaps {
     events_shown: 4,
     event_chars: 220,
     pack: 400,
+    pouch: 400,
     custom: 350,
     site: 1_000,
     bonds: 300,
     owed: 800,
     ledger: 300,
+    quests: 500,
     cast: Some(900),
 };
 /// (2026-08-21 Chloe rulings — morning 8192/no-degrade + evening "never
@@ -12698,7 +17114,7 @@ const STAGE2: LeanCaps = LeanCaps {
 const WS_BUDGET: usize = 18_000;
 
 fn render_tracker_world_state(s: &schema::WorldSchema) -> String {
-    let mut rich = render_fable_world_state(s, &[], false);
+    let mut rich = render_fable_world_state(s, &[], false, false);
     // (2026-08-19 Hidden site maps) The TRACKER gets the compact id-bearing
     // site slice, not the narrator prose: swap the multi-line `site:` block
     // for the single-line ids + doors (a door's TARGET id is exactly how an
@@ -12708,8 +17124,30 @@ fn render_tracker_world_state(s: &schema::WorldSchema) -> String {
         .travel_graph
         .current_node
         .as_deref()
-        .and_then(|cur| s.site_maps.get(cur))
-        .and_then(site_map::render_tracker_slice)
+        // (2026-08-23 hosted interiors) The resolver law: the tracker's
+        // compact slice carries the ACTIVE map (the building's ids while
+        // inside) — the breadcrumb rides in front so the tracker knows
+        // which structure it is tracking.
+        .and_then(|cur| {
+            site_map::active_site_map_key(&s.site_maps, Some(cur)).and_then(|k| {
+                s.site_maps
+                    .get(&k)
+                    // (2026-08-22 living-world) `now` rides in — stale terminal
+                    // assets collapse out of the id list (remnants count instead).
+                    .and_then(|m| site_map::render_tracker_slice(m, s.world_clock.current_minutes))
+                    .map(|slice| {
+                        if k.as_str() == cur {
+                            return slice;
+                        }
+                        let building =
+                            site_map::hosted_breadcrumb(&s.site_maps, &s.travel_graph, &k);
+                        match building {
+                            Some(bc) => format!("in {bc}; {slice}"),
+                            None => slice,
+                        }
+                    })
+            })
+        })
     {
         rich = swap_site_block_for_tracker(&rich, &compact);
     }
@@ -12833,6 +17271,10 @@ fn lean_world_state_surgery(rich: &str, caps: &LeanCaps) -> String {
             Some(format!("summary: {}", lean_truncate_line(v, caps.summary)))
         } else if let Some(v) = line.strip_prefix("pack: ") {
             Some(format!("pack: {}", lean_truncate_line(v, caps.pack)))
+        } else if let Some(v) = line.strip_prefix("pouch: ") {
+            // (2026-08-23 pouch ruling) The wallet line — same discipline as
+            // the pack line.
+            Some(format!("pouch: {}", lean_truncate_line(v, caps.pouch)))
         } else if let Some(v) = line.strip_prefix("custom: ") {
             Some(format!("custom: {}", lean_truncate_line(v, caps.custom)))
         } else if let Some(v) = line.strip_prefix("site: ") {
@@ -12844,6 +17286,10 @@ fn lean_world_state_surgery(rich: &str, caps: &LeanCaps) -> String {
             Some(format!("owed: {}", lean_truncate_line(v, caps.owed)))
         } else if let Some(v) = line.strip_prefix("ledger: ") {
             Some(format!("ledger: {}", lean_truncate_line(v, caps.ledger)))
+        } else if let Some(v) = line.strip_prefix("quests: ") {
+            // (2026-08-22 living-world) The quest line cap — same
+            // boundary-preferring cut as every list line.
+            Some(format!("quests: {}", lean_truncate_line(v, caps.quests)))
         } else if let (Some(v), Some(cap)) = (line.strip_prefix("cast: "), caps.cast) {
             Some(format!("cast: {}", lean_truncate_line(v, cap)))
         } else {
@@ -12973,6 +17419,52 @@ impl Drop for FableCancelSlotGuard {
     }
 }
 
+/// (2026-08-24) RAII marker for the edit→re-track window: arms
+/// [`AppState::retrack_armed`] on creation and clears it on Drop, so every
+/// exit path (including `?` unwinds between `apply_edit` and the re-track's
+/// own cancel-token mint) leaves the flag down. The flag is the ONLY guard
+/// covering that window — a Save or narrator turn landing there pairs an
+/// edited beat with a pre-re-track schema.
+struct RetrackArmedGuard(Arc<std::sync::atomic::AtomicBool>);
+impl RetrackArmedGuard {
+    fn arm(state: &tauri::State<'_, AppState>) -> Self {
+        state
+            .retrack_armed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Self(Arc::clone(&state.retrack_armed))
+    }
+}
+impl Drop for RetrackArmedGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// (2026-08-24) RAII single-flight guard for the world-progression tick:
+/// emits `world-tick-begin` on acquire; on Drop (every exit — identity-guard
+/// returns, LLM failure, success, unwinds) clears the flag + emits
+/// `world-tick-end`. The events are the frontend busy signal that keeps the
+/// Soul Gem / raw editor gate red through the whole post-`done` window.
+struct WorldTickFlightGuard {
+    app: tauri::AppHandle,
+    flag: Arc<std::sync::atomic::AtomicBool>,
+}
+impl WorldTickFlightGuard {
+    fn new(app: &tauri::AppHandle, flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        let _ = app.emit("world-tick-begin", ());
+        Self {
+            app: app.clone(),
+            flag,
+        }
+    }
+}
+impl Drop for WorldTickFlightGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, std::sync::atomic::Ordering::Release);
+        let _ = self.app.emit("world-tick-end", ());
+    }
+}
+
 /// Empty a cancel slot only when it still points at `token` — the #46
 /// concurrent-turn race fix. A newer turn that overwrote the slot owns it;
 /// the older turn's cleanup must not strand the live token.
@@ -13066,6 +17558,10 @@ async fn restore_tick_directives(state: &AppState, snapshot: &[String]) {
 /// (left-drawer Consume/Equip) was consumed at turn start; every abort path
 /// re-arms it so the retry turn still honors the tactile UI action instead
 /// of silently eating it.
+/// (2026-08-24) `history_depth`: the turn-start undo-ring depth — the ring
+/// is truncated back to it so the aborted turn leaves no undo entry (the
+/// schema restore above plus a stale ring entry would let the next Undo
+/// resurrect the dead turn's world state).
 /// Capped, whitespace-collapsed echo of an id/name the tracker emitted —
 /// used inside reject-directive text so the model sees exactly what it sent.
 /// (The one survivor of the retired logs::brief previewer: these strings
@@ -13089,6 +17585,7 @@ async fn emit_fable_api_lost(
     pop_trailing_user_turn: bool,
     restore_schema: Option<schema::WorldSchema>,
     restore_player_action: Option<String>,
+    history_depth: usize,
 ) -> Result<(), String> {
     // Cancel-slot hygiene lives in the caller's FableCancelSlotGuard (#46):
     // every `emit_fable_api_lost` call site is a `return` from `fable_send`,
@@ -13116,10 +17613,19 @@ async fn emit_fable_api_lost(
     if let Some(base) = restore_schema {
         *state.fable_schema.lock().await = base;
     }
+    // (2026-08-24) The dead turn's ring entries die with it — the schema
+    // restore above must not leave an undo target back INTO the turn.
+    truncate_fable_history_to_depth(state, history_depth).await;
     // Re-arm the consumed manual player_action (see the fn doc).
     if let Some(pa) = restore_player_action {
         *state.pending_player_action.lock().await = Some(pa);
     }
+    // (2026-08-22 living-world) Disarm the Recovery Referee's rest backstop:
+    // the referee armed it for a turn that is now reverting — a surviving
+    // flag would stamp a phantom rested anchor onto the NEXT turn's [TIME].
+    state
+        .pending_rest
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     // Autosave (best-effort) — identical to the normal turn-finalize autosave.
     // (2026-08-16 deferred-2) Snapshot-at-enqueue via the shared helper: the
     // api_lost reverts just completed above, so the captured pairing is the
@@ -13299,6 +17805,16 @@ async fn fable_send(
     // state. Runs FIRST (P3 #20) so a no-API call pays neither the schema
     // lock nor the possible tracker-context engine spawn below.
     require_api_for_fable(&state)?;
+    // (2026-08-24) Refuse while an edit's re-track window is armed: the beat
+    // text has mutated but the world hasn't re-tracked yet — a turn starting
+    // here would track on top of the pre-edit schema, then the re-track's
+    // base revert would discard the new turn's tracker mutations.
+    if state
+        .retrack_armed
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err("an edit is being re-tracked: try again in a moment".into());
+    }
 
     // (2026-08-15 audit fix) Server-side action cap: a giant paste would
     // front-drain the tracker's context past its budget (the
@@ -13343,6 +17859,15 @@ async fn fable_send(
         let guard = state.active_fable_card.lock().unwrap_or_else(|e| e.into_inner());
         guard.clone().ok_or_else(|| "no active game card: call fable_start first".to_string())?
     };
+    // (2026-08-24 Part II D1) The turn's MEMORY routing key — the branch
+    // partition (`card#session`) when this session is a branch, else the
+    // card id itself. Cloned at turn start so the detached archival spawn
+    // below stays immune to slot swaps (the card_id discipline).
+    let memory_partition = state
+        .active_memory_partition
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
     // (2026-08-16 bug 8) Session generation at turn START: the deferred
     // world-progression tick compares against it at fire time. A session
     // boundary can only pass its guards once this turn's cancel slot is
@@ -13463,6 +17988,13 @@ async fn fable_send(
         let mut g = state.pending_player_action.lock().await;
         g.take()
     };
+    // (2026-08-24 Part II B3) The one-shot pinned skill DC (a committed
+    // Crossroads declaration) — consumed BEFORE the schema lock so the
+    // referee block below reads it atomically with the world render.
+    let pinned_skill_dc: Option<(String, u32)> = {
+        let mut g = state.pending_pinned_skill_dc.lock().await;
+        g.take()
+    };
 
     // (#25) Pre-referee snapshot: the world BEFORE this turn's Referee
     // mutations. The api_lost path restores THIS (not the post-referee
@@ -13472,6 +18004,13 @@ async fn fable_send(
     // keeps restoring `base_schema_snapshot` (the message's stored pre-turn
     // world, an even earlier point).
     let pre_referee_schema: schema::WorldSchema = state.fable_schema.lock().await.clone();
+
+    // (2026-08-24) Turn-start undo-ring depth. Captured BEFORE any push this
+    // turn can mint (the referee-phase push, the tracker's bracket/TIME
+    // pushes, the site-architect pushes); every abort/cancel/error exit
+    // below truncates the ring back to this depth so a dead turn leaves no
+    // undo entry (see `truncate_fable_history_to_depth`).
+    let history_depth_at_turn_start = state.fable_schema_history.lock().await.len();
 
     // (2026-08-16 audit fix #10) Full directive snapshot at turn start, taken
     // BEFORE the referee block drains the queue. Every revert path below
@@ -13494,7 +18033,7 @@ async fn fable_send(
     // die with it while the tracker stage still referenced it.)
     let mut turn_notices: Vec<(&'static str, String)> = Vec::new();
 
-    let (world_state, pacing, mut turn_directives, referee_undo) = {
+    let (world_state, pacing, mut turn_directives, referee_undo, proximity_terms, skills_before) = {
         let mut s = state.fable_schema.lock().await;
 
         // (1) Scene pacing FIRST — its DC modifier threads into (3).
@@ -13645,7 +18184,11 @@ async fn fable_send(
                 .travel_graph
                 .current_node
                 .as_deref()
-                .and_then(|cur| s.site_maps.get(cur))
+                // (2026-08-23 hosted interiors) The resolver law: the mob
+                // read anchors on the ACTIVE map — inside a building, ITS
+                // creatures set the stakes, not the district's.
+                .and_then(|cur| site_map::active_site_map_key(&s.site_maps, Some(cur)))
+                .and_then(|k| s.site_maps.get(&k))
                 .and_then(site_map::present_mob_tier);
             // `select_attacker_tier_from_entities` returns a concrete tier
             // (Soldier floor when no on-camera NPC declares one), so only the
@@ -13657,7 +18200,49 @@ async fn fable_send(
             };
             combined
         };
-        let combat_directive: Option<String> = if let Some(outcome) =
+        // (2026-08-22 Chloe ruling — traversal is exertion, damage is
+        // consequence-only) Transit-only text (climb/sprint/leap… with no
+        // violence verb and no hazard) never reaches the injury Referee —
+        // `referee_evaluate_with_tier` returns None on the gate. The turn
+        // instead pays the one-step stamina tax HERE, with a player-facing
+        // notice on the same buffered channel the injury bubble uses (a
+        // cancelled/reverted turn discards the notice with the schema).
+        let transit_lower = player_state::strip_dialogue(&text).to_lowercase();
+        if player_state::transit_only_exertion(&transit_lower) {
+            let stamina_before = s.player_state.stamina;
+            s.player_state.stamina.drain();
+            if s.player_state.stamina != stamina_before {
+                if undo_snapshot.is_none() {
+                    undo_snapshot = Some(s.clone());
+                }
+                mutated = true;
+                let word = format!("{:?}", s.player_state.stamina).to_lowercase();
+                turn_notices.push((
+                    "injury",
+                    format!("The exertion takes its toll — stamina {word}."),
+                ));
+                tracing::info!(
+                    stamina = ?s.player_state.stamina,
+                    "transit exertion tax applied (no injury roll — 2026-08-22 Chloe ruling)"
+                );
+            }
+        }
+        // (2026-08-23 Playground) God-mode AUTO-PASS, read once for this
+        // turn's referee block: skips the combat outcome block entirely
+        // (no injury, no notice, no directive) + forces skill-check
+        // success. Session-scoped AtomicBool — see the AppState field docs.
+        // (FREEZE CLAMPS lives in apply_time_command_and_maybe_tick, where
+        // every survival stamp it governs is applied.)
+        let playground_auto_pass = state
+            .playground_auto_pass
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let combat_directive: Option<String> = if playground_auto_pass {
+            // (2026-08-23 Playground) AUTO-PASS — combat: the injury
+            // Referee's whole outcome block is skipped. No roll, no injury,
+            // no notice, no directive: the god player cannot be hurt.
+            tracing::info!("[playground] auto-pass: combat referee skipped");
+            None
+        } else if let Some(outcome) =
             player_state::referee_evaluate_live(
                 &text,
                 &s.player_state,
@@ -13713,6 +18298,16 @@ async fn fable_send(
         // `health_dc_mod` (NOT the displayed tier's modifier): the wound
         // grade keeps priority over a Sick label at Poor+ (Chloe ruling —
         // a fever never makes a Critical body easier to pick locks with).
+        // (2026-08-22 living-world) The DC also carries VIGOR — the worse
+        // of the stamina grade and the ACTIVE mana grade (the alignment
+        // table: Fresh/Surging +4 … Depleted/Spent −4, negated into DC
+        // units). A dormant pool contributes nothing.
+        // (2026-08-23 dynamic DCs) The DC also carries STAKES — the
+        // `combined` tier computed above (on-camera NPC tier max the ACTIVE
+        // site map's mob tier, resolver-routed) through
+        // `AttackerTier::skill_dc_mod`. Picking a lock under a legend's gaze
+        // is a different DC than picking one in an empty alley; the ladder
+        // is pure Rust, the model never sees a number to nudge.
         let skills = player_state::referee_evaluate_skill_checks(
             &text,
             pacing.mode.dc_modifier(),
@@ -13721,6 +18316,22 @@ async fn fable_send(
                 &s.status_tags,
                 s.world_clock.current_minutes,
             ),
+            player_state::vigor_dc_mod(s.player_state.stamina, s.player_state.mana),
+            attacker_tier.skill_dc_mod(),
+            // (2026-08-23 hazard referees) The live entity map — a declared
+            // `skill_*` rank lowers ITS skill's DC through the
+            // one-directional proficiency ladder (the panel's own bars feed
+            // it). No dice change: the mod shifts the DC, never the seed.
+            &s.entities,
+            // (2026-08-23 Playground) AUTO-PASS — every triggered skill
+            // forces SUCCESS (an explicit god input, never a seed change).
+            playground_auto_pass,
+            // (2026-08-24 Part II B3) The committed Crossroads DC, if the
+            // player picked an option that declared one — verbatim for the
+            // matching skill, this turn only.
+            pinned_skill_dc
+                .as_ref()
+                .map(|(name, dc)| (name.as_str(), *dc)),
         );
 
         // (3a) Phase 4 §11.44 (Component 1): Disguise Referee — the Rust-side
@@ -13755,6 +18366,9 @@ async fn fable_send(
                     &s.status_tags,
                     s.world_clock.current_minutes,
                 ),
+                // (2026-08-22 living-world) Vigor threads here too (the
+                // health-modifier symmetry).
+                player_state::vigor_dc_mod(s.player_state.stamina, s.player_state.mana),
                 s.world_clock.current_minutes,
             )
         };
@@ -13804,6 +18418,14 @@ async fn fable_send(
             }
             player_state::apply_recovery(&mut s.player_state, &r);
             mutated = true;
+            // (2026-08-22 living-world) Arm the rested anchor's backstop —
+            // the Recovery Referee firing IS deterministic evidence of a
+            // genuine rest; `apply_time_command_and_maybe_tick` consumes
+            // this + stamps `last_rest_minutes` even when the tracker
+            // forgot [REST].
+            state
+                .pending_rest
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             let mut line = String::from("The player rests and recovers:");
             if r.stamina_recovered {
                 line.push_str(&format!(
@@ -13827,6 +18449,43 @@ async fn fable_send(
             line
         });
 
+        // (3a2) (2026-08-23 hazard referees) LOOT RARITY — one roll per
+        // turn over the turn text (hard stems fire alone; soft search/
+        // check/open/strip stems need a container word). The stakes are
+        // the SAME `combined` tier the combat referee read (on-camera NPC
+        // tier max the ACTIVE site map's mob tier) + the CURRENT node's
+        // prosperity; Chloe's 6-rung ladder lands the rarity, the
+        // post-roll tier cap bounds it (a Nat 20 at a Minion camp stays
+        // Rare). Turn-scoped like the skill checks — no schema mutation,
+        // no undo push; the directive fixes the BEST recoverable quality,
+        // and the item itself still enters play through the tracker's
+        // existing [PACK]/[ASSET … Taken] emissions.
+        let loot_directive: Option<String> = {
+            let prosperity = s
+                .travel_graph
+                .current_node
+                .as_deref()
+                .and_then(|cur| s.travel_graph.nodes.iter().find(|n| n.id == cur))
+                .map(|n| n.prosperity)
+                .unwrap_or(economy::PROSPERITY_DEFAULT);
+            hazard::referee_evaluate_loot(
+                &text,
+                attacker_tier,
+                prosperity,
+                s.world_clock.current_minutes,
+            )
+            .map(|o| {
+                tracing::info!(
+                    rarity = %o.rarity.label(),
+                    roll = o.roll,
+                    total = o.total,
+                    capped = o.capped,
+                    "loot rarity referee fired"
+                );
+                o.directive
+            })
+        };
+
         // (3b) Combat lethality directive (Slice 3): same injection path as
         // skill checks — the narrator sees ONE `<directives>` block with all
         // hard facts for the turn (combat lethality + skill outcomes).
@@ -13842,7 +18501,9 @@ async fn fable_send(
         // Assemble the turn-scoped directives in priority order: lethality
         // first (most consequential), then the disguise outcome (scene-
         // establishing — "your disguise holds" / "scrutinized: FAIL"), then
-        // skill checks, then off-screen tick directives (background facts).
+        // skill checks, then the recovery outcome, then the loot rarity
+        // (2026-08-23 hazard referees), then off-screen tick directives
+        // (background facts).
         // §11.41 (2026-07-28): these are returned alongside the world-state
         // render so the API branch can RE-render world-state after the
         // tracker stage mutates the schema — the Referees run ONCE (pre-
@@ -13863,6 +18524,9 @@ async fn fable_send(
         if disguise_directive.is_some() {
             tracing::info!("disguise gate directive injected");
         }
+        if loot_directive.is_some() {
+            tracing::info!("loot rarity directive injected");
+        }
         if !tick_directives.is_empty() {
             tracing::info!(
                 count = tick_directives.len(),
@@ -13880,6 +18544,9 @@ async fn fable_send(
         }
         if let Some(rd) = &recovery_directive {
             turn_directives.push(rd.clone());
+        }
+        if let Some(ld) = &loot_directive {
+            turn_directives.push(ld.clone());
         }
         for td in &tick_directives {
             turn_directives.push(td.clone());
@@ -13908,10 +18575,30 @@ async fn fable_send(
         let _ = mutated; // (kept for clarity; undo_snapshot.is_some() is the real gate)
 
         let world_state_opt = if rendered.trim().is_empty() { None } else { Some(rendered) };
+        // (2026-08-24 Part II B6) Scene-proximity terms for the retrieval
+        // tie-break: every PRESENT NPC's name + the current travel node id.
+        // Built inside the schema lock (the schema leaves scope with the
+        // block), consumed by the codex retrieval below.
+        let proximity_terms = crate::memory_rrf::SceneProximityTerms::new(
+            s.presences
+                .iter()
+                .map(|p| p.name.clone())
+                .chain(s.travel_graph.current_node.iter().cloned())
+                .collect(),
+        );
+        // (2026-08-24 Part II B8) PRE-tracker skill ranks — the
+        // rank-advance toast's before-half; the after-half snapshots right
+        // below the tracker's bracket apply.
+        let skills_before: Vec<(String, serde_json::Value)> = s
+            .entities
+            .iter()
+            .filter(|(k, _)| k.starts_with("skill_") || k.starts_with("skill."))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
         // (2026-08-16 audit fix #10) The drained directive set no longer rides
         // out of this block — every revert path restores the FULL turn-start
         // snapshot (`directives_at_turn_start`), which includes it in order.
-        (world_state_opt, pacing, turn_directives, undo_snapshot)
+        (world_state_opt, pacing, turn_directives, undo_snapshot, proximity_terms, skills_before)
     };
 
     // Fable codex retrieval (2026-07-29, the core fix): the narrator now
@@ -13926,14 +18613,19 @@ async fn fable_send(
     // turn — no eager-prefill invariant to protect here, so the block can go
     // straight into the system prompt.)
     let memory_block: Option<String> = match state.memory.get() {
-        Some(engine) => match engine.search_fable_visible(&text, &card.id, 5, None).await {
-            Ok(hits) if !hits.is_empty() => Some(memory::render_memory_block(&hits)),
-            Ok(_) => None,
-            Err(e) => {
-                tracing::warn!(error = %format!("{e}"), "fable codex retrieval failed; injecting nothing");
-                None
+        Some(engine) => {
+            match engine
+                .search_fable_visible(&text, &memory_partition, 5, None, Some(&proximity_terms))
+                .await
+            {
+                Ok(hits) if !hits.is_empty() => Some(memory::render_memory_block(&hits)),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e}"), "fable codex retrieval failed; injecting nothing");
+                    None
+                }
             }
-        },
+        }
         None => {
             tracing::trace!("memory engine not initialized; skipping fable codex retrieval");
             None
@@ -14291,9 +18983,22 @@ async fn fable_send(
         // Reuses the existing apply pipeline verbatim — zero new apply code.
         // The tracker's prose is discarded (we keep only parsed.commands).
         if let Some(tracker_reply) = &tracker_reply_opt {
-            if tracker_reply.error.is_empty() {
-                let cleaned_tracker = schema::extract_reply_channel(&tracker_reply.raw_output);
-                let tracker_parsed = bracket_parser::parse(&cleaned_tracker);
+            // (2026-08-25 scope fix) The parse is hoisted to an Option at this
+            // level so the post-apply invariant warn below — which must also
+            // fire on the errored-reply path, where no parse ran — can name
+            // the turn's brackets without a per-turn clone.
+            let tracker_parsed_opt: Option<bracket_parser::ParsedNarration> =
+                if tracker_reply.error.is_empty() {
+                    let cleaned_tracker = schema::extract_reply_channel(&tracker_reply.raw_output);
+                    Some(bracket_parser::parse(&cleaned_tracker))
+                } else {
+                    tracing::warn!(
+                        error = %tracker_reply.error,
+                        "fable_send: tracker stage errored; proceeding to API narrator with pre-tracker state"
+                    );
+                    None
+                };
+            if let Some(tracker_parsed) = tracker_parsed_opt.as_ref() {
                 if !tracker_parsed.commands.is_empty() {
                     tracing::info!(
                         cmd_count = tracker_parsed.commands.len(),
@@ -14342,7 +19047,7 @@ async fn fable_send(
                     // — a rejected travel is the least consequential of the
                     // hard facts, and the narrator has already seen the legal
                     // `location:` line + exits in `<world_state>`.
-                    let (_, travel_rejects) =
+                    let (_, travel_rejects, bracket_event_directives) =
                         apply_phase3_bracket_commands(&tracker_parsed, &state, true, &tracker_window, &mut turn_notices)
                             .await;
                     // (2026-08-22) The apply's auto-inventory notices (equips,
@@ -14351,6 +19056,11 @@ async fn fable_send(
                     // flush site at the session install), never here: a
                     // cancelled turn reverts these very mutations.
                     turn_directives.extend(travel_rejects.clone());
+                    // (2026-08-23 hazard referees) The bracket-time hazard
+                    // events (road/city) join the same block AFTER the
+                    // rejects — legal referee outcomes, never distilled
+                    // into tracker emit-errors.
+                    turn_directives.extend(bracket_event_directives);
                     // (2026-08-22 tracker feedback loop) The tracker sees its
                     // own rejects NEXT turn (distilled + capped) — the
                     // narrator keeps its copies above. Before this the local
@@ -14359,16 +19069,65 @@ async fn fable_send(
                     // [NPC_ITEM player +coppers] loop).
                     *state.tracker_emit_errors.lock().await =
                         distill_tracker_emit_errors(&travel_rejects);
-                    tick_armed =
+                    let (time_armed, time_event_directives, rest_notice) =
                         apply_time_command_and_maybe_tick(&tracker_parsed, &state).await;
+                    tick_armed = time_armed;
+                    // (2026-08-23 hazard referees) The time-channel events
+                    // (rest interruption, ≥6h time-skip) merge BEFORE the
+                    // narrator re-render below — bracket-time + time-channel
+                    // events reach the SAME turn's narrator. The rest
+                    // interruption's bubble rides the commit-flush channel
+                    // (a cancelled turn never shows it).
+                    turn_directives.extend(time_event_directives);
+                    if let Some(notice) = rest_notice {
+                        turn_notices.push(("rest", notice));
+                    }
+                    // (2026-08-24 Part II B8) RANK-ADVANCE TOAST — diff the
+                    // pre/post `skill_*` ranks around the tracker apply and
+                    // push ONE buffered notice per deepened skill (flushed at
+                    // turn commit with every other notice — a cancelled turn
+                    // reverts these very writes, so it shows nothing). The
+                    // level-up system is dead by ruling; this subtle toast is
+                    // its entire surviving surface.
+                    {
+                        let s = state.fable_schema.lock().await;
+                        for (skill, old_rank, _new) in
+                            player_state::detect_skill_advances(
+                                &skills_before
+                                    .iter()
+                                    .cloned()
+                                    .collect::<std::collections::BTreeMap<_, _>>(),
+                                &s.entities,
+                            )
+                        {
+                            if old_rank == 0 {
+                                turn_notices.push((
+                                    "skill",
+                                    format!("{skill} — a knack takes root."),
+                                ));
+                            } else {
+                                turn_notices.push(("skill", format!("{skill} mastery deepens.")));
+                            }
+                        }
+                    }
                 } else {
                     tracing::info!("fable_send: tracker produced no bracket commands");
                 }
-            } else {
-                tracing::warn!(
-                    error = %tracker_reply.error,
-                    "fable_send: tracker stage errored; proceeding to API narrator with pre-tracker state"
-                );
+            }
+            // (2026-08-24 fix) Post-tracker invariant: a non-empty graph with
+            // no current_node is a ghost state. Every TRAVEL/DISCOVER arm now
+            // assigns or rejects explicitly, so this firing means an arm
+            // diverged — loud, with the turn's bracket list, so a live repro
+            // names the culprit immediately instead of a silent ghost.
+            {
+                let s = state.fable_schema.lock().await;
+                if s.travel_graph.is_set() && s.travel_graph.current_node.is_none() {
+                    tracing::warn!(
+                        brackets = ?tracker_parsed_opt.as_ref().map(|p| &p.commands),
+                        nodes = s.travel_graph.nodes.len(),
+                        "INVARIANT: travel graph non-empty but current_node is None after the tracker apply"
+                    );
+                }
             }
         }
 
@@ -14380,6 +19139,12 @@ async fn fable_send(
         // it skips silently (the narrator proceeds map-less — today's
         // behavior — and the next turn re-architects).
         maybe_run_site_architect(&state, engine, &cancel, &tracker_window).await;
+        // (2026-08-23 hosted interiors) The BUILDING-child architect — same
+        // window, same lock shape. Runs AFTER the bracket apply above (a
+        // `[ROOM]` enter set `current_building` this turn) and AFTER the
+        // node architect (entering a building in a just-arrived settlement
+        // needs the district map first).
+        maybe_run_hosted_interior_architect(&state, engine, &cancel, &tracker_window).await;
 
         // The tracker's local-model work is done — release the local-model
         // turn lock NOW so a concurrent chat_send / schema-delta can use the
@@ -14434,7 +19199,7 @@ async fn fable_send(
         let reveal_beneath = equipment::narrative_trips_exposure(&exposure_corpus);
         let narrator_world_state: Option<String> = {
             let s = state.fable_schema.lock().await;
-            let rendered = render_fable_world_state(&s, &turn_directives, reveal_beneath);
+            let rendered = render_fable_world_state(&s, &turn_directives, reveal_beneath, true);
             if rendered.trim().is_empty() { None } else { Some(rendered) }
         };
 
@@ -14560,6 +19325,7 @@ async fn fable_send(
                             !regenerate && !reroll,
                         if reroll { Some(base_schema_snapshot.clone()) } else { Some(pre_referee_schema.clone()) },
                         player_action.clone(),
+                        history_depth_at_turn_start,
                         )
                         .await;
                     }
@@ -14572,6 +19338,7 @@ async fn fable_send(
                             !regenerate && !reroll,
                         if reroll { Some(base_schema_snapshot.clone()) } else { Some(pre_referee_schema.clone()) },
                         player_action.clone(),
+                        history_depth_at_turn_start,
                         )
                         .await;
                     }
@@ -14585,6 +19352,7 @@ async fn fable_send(
                         !regenerate && !reroll,
                     if reroll { Some(base_schema_snapshot.clone()) } else { Some(pre_referee_schema.clone()) },
                     player_action.clone(),
+                    history_depth_at_turn_start,
                     )
                     .await;
                 }
@@ -14601,6 +19369,7 @@ async fn fable_send(
                     !regenerate && !reroll,
                 if reroll { Some(base_schema_snapshot.clone()) } else { Some(pre_referee_schema.clone()) },
                 player_action.clone(),
+                history_depth_at_turn_start,
                 ).await;
             };
             // (2026-08-16 bug 10) The engine Arc + lease drops for the WHOLE
@@ -14710,6 +19479,7 @@ async fn fable_send(
                     !regenerate && !reroll,
                 if reroll { Some(base_schema_snapshot.clone()) } else { Some(pre_referee_schema.clone()) },
                 player_action.clone(),
+                history_depth_at_turn_start,
                 )
                 .await;
             }
@@ -14754,7 +19524,7 @@ async fn fable_send(
     if state.fable_abort_requested.swap(false, std::sync::atomic::Ordering::Relaxed) {
         // The drained tick directives never reached a delivered beat —
         // restore them for the next turn (2026-08-15 audit fix: a reroll
-        // abort used to permanently drop one-shot world events).
+        // abort used to permanently drop one-time world events).
         restore_tick_directives(&state, &directives_at_turn_start).await;
         // Reroll → the message's stored pre-turn base; normal turn → the
         // pre-REFEREE world (#25: base_schema_snapshot is post-referee there,
@@ -14764,6 +19534,14 @@ async fn fable_send(
         } else {
             pre_referee_schema.clone()
         };
+        // (2026-08-24) The aborted turn's ring entries die with it — the
+        // schema restore must not leave an undo target back INTO the turn.
+        truncate_fable_history_to_depth(&state, history_depth_at_turn_start).await;
+        // (2026-08-22 living-world) The aborted turn never happened — its
+        // Recovery Referee rest signal must not leak onto the next turn.
+        state
+            .pending_rest
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // (2026-08-15 audit fix) Re-arm the consumed manual player_action:
         // an aborted turn never acknowledged the tactile UI action
         // (Consume/Equip) — restoring it makes the NEXT turn honor it
@@ -14803,6 +19581,14 @@ async fn fable_send(
         } else {
             pre_referee_schema.clone()
         };
+        // (2026-08-24) The failed turn's ring entries die with it — the
+        // schema restore must not leave an undo target back INTO the turn.
+        truncate_fable_history_to_depth(&state, history_depth_at_turn_start).await;
+        // (2026-08-22 living-world) The failed turn never happened — its
+        // Recovery Referee rest signal must not leak onto the next turn.
+        state
+            .pending_rest
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         if let Some(pa) = &player_action {
             *state.pending_player_action.lock().await = Some(pa.clone());
         }
@@ -14837,6 +19623,15 @@ async fn fable_send(
         } else {
             pre_referee_schema.clone()
         };
+        // (2026-08-24) The cancelled turn's ring entries die with it — the
+        // schema restore must not leave an undo target back INTO the turn.
+        truncate_fable_history_to_depth(&state, history_depth_at_turn_start).await;
+        // (2026-08-22 living-world) The cancelled turn never happened — its
+        // Recovery Referee rest signal must not leak onto the next turn's
+        // [TIME] as a phantom rested anchor.
+        state
+            .pending_rest
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         // (2026-08-15 audit fix) Re-arm the consumed manual player_action —
         // the cancelled turn never acknowledged the tactile UI action.
         if let Some(pa) = &player_action {
@@ -14957,6 +19752,7 @@ async fn fable_send(
             !regenerate && !reroll,
             if reroll { Some(base_schema_snapshot.clone()) } else { Some(pre_referee_schema.clone()) },
             player_action.clone(),
+            history_depth_at_turn_start,
         )
         .await;
     }
@@ -14977,13 +19773,14 @@ async fn fable_send(
     // left in the window.
     clear_cancel_slot_if_owner(&state.active_fable_cancel, &cancel);
 
-    // Archive both turns to the card-scoped memory. Best-effort, detached,
-    // same pattern as chat_send's pillar-2 archive. The card id is taken
-    // from the turn's OWN card (`card.id`), NOT the live slot — the
-    // session-race guard above already proved the slot still matches, but
-    // capturing here from `card` keeps the archival target immune to any
-    // future interleaving between this point and the spawn.
-    let card_id = card.id.clone();
+    // Archive both turns to the session's memory partition. Best-effort,
+    // detached, same pattern as chat_send's pillar-2 archive. The partition
+    // key is the turn-start clone (NOT the live slot) — the session-race
+    // guard above already proved the slot still matches, but the captured
+    // key keeps the archival target immune to any future interleaving
+    // between this point and the spawn (the card_id discipline; a branch
+    // archives into its fork, never back into the base card).
+    let card_id = memory_partition.clone();
     if let Some(memory_engine) = state.memory.get() {
         let memory_engine = Arc::clone(memory_engine);
         let user_text = text.clone();
@@ -15000,8 +19797,11 @@ async fn fable_send(
         tokio::spawn(async move {
             // (P3) A reroll/regenerate turn carries an EMPTY user text —
             // don't archive it (add_memory would warn "chunked to nothing"
-            // on every reroll).
-            if !user_text.trim().is_empty() {
+            // on every reroll). (2026-08-26 chronicle-hygiene) The gate is
+            // now archivable_prose: a punctuation-only player message ("/")
+            // is equally nothing to archive — it used to become a Chronicle
+            // row whose whole snippet was the stray character.
+            if memory::archivable_prose(&user_text) {
                 if let Err(e) = memory_engine
                     .add_memory(user_text, &card_id, memory::Role::User, 1.0, Some(&turn_uuid))
                     .await
@@ -15016,6 +19816,8 @@ async fn fable_send(
                 tracing::debug!(
                     "[fable-archive] assistant prose not archived (reroll/regenerate/codex echo-skip)"
                 );
+            } else if !memory::archivable_prose(&asst_text) {
+                tracing::debug!("[fable-archive] assistant prose not archived (no alphanumeric content)");
             } else if let Err(e) = memory_engine
                 .add_memory(asst_text, &card_id, memory::Role::Assistant, 1.0, Some(&turn_uuid))
                 .await
@@ -15176,7 +19978,169 @@ async fn fable_send(
         // generation (bug 8) — it runs after the cancel slot is cleared, so
         // it must self-guard against a session swap (including a same-card
         // load) during its ~1-3s run.
-        fire_world_progression_tick(&state, &card.id, turn_session_generation).await;
+        fire_world_progression_tick(&state, &app, &card.id, turn_session_generation).await;
+    }
+
+    // (2026-08-24 fix) Deferred FABLE schema delta — the sibling of the chat
+    // path's post-turn spawn (chat_send's `pending_delta` block). Until now
+    // only the [TIME]-gated tick called apply_delta on the fable path, and
+    // its prompt never asks for summary/recent_events — both stayed empty
+    // forever on normal turns. Mirrors the chat block: clone the schema,
+    // drain THIS surface's failures, acquire the schema engine, apply under
+    // the fable_schema lock, re-enqueue failures. Detached (never blocks
+    // the turn's return); the task holds the local-model turn lock across
+    // its run, so the next fable_send's turn-lock acquire naturally waits
+    // for it — the invisible-queue guarantee chat gets from pending_delta,
+    // for free. Persistence rides the next turn's session install +
+    // reserved autosave (best-effort, the memory-archival contract).
+    // Reroll/regenerate turns skip — the re-track path owns those moments
+    // and their beats replace rather than extend (v1; re-track-integrated
+    // deltas are follow-up work). Codex-injected turns still fire: the
+    // delta records world STATE, and the echo-skip law governs archival
+    // only. The late apply is deliberately OUTSIDE the undo ring — the
+    // delta describes the turn that just committed, so undoing that turn
+    // reverts to a pre-delta world by construction.
+    if !reroll
+        && !regenerate
+        && schema_engine::fable_delta_should_fire(reply.cancelled, &text, &parsed.prose)
+    {
+        let current_schema = state.fable_schema.lock().await.clone();
+        // Drain ONLY this surface's failures — a chat failure must never be
+        // folded into a fable delta prompt (it diffs against a different
+        // schema). Non-Fable attempts stay queued for their own surface.
+        let mut deferred: Vec<schema_engine::FailedAttempt> = Vec::new();
+        {
+            let mut q = state.failed_delta_queue.lock().await;
+            q.retain(|a| {
+                if a.surface == schema_engine::DeltaSurface::Fable {
+                    deferred.push(a.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        if !deferred.is_empty() {
+            tracing::info!(
+                deferred = deferred.len(),
+                "fable delta attempt includes deferred re-attempts"
+            );
+        }
+        let fable_schema_slot = state.fable_schema.clone();
+        let failed_queue_slot = state.failed_delta_queue.clone();
+        let context_swap = state.context_swap.clone();
+        let schema_engine_slot = Arc::clone(&state.schema_engine);
+        let local_model_lock = Arc::clone(&state.local_model_lock);
+        let active_card_slot = Arc::clone(&state.active_card_id);
+        let session_gen_slot = Arc::clone(&state.fable_session_generation);
+        let user_action = text.clone();
+        let beat = parsed.prose.clone();
+        let turn_card_id = card.id.clone();
+        let turn_gen = turn_session_generation;
+        tokio::spawn(async move {
+            // Session liveness (the tick's discipline): the decode runs
+            // detached after the cancel slot cleared, so card identity +
+            // session generation must be re-verified before the apply — a
+            // swap mid-flight must not write a dead timeline's delta into
+            // the live schema.
+            let session_live = || {
+                *active_card_slot.lock().unwrap_or_else(|e| e.into_inner()) == turn_card_id
+                    && session_gen_slot.load(std::sync::atomic::Ordering::SeqCst) == turn_gen
+            };
+            let (schema_engine, _lease, _model_guard) =
+                match acquire_schema_engine_from_arcs(
+                    context_swap,
+                    schema_engine_slot,
+                    local_model_lock,
+                )
+                .await
+                {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "fable delta: could not acquire schema engine; schema unchanged");
+                        reenqueue_failed_attempts(&failed_queue_slot, deferred, "failed_delta_queue").await;
+                        return;
+                    }
+                };
+            if !session_live() {
+                tracing::warn!("fable delta: session swapped before decode; schema unchanged (failures re-queued)");
+                reenqueue_failed_attempts(&failed_queue_slot, deferred, "failed_delta_queue").await;
+                return;
+            }
+            let reply_rx = match schema_engine.request_delta(
+                (user_action, beat),
+                &current_schema,
+                deferred.clone(),
+                schema_engine::DeltaSurface::Fable,
+            ) {
+                Ok(rx) => rx,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "fable delta request failed; schema unchanged");
+                    reenqueue_failed_attempts(&failed_queue_slot, deferred, "failed_delta_queue").await;
+                    return;
+                }
+            };
+            let reply = match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %format!("{e}"), "fable delta reply channel closed");
+                    reenqueue_failed_attempts(&failed_queue_slot, deferred, "failed_delta_queue").await;
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e}"), "fable delta reply join failed");
+                    reenqueue_failed_attempts(&failed_queue_slot, deferred, "failed_delta_queue").await;
+                    return;
+                }
+            };
+            if !session_live() {
+                tracing::warn!("fable delta: session swapped mid-decode; dropping the delta (failures re-queued)");
+                reenqueue_failed_attempts(&failed_queue_slot, deferred, "failed_delta_queue").await;
+                return;
+            }
+            if let Some(delta) = reply.delta {
+                drop(deferred);
+                let mut s = fable_schema_slot.lock().await;
+                s.apply_delta(delta);
+                tracing::debug!("fable schema delta applied (post-done; persists with the next autosave)");
+            } else {
+                // Fail-proof contract, the chat arm verbatim: retryable
+                // failures re-enqueue through their own budget bump; infra
+                // failures restore the drained priors unbumped.
+                let mut q = failed_queue_slot.lock().await;
+                if let Some(failed) = reply.failed_attempt.clone().and_then(bump_retry_budget) {
+                    for prior in deferred {
+                        if let Some(p) = bump_retry_budget(prior) {
+                            push_failed_attempt_capped(&mut q, p);
+                        }
+                    }
+                    push_failed_attempt_capped(&mut q, failed);
+                    tracing::warn!(error = %reply.error, "fable schema delta failed all passes; queued for next-turn re-attempt");
+                } else if !reply.error.is_empty() {
+                    for prior in deferred {
+                        push_failed_attempt_capped(&mut q, prior);
+                    }
+                    tracing::warn!(error = %reply.error, "fable schema delta infrastructure failure; not queued (not retryable)");
+                } else {
+                    for prior in deferred {
+                        push_failed_attempt_capped(&mut q, prior);
+                    }
+                }
+            }
+        });
+    }
+
+    // (2026-08-23 WS6) Deferred memory consolidation — detached (NEVER
+    // blocks the turn's return): the off-turn local extraction worker
+    // triggers when the card's archive carries >30 live un-consolidated
+    // turns. Same discipline as the tick (post-lock-drop, session-guarded,
+    // per-batch lock acquisition) — the greenlit "post-lock idle trigger".
+    {
+        let app = app.clone();
+        let card_id = card.id.clone();
+        tokio::spawn(async move {
+            fire_memory_consolidation(&app, &card_id, turn_session_generation).await;
+        });
     }
 
     Ok(())
@@ -15936,7 +20900,13 @@ async fn fable_end(
     // 3. Restore the pre-game card id + clear the game-scoped state.
     {
         let pre = state.pre_fable_card_id.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        *state.active_card_id.lock().unwrap_or_else(|e| e.into_inner()) = pre;
+        *state.active_card_id.lock().unwrap_or_else(|e| e.into_inner()) = pre.clone();
+        // (2026-08-24 Part II D1) The memory partition restores with it — a
+        // branch's fork key never leaks into the next scope's retrieval.
+        *state
+            .active_memory_partition
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = pre;
     }
     *state.fable_schema.lock().await = schema::WorldSchema::default();
     clear_fable_history(&state).await;
@@ -15979,14 +20949,34 @@ async fn fable_end(
     }
     state.failed_progression_queue.lock().await.clear();
     state.failed_translation_queue.lock().await.clear();
+    // (2026-08-24 fix) The delta queue joins the boundary drains (both
+    // surfaces — a chat failure is just as foreign to the next timeline).
+    state.failed_delta_queue.lock().await.clear();
     // (2026-08-22 tracker feedback loop) Reject feedback is one-shot per
     // timeline too — a dead session's rejects never reach a new one.
     state.tracker_emit_errors.lock().await.clear();
+    // (2026-08-22 living-world) The rest backstop flag is one-shot per
+    // timeline too — a dead session's referee signal never stamps a rest
+    // onto this one's clock.
+    state
+        .pending_rest
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    // (2026-08-23 Playground) God flags die with the timeline — a new game
+    // never inherits the last one's auto-pass/freeze clamps.
+    state
+        .playground_auto_pass
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    state
+        .playground_freeze_clamps
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     // (2026-08-16 audit fix #11) An armed manual player_action (Consume/
     // Equip from the Soul Gem panel) is a tactile intent of THIS game — it
     // must never fire as a hard fact in a different card's first turn.
     // Cleared alongside the one-shot queue drains.
     *state.pending_player_action.lock().await = None;
+    // (2026-08-24 Part II B3) The armed pinned skill DC is the same
+    // one-shot tactile intent — never inherited across a boundary.
+    *state.pending_pinned_skill_dc.lock().await = None;
 
     tracing::info!("game ended: narrator engine down, per-card state persisted, memory scope restored");
     Ok(())
@@ -16030,6 +21020,41 @@ async fn fable_player_action_set(
     let mut g = state.pending_player_action.lock().await;
     *g = Some(capped);
     tracing::info!("player action armed (one-shot, will fire on next fable_send)");
+    Ok(())
+}
+
+// ===========================================================================
+// (2026-08-24 Part II B3) Crossroads pinned-DC commit.
+//
+// A Crossroads option that hinges on a skilled act DECLARES its difficulty
+// inline ("— [Lockpicking DC 18]", the A4 prompt law). The declared DC is
+// committed the moment the option is offered — when the player PICKS such an
+// option, the frontend parses the declaration out of the option text and
+// arms this one-shot slot. The next `fable_send` consumes it and the skill
+// referee uses the declared DC verbatim for the matching skill (dice +
+// seeds untouched; every other skill computes normally). Closes the last
+// sycophancy door: the model cannot soften a check it already priced.
+// ===========================================================================
+
+#[tauri::command]
+async fn crossroads_commit_dc(
+    skill: String,
+    dc: u32,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
+    let trimmed = skill.trim();
+    if trimmed.is_empty() {
+        let mut g = state.pending_pinned_skill_dc.lock().await;
+        *g = None;
+        return Ok(());
+    }
+    if !(1..=30).contains(&dc) {
+        return Err(format!("dc {dc} outside 1..=30"));
+    }
+    let capped: String = trimmed.chars().take(64).collect();
+    let mut g = state.pending_pinned_skill_dc.lock().await;
+    *g = Some((capped, dc));
+    tracing::info!(skill = %trimmed, dc, "crossroads DC committed (one-shot, fires on next fable_send)");
     Ok(())
 }
 
@@ -16457,12 +21482,13 @@ async fn player_state_get(
 
 /// Return the identity of the currently-seated fable card plus the chat-UI
 /// portrait data: `{ name, subtype, player_name, card_id, card_portrait_url,
-/// player_portrait_url, npc_names }`.
+/// player_portrait_url }`.
 ///
 /// - `name` / `player_name` — the stage's "(name) is currently typing..."
 ///   indicator + message-header names (card name → narrator beats;
-///   player_name → user beats). `player_name` is "" when the card omits
-///   `<player_name>`.
+///   player_name → user beats). `player_name` is the ATTACHED SavedPlayer's
+///   name (walker-resolved from `active_player_id`), "" when no player is
+///   bound.
 /// - `subtype` — the wizard discriminator (`"npc"` | `"scenario"` |
 ///   `"world"`), null when the card carries no `<subtype>`. Drives the
 ///   typing indicator's voice (2026-08-19): npc cards read
@@ -16478,17 +21504,9 @@ async fn player_state_get(
 /// - `player_portrait_url` — absolute path to the active saved player's
 ///   portrait, or null (playerless game / no portrait). Resolved
 ///   via `load_player_portrait` from `active_player_id`.
-/// - `npc_names` — `{ id, name }` pairs from the card's `<cast>`, so the chat
-///   can render real NPC display names on character beats (replaces the old
-///   slug-title-case fallback).
 ///
-/// `None` (serialized as null) when no game is active.
-///
-/// FRONTEND CONTRACT: the JS consumer (stage.js `refreshActiveCardName`)
-/// accepts BOTH this object shape AND a legacy plain-string shape, so a
-/// frontend built against the older `Option<String>` return still works — it
-/// reads each new field defensively. Uses the same `fable_is_active` gate as
-/// the other read-only fable queries.
+/// `None` (serialized as null) when no game is active. Uses the same
+/// `fable_is_active` gate as the other read-only fable queries.
 #[tauri::command]
 fn fable_active_card_get(
     state: tauri::State<'_, AppState>,
@@ -16511,10 +21529,6 @@ fn fable_active_card_get(
             .unwrap_or_else(|e| e.into_inner())
             .as_deref()
             .and_then(|pid| load_player_portrait(&app, pid));
-        // The cast NPC id→name map (real speaker labels on character beats).
-        let npc_names: Vec<serde_json::Value> = c.cast.iter().map(|n| {
-            serde_json::json!({ "id": n.id, "name": n.name })
-        }).collect();
         // (2026-08-22) The header name is the ATTACHED SavedPlayer's name,
         // walker-resolved from `active_player_id` — the single authority for
         // every attach path (fresh start, session resume, save-slot swap).
@@ -16537,7 +21551,6 @@ fn fable_active_card_get(
                             .unwrap_or("Player")
                             .to_owned();
                         load_player_at(&folder.join(format!("{stem}.player")))
-                            .or_else(|| load_player_at(&folder.join(format!("{stem}.json"))))
                     })
                     .map(|sp| sp.name.trim().to_owned())
                     .filter(|n| !n.is_empty())
@@ -16551,7 +21564,6 @@ fn fable_active_card_get(
             "card_id": c.id,
             "card_portrait_url": card_portrait_url,
             "player_portrait_url": player_portrait_url,
-            "npc_names": npc_names,
         })
     }))
 }
@@ -16572,6 +21584,59 @@ async fn fable_schema_get(
     serde_json::to_value(&*s).map_err(|e| format!("serialize world schema: {e}"))
 }
 
+/// (2026-08-23 fog-of-war map) The PLAYER-facing, knowledge-filtered slice
+/// of the ACTIVE site map — the left-drawer location card's map panel
+/// (`engine/site-map.js`, the Multihog-style node graph). Resolves through
+/// the RESOLVER LAW (`site_map::active_site_map_key` — the hosted building
+/// child while the player stands in one), filters hidden truth in Rust
+/// (`site_map::player_slice`: Unrevealed areas surface only as anonymous
+/// 1-hop `?N` fog stubs; Unrevealed assets never cross the IPC), and
+/// returns `None` when the current node carries no map (outdoors / an
+/// unmapped site) — the frontend renders the plain location card then.
+#[tauri::command]
+async fn fable_site_map_get(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<site_map::PlayerSiteMap>, String> {
+    if !fable_is_active(&state) {
+        return Err("no fable game active: call fable_start first".to_string());
+    }
+    let s = state.fable_schema.lock().await;
+    let Some(key) =
+        site_map::active_site_map_key(&s.site_maps, s.travel_graph.current_node.as_deref())
+    else {
+        return Ok(None);
+    };
+    let Some(map) = s.site_maps.get(&key) else {
+        return Ok(None);
+    };
+    let hosted = site_map::parse_hosted_key(&key).is_some();
+    let site_name = if hosted {
+        site_map::hosted_breadcrumb(&s.site_maps, &s.travel_graph, &key)
+            .unwrap_or_else(|| key.clone())
+    } else {
+        s.travel_graph
+            .find_node(&key)
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| key.clone())
+    };
+    // (2026-08-25 quest anchors) Active anchored objectives — quest titles
+    // first, then promise descriptions — feeding the map's scroll markers.
+    // Bounded by construction: ≤ MAX_QUESTS + MAX_PROMISES pairs.
+    let anchored: Vec<site_map::AnchoredObjective> = s
+        .quests
+        .iter()
+        .filter(|q| !q.area_anchor.is_empty())
+        .map(|q| (q.area_anchor.clone(), q.title.clone()))
+        .chain(
+            s.promises
+                .iter()
+                .filter(|p| !p.area_anchor.is_empty())
+                .map(|p| (p.area_anchor.clone(), p.description.clone())),
+        )
+        .collect();
+    Ok(Some(site_map::player_slice(map, &site_name, hosted, &anchored)))
+}
+
 /// Replace the live `WorldSchema` with a manually-edited one (from the Tracker
 /// tab OR the Soul Gem inventory panel). This is a USER-INITIATED edit (the
 /// same trust class as `fable_rollback` + `fable_load_save`): it bypasses the
@@ -16582,7 +21647,7 @@ async fn fable_schema_get(
 /// `WorldSchema`.
 ///
 /// `event_note` (optional, 2026-08-08): when the Soul Gem inventory panel fires
-/// a physical action (EQUIP/CONSUME/POCKET/STORE/DISCARD), it passes a short
+/// a physical action (EQUIP/CONSUME/POUCH/STORE/DISCARD), it passes a short
 /// past-tense description here ("equipped Iron Sword", "consumed Health Potion").
 /// The note is appended to the installed schema's `recent_events`, which the
 /// next narrator turn renders inside `<world_state>` — so the API narrator is
@@ -16603,6 +21668,15 @@ async fn fable_schema_set(
     if !fable_is_active(&state) {
         return Err("no fable game active: call fable_start first".to_string());
     }
+    // (2026-08-24 mid-turn guard) Same refusal as every schema-swapping
+    // sibling (rollback, save, end, branch, playground): a Stage-1 bracket
+    // apply landing inside this command's lock-free window would be
+    // silently erased by the wholesale install + then autosaved away.
+    if fable_turn_in_flight(&state) {
+        return Err(
+            "a narrator turn is still in flight: stop it (or wait) before replacing the live schema".into(),
+        );
+    }
     let mut new_schema: schema::WorldSchema = serde_json::from_value(schema_json)
         .map_err(|e| format!("deserialize world schema: {e}"))?;
     // If a UI-action trace was supplied, append it to recent_events so the next
@@ -16621,6 +21695,27 @@ async fn fable_schema_set(
             new_schema.push_event(capped);
         }
     }
+    // (2026-08-24 caps parity) A wholesale hand-edited install must meet the
+    // SAME growth caps every other install path enforces (merge_patch's
+    // typed arms + fable_json_raw_set's W3 checks) — a hand-edited
+    // 500+-entity schema or an over-cap travel graph/registry would blow
+    // the schema-engine budget from the live side.
+    if new_schema.travel_graph.nodes.len() > schema::MAX_TRAVEL_NODES {
+        return Err(format!(
+            "travel_graph: {} nodes exceeds the {} cap",
+            new_schema.travel_graph.nodes.len(),
+            schema::MAX_TRAVEL_NODES
+        ));
+    }
+    if new_schema.npc_registry.entries.len() > schema::MAX_NPC_REGISTRY {
+        return Err(format!(
+            "npc_registry: {} entries exceeds the {} cap",
+            new_schema.npc_registry.entries.len(),
+            schema::MAX_NPC_REGISTRY
+        ));
+    }
+    new_schema.enforce_typed_caps();
+    new_schema.enforce_entity_cap();
     // Snapshot the current schema for undo, then install the edit.
     {
         let snap = state.fable_schema.lock().await.clone();
@@ -16689,7 +21784,7 @@ fn fable_card_get(
                 "date": c.world.date,
                 "time": c.world.time,
                 "weather": c.world.weather,
-                "tone": c.world.tone.clone().or_else(|| c.tone.clone()),
+                "tone": c.world.tone.clone(),
             },
             "location": c.location.clone().unwrap_or_default(),
             "inventory": {
@@ -16766,6 +21861,10 @@ fn fable_card_raw_set(
     // fable_validate_card_xml / fable_write_card).
     let parsed = sim_card::parse_from_xml_str(&xml)
         .map_err(|e| format!("Invalid card format: {e}"))?;
+    // (v0.30.0 clean break) the raw editor can paste a pre-v2 backup over a
+    // live card — reject at the write boundary instead of silently unwalking
+    // it (it would vanish from every list on the next refresh).
+    ensure_playable_v2(&parsed)?;
     // (2026-08-16 yellow C18) The embedded id must keep resolving under the
     // folder it's saved into — editing <metadata><id> in the raw editor used
     // to split the card (state/saves/portrait under the folder stem, listing
@@ -16812,6 +21911,8 @@ fn fable_card_raw_set_by_id(card_id: String, xml: String, app: tauri::AppHandle)
     }
     let parsed = sim_card::parse_from_xml_str(&xml)
         .map_err(|e| format!("Invalid card format: {e}"))?;
+    // (v0.30.0 clean break) same pre-v2 rejection as `fable_card_raw_set`.
+    ensure_playable_v2(&parsed)?;
     // (2026-08-16 yellow C18) Same id/folder-stem agreement as the other two
     // card writers — a drifting embedded id splits state resolution.
     if parsed.id != card_id {
@@ -16940,6 +22041,14 @@ async fn fable_json_raw_set(
     state: tauri::State<'_, AppState>,
     app: tauri::AppHandle,
 ) -> Result<(), String> {
+    // (2026-08-24 mid-turn guard) Same refusal as every schema-swapping
+    // sibling — a Stage-1 bracket apply landing inside the recompose window
+    // would be silently erased by the wholesale install + autosaved away.
+    if fable_turn_in_flight(&state) {
+        return Err(
+            "a narrator turn is still in flight: stop it (or wait) before applying a raw schema edit".into(),
+        );
+    }
     let card_id = active_roleplay_card_id(&state)?;
     let parsed: serde_json::Value =
         serde_json::from_str(&json).map_err(|e| format!("invalid JSON: {e}"))?;
@@ -17232,8 +22341,7 @@ fn fable_codex_link_get(card_id: String, app: tauri::AppHandle) -> Result<Vec<St
 /// Replace a card's `<linked_codices>` list (priority order — index 0 = top
 /// priority). Names are validated against the library (unknown name → Err);
 /// the `.sim` rewrite goes through `sim_card::with_linked_codices` (the
-/// canonical re-serialize for v2 cards, the verbatim-preserving tail-splice
-/// for legacy-verbatim cards). An EMPTY list is valid — it's the
+/// canonical re-serialize). An EMPTY list is valid — it's the
 /// unlink-everything signal. When the card is the ACTIVE game's card, a
 /// live re-seed fires on every change INCLUDING the empty list (the priority
 /// merge + source-scoped reconcile make link changes effective immediately,
@@ -17288,7 +22396,9 @@ async fn fable_codex_link_set(
                     .collect();
                 let card_id_owned = card_id.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = codex::seed_linked_codices(&me, &links, &card_id_owned).await {
+                    // (2026-08-24) Family seed — base + branch fork keys (see
+                    // enter_fable_session's call site).
+                    if let Err(e) = codex::seed_linked_codices_family(&me, &links, &card_id_owned).await {
                         tracing::warn!(
                             card_id = %card_id_owned,
                             error = %format!("{e:#}"),
@@ -17342,33 +22452,262 @@ fn fable_codex_create_for_card(
     Ok(name)
 }
 
-/// Write a sibling text file (`.intro`) under an EXPLICIT card_id's folder.
-/// Used by the new Creators (NPC/World/Scenario) at CREATE time, when no
-/// card is active yet. (2026-08-22: ext `codex` is RETIRED — codex files
-/// are universal library members now; the Creator writes them via
-/// `fable_codex_create_for_card`.) `ext` MUST be "intro" (the only text
-/// sibling this exposes; the `.sim` is written by `fable_write_card`, the
-/// JSON state files by their own IPCs). Atomic write (temp+fsync+rename).
-/// Empty text is allowed. Created on first write.
-#[tauri::command]
-fn fable_card_sibling_write(
+/// One card's codex links — a row of the LOAD → CODEX browser's inverse
+/// index (`fable_codex_links_map`).
+#[derive(serde::Serialize)]
+struct CardCodexLinks {
     card_id: String,
-    ext: String,
-    text: String,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
-    if ext != "intro" {
-        return Err(format!(
-            "unsupported sibling ext '{ext}': only intro (codex files are universal library members — fable_codex_create_for_card)"
-        ));
+    card_name: String,
+    codices: Vec<String>,
+}
+
+/// Every playable card's `<linked_codices>` list in ONE IPC (2026-08-23 LOAD
+/// → CODEX browser): the frontend folds this into the inverse map (codex →
+/// the cards linking it) without an N+1 of `fable_codex_link_get` round-
+/// trips. Same walker + skip rules as `fable_cards_list`.
+#[tauri::command]
+fn fable_codex_links_map(app: tauri::AppHandle) -> Result<Vec<CardCodexLinks>, String> {
+    let Some(cards_root) = resolve_fable_cards_dir(&app) else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for path in iter_card_sim_paths(&cards_root) {
+        let card = sim_card::load_or_fallback(&path);
+        // Same skip rules as fable_cards_list: fallback stubs, non-simulation
+        // cards, and pre-v2 cards never reach a picker, so their links are
+        // invisible here too (a pre-v2 card can't be linked from the UI).
+        if card.id == "__wupi_fallback__" || card.card_type != "simulation" || !card.format_v2 {
+            continue;
+        }
+        out.push(CardCodexLinks {
+            card_id: card.id,
+            card_name: card.name,
+            codices: card.linked_codices,
+        });
     }
+    out.sort_by(|a, b| a.card_name.to_lowercase().cmp(&b.card_name.to_lowercase()));
+    Ok(out)
+}
+
+/// Shared sweep for rename/delete: rewrite every card's `<linked_codices>`
+/// through `map_fn` (position-preserving), returning the (card_id, new list)
+/// pairs of the cards whose list CHANGED. Pure disk work — the caller decides
+/// whether a live re-seed is owed (it checks the active card's id against the
+/// changed pairs).
+fn sweep_card_codex_links<F>(cards_root: &std::path::Path, map_fn: F) -> Vec<(String, Vec<String>)>
+where
+    F: Fn(&[String]) -> Option<Vec<String>>,
+{
+    let mut changed = Vec::new();
+    for path in iter_card_sim_paths(cards_root) {
+        let Ok(xml) = std::fs::read_to_string(&path) else { continue };
+        let Ok(card) = sim_card::parse_from_xml_str(&xml) else { continue };
+        // (2026-08-23 audit fix — the fable_codex_links_map skip rules) A
+        // pre-v2 card is NEVER rewritten: with_linked_codices round-trips
+        // through serialize_v2, which re-emits only the v2 model — a legacy
+        // card would be silently destroyed down to a husk (and resurrected
+        // into the pickers by the hardcoded v2 <type>). Legacy cards keep
+        // their bytes; a dangling mention on one is inert (link_set
+        // validates only v2 cards).
+        if card.card_type != "simulation" || !card.format_v2 {
+            continue;
+        }
+        let Some(new_list) = map_fn(&card.linked_codices) else { continue };
+        // Canonicalize (dedupe) so a hand-edited duplicate can't survive the
+        // rewrite; with_linked_codices self-checks the round-trip.
+        let cleaned = sim_card::clean_codex_names(&new_list);
+        if cleaned == card.linked_codices {
+            continue;
+        }
+        match sim_card::with_linked_codices(&xml, &cleaned) {
+            Ok(out_xml) => {
+                if write_atomic(&path, out_xml.as_bytes()).is_ok() {
+                    changed.push((card.id, cleaned));
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %format!("{e:#}"),
+                    "codex link sweep: card rewrite failed (left as-is)"
+                );
+            }
+        }
+    }
+    changed
+}
+
+/// Live re-seed the ACTIVE game when the sweep touched its card (rename/
+/// delete changed its `<linked_codices>`): the source-scoped reconcile makes
+/// the change effective immediately mid-session (old/removed sources' rows
+/// purge, new sources seed). Mirrors `fable_codex_link_set`'s tail.
+async fn reseed_active_card_codex(
+    state: &tauri::State<'_, AppState>,
+    app: &tauri::AppHandle,
+    changed: &[(String, Vec<String>)],
+) {
+    let active_card = state
+        .active_fable_card
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let Some(card) = active_card else { return };
+    let Some((card_id, links)) = changed.iter().find(|(id, _)| *id == card.id) else {
+        return;
+    };
+    let Some(codex_dir) = resolve_codex_dir(app) else { return };
+    let Some(memory_engine) = state.memory.get() else { return };
+    let me = Arc::clone(memory_engine);
+    let resolved: Vec<codex::LinkedCodex> = links
+        .iter()
+        .filter_map(|name| {
+            resolve_codex_file(&codex_dir, name)
+                .map(|path| codex::LinkedCodex { name: name.clone(), path })
+        })
+        .collect();
+    let card_id = card_id.clone();
+    tokio::spawn(async move {
+        // (2026-08-24) Family seed — base + branch fork keys (see
+        // enter_fable_session's call site).
+        if let Err(e) = codex::seed_linked_codices_family(&me, &resolved, &card_id).await {
+            tracing::warn!(
+                card_id = %card_id,
+                error = %format!("{e:#}"),
+                "live codex re-seed after rename/delete failed"
+            );
+        }
+    });
+}
+
+/// Rename a library codex (2026-08-23 LOAD → CODEX editor). Walker-resolves
+/// the old name, moves the file under the sanitized new stem (collision →
+/// Err), and rewrites every card's `<linked_codices>` mention old→new
+/// (case-insensitive, position preserved) via the canonical re-serialize —
+/// a dangling old name would fail every later `fable_codex_link_set`
+/// validation on that card. Returns the canonical new name (the caller
+/// writes any content changes under it). Live re-seeds the active card when
+/// it linked the renamed codex (the source key changed: old rows purge, the
+/// new name seeds).
+#[tauri::command]
+async fn fable_codex_file_rename(
+    old_name: String,
+    new_name: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let codex_dir = resolve_codex_dir(&app)
+        .ok_or_else(|| "no apps/fable/data/codex/ dir resolved".to_string())?;
+    let old_clean = old_name
+        .trim()
+        .strip_suffix(".codex")
+        .unwrap_or(old_name.trim())
+        .to_string();
+    let new_stem = crate::safe_display_stem(new_name.trim(), "Codex");
+    let old_path = resolve_codex_file(&codex_dir, &old_clean)
+        .ok_or_else(|| format!("no codex named '{old_clean}' in the library"))?;
+    let new_path = codex_dir.join(format!("{new_stem}.codex"));
+    if old_path != new_path {
+        // (2026-08-23 audit fix) Windows is case-insensitive: a case-only
+        // rename ("aldermoor" → "Aldermoor") sees new_path.exists() == true
+        // for the SAME file — it used to error out. Route case-only renames
+        // through a temp stem so the collision check passes and the file
+        // lands under the new casing.
+        let case_only = old_path
+            .to_str()
+            .zip(new_path.to_str())
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
+        if case_only {
+            let tmp = codex_dir.join(format!(".case-rename-{}.codex", fable_save::unique_tmp_suffix()));
+            std::fs::rename(&old_path, &tmp).map_err(|e| format!("case rename step 1: {e}"))?;
+            if let Err(e) = std::fs::rename(&tmp, &new_path) {
+                // Put it back — a stranded temp file loses the codex.
+                let _ = std::fs::rename(&tmp, &old_path);
+                return Err(format!("case rename step 2: {e}"));
+            }
+        } else {
+            if new_path.exists() {
+                return Err(format!("a codex named '{new_stem}' already exists"));
+            }
+            let text = std::fs::read_to_string(&old_path).map_err(|e| format!("read codex: {e}"))?;
+            write_atomic(&new_path, text.as_bytes()).map_err(|e| format!("write codex: {e}"))?;
+            std::fs::remove_file(&old_path).map_err(|e| format!("remove old codex: {e}"))?;
+        }
+    }
+    // Sweep the cards: old→new, position preserved. A same-name rename
+    // (whitespace/case cleanup) still normalizes every mention to the
+    // canonical stem.
     let cards_root = resolve_fable_cards_dir(&app)
         .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
-    let card_dir = resolve_card_dir(&cards_root, &card_id);
-    std::fs::create_dir_all(&card_dir).map_err(|e| format!("mkdir card folder: {e}"))?;
-    let path = resolve_card_file(&cards_root, &card_id, &ext);
-    write_atomic(&path, text.as_bytes()).map_err(|e| format!("write {ext}: {e}"))?;
-    tracing::info!(card_id = %card_id, ext = %ext, "fable_card_sibling_write: sibling written");
+    let stem_for_map = new_stem.clone();
+    let old_for_map = old_clean.clone();
+    let changed = sweep_card_codex_links(&cards_root, |links| {
+        let mut touched = false;
+        let out: Vec<String> = links
+            .iter()
+            .map(|n| {
+                if n.eq_ignore_ascii_case(&old_for_map) {
+                    touched = true;
+                    stem_for_map.clone()
+                } else {
+                    n.clone()
+                }
+            })
+            .collect();
+        if touched {
+            Some(out)
+        } else {
+            None
+        }
+    });
+    tracing::info!(
+        old = %old_clean,
+        new = %new_stem,
+        cards = changed.len(),
+        "fable_codex_file_rename: library codex renamed + card links rewritten"
+    );
+    reseed_active_card_codex(&state, &app, &changed).await;
+    Ok(new_stem)
+}
+
+/// Delete a library codex (2026-08-23 LOAD → CODEX browser). Removes the
+/// file + unlinks it from every card that references it (the inverse of
+/// `fable_codex_link_set`'s name validation: a dangling name must never
+/// survive on disk). Live re-seeds the active card when it linked the
+/// deleted codex so its lore rows purge immediately.
+#[tauri::command]
+async fn fable_codex_file_delete(
+    name: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    let codex_dir = resolve_codex_dir(&app)
+        .ok_or_else(|| "no apps/fable/data/codex/ dir resolved".to_string())?;
+    let clean = name.trim().strip_suffix(".codex").unwrap_or(name.trim()).to_string();
+    let path = resolve_codex_file(&codex_dir, &clean)
+        .ok_or_else(|| format!("no codex named '{clean}' in the library"))?;
+    std::fs::remove_file(&path).map_err(|e| format!("delete codex: {e}"))?;
+    // Sweep the cards: drop the deleted name everywhere it appears.
+    let cards_root = resolve_fable_cards_dir(&app)
+        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
+    let clean_for_map = clean.clone();
+    let changed = sweep_card_codex_links(&cards_root, |links| {
+        let out: Vec<String> = links
+            .iter()
+            .filter(|n| !n.eq_ignore_ascii_case(&clean_for_map))
+            .cloned()
+            .collect();
+        if out.len() == links.len() {
+            None // nothing referenced it — no rewrite
+        } else {
+            Some(out)
+        }
+    });
+    tracing::info!(
+        name = %clean,
+        cards = changed.len(),
+        "fable_codex_file_delete: library codex deleted + card links swept"
+    );
+    reseed_active_card_codex(&state, &app, &changed).await;
     Ok(())
 }
 
@@ -17411,42 +22750,288 @@ fn fable_session_delete(
         .map_err(|e| format!("delete session '{session_id}': {e}"))
 }
 
-/// Set/replace a card's `<intro>` block — the Fable opening narrator beat that
-/// lives as a SIBLING after `</sim_card>` in the `.sim` file (2026-08-13). Rust
-/// owns the XML edit so the two-root shape (`<sim_card>` + its siblings)
-/// stays well-formed under the parser's validation. Used by the Creator's
-/// dedicated intro step (which runs AFTER `fable_write_card` made the card) +
-/// by the import path that captures SillyTavern `first_mes`/
-/// `alternate_greetings`. `text` empty → strips any existing intro (clears
-/// the beat). Validates via `parse_from_xml_str` BEFORE the atomic write so a
-/// malformed edit never lands on disk.
+/// (2026-08-24 Part II D1) BRANCH — fork one playthrough into a new session:
+/// the session folder (conversation + split schemas + the saves tree, undo
+/// rings riding along) COPIES to a fresh `session_<ms>` folder whose manifest
+/// carries `memory_partition = "<card>#<new session>"`, and the memory
+/// partition forks (`fork_partition_to` — rows + vectors verbatim, no
+/// re-embed; full post-branch episodic isolation; the codex partitions stay
+/// card-scoped, authored lore is shared by design).
+///
+/// Guards + fail-closed (the Multihog law): a turn in flight refuses (the
+/// copy would race the turn's writes); when the source is the ACTIVE
+/// session, a reserved autosave completes FIRST (the live state is the copy
+/// source); ANY step error rolls the whole branch back — the partial folder
+/// is deleted and the fork key purged — the original is NEVER touched
+/// (copy, not move). Branching is non-destructive: no confirm needed.
 #[tauri::command]
-fn fable_card_set_intro(card_id: String, text: String, app: tauri::AppHandle) -> Result<(), String> {
-    let cards_root = resolve_fable_cards_dir(&app)
-        .ok_or_else(|| "no apps/fable/cards/ dir resolved".to_string())?;
-    let path = resolve_card_file(&cards_root, &card_id, "sim");
-    let existing = std::fs::read_to_string(&path)
-        .map_err(|e| format!("read card for set_intro: {e}"))?;
-    // (2026-08-19) Rebuild through the PARSED card: the tail now carries
-    // `<world>`/`<location>`/`<inventory>` siblings that the old
-    // slice-and-append destroyed on every intro edit. Parse → set the intro →
-    // `serialize_v2` reproduces the canonical layout with every sibling in
-    // place (and lazily converts a legacy card to v2 on its first intro
-    // edit). Validated through the real parser BEFORE the disk touch (the
-    // same gate `fable_write_card` uses).
-    let mut card = sim_card::parse_from_xml_str(&existing)
-        .map_err(|e| format!("existing card failed to parse for set_intro: {e}"))?;
-    // (2026-08-22 intro variants) Setting the intro REPLACES the whole set:
-    // the variants list is what serialize_v2 emits now, so a stale list here
-    // would silently discard the edit. Empty text strips every variant.
-    let trimmed = text.trim().to_owned();
-    card.intro_variants = if trimmed.is_empty() { Vec::new() } else { vec![trimmed.clone()] };
-    card.intro = trimmed;
-    let out = card.serialize_v2();
-    sim_card::parse_from_xml_str(&out).map_err(|e| format!("set_intro rebuild invalid: {e}"))?;
-    write_atomic(&path, out.as_bytes()).map_err(|e| format!("write card (set_intro): {e}"))?;
-    tracing::info!(card_id = %card_id, len = text.trim().len(), "fable_card_set_intro: <intro> sibling written");
-    Ok(())
+async fn fable_session_branch(
+    card_id: String,
+    session_id: String,
+    name: Option<String>,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    if fable_turn_in_flight(&state) {
+        return Err(
+            "a narrator turn is still in flight: stop it (or wait) before branching".into(),
+        );
+    }
+    let fable_root = resolve_apps_dir(&app).join("fable");
+
+    // If the source is the ACTIVE session, flush a reserved autosave FIRST
+    // (awaited — unlike the detached post-mutation spawner, the copy needs
+    // the write COMPLETE) so the branch copies the live timeline.
+    let is_active_session = {
+        let active_card = state
+            .active_card_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let active_session = state
+            .active_session_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        active_card == card_id && active_session.as_deref() == Some(session_id.as_str())
+    };
+    if is_active_session {
+        let card = state
+            .active_fable_card
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let session = state.fable_session.lock().await.clone();
+        let schema = state.fable_schema.lock().await.clone();
+        let history: Vec<(usize, schema::WorldSchema)> = state
+            .fable_schema_history
+            .lock()
+            .await
+            .iter()
+            .cloned()
+            .collect();
+        let root = fable_root.clone();
+        let sid = session_id.clone();
+        let card_ref = card
+            .ok_or_else(|| "active game card vanished mid-branch".to_string())?;
+        let written = tokio::task::spawn_blocking(move || {
+            fable_save::write_save(
+                &root,
+                &card_ref,
+                &sid,
+                fable_save::AUTOSAVE_ID,
+                "Autosave",
+                &session,
+                &schema,
+                &history,
+            )
+        })
+        .await
+        .map_err(|e| format!("autosave join: {e}"))?
+        .map_err(|e| format!("pre-branch autosave: {e}"))?;
+        let _ = written;
+    }
+
+    // Folder copy first (fail-closed: a partial branch folder never
+    // survives), then the memory fork under the manifest's fresh key.
+    let manifest = fable_save::branch_session(&fable_root, &card_id, &session_id, name.as_deref())
+        .map_err(|e| format!("branch session '{session_id}': {e}"))?;
+    let fork_key = manifest
+        .memory_partition
+        .clone()
+        .unwrap_or_else(|| format!("{card_id}#{}", manifest.session_id));
+    // The SOURCE partition: the base card for an original session, the
+    // source's OWN fork key when branching a branch (chained branches
+    // isolate from their true parent).
+    let source_partition = fable_save::load_manifest(&fable_root, &card_id, &session_id)
+        .and_then(|m| m.memory_partition)
+        .unwrap_or_else(|| card_id.clone());
+    if let Some(engine) = state.memory.get() {
+        if let Err(e) = engine.fork_partition_to(&source_partition, &fork_key).await {
+            // Roll back the copied folder (ours — created above). The memory
+            // fork itself is ONE transaction (all rows or nothing), so there
+            // is never a partial fork to purge — and a purge here could only
+            // destroy a PRE-EXISTING partition: the fork-once refusal fires
+            // exactly when the target key already carries rows, so the
+            // correct rollback for it (and every fork error) is nothing.
+            let dest = fable_save::resolve_session_root(&fable_root, &card_id, &manifest.session_id);
+            let _ = std::fs::remove_dir_all(dest);
+            return Err(format!("fork memory partition: {e:#}"));
+        }
+    }
+    tracing::info!(
+        card_id = %card_id,
+        source = %session_id,
+        branch = %manifest.session_id,
+        partition = %fork_key,
+        "session branched"
+    );
+    Ok(serde_json::json!({
+        "session_id": manifest.session_id,
+        "name": manifest.name,
+        "memory_partition": fork_key,
+    }))
+}
+
+/// (2026-08-24 Part II D2) CAMPAIGN EXPORT — zip the WHOLE campaign for
+/// sharing: the card folder (.sim + portraits; `.lnk`/`.ico` are machine
+/// locals and skip), every LINKED codex file (the card's
+/// `<linked_codices>` through the library walker), and the card's whole
+/// `data/saves/<Name>/` tree (sessions + save slots). Destination via the
+/// OS save dialog (tauri-plugin-dialog, the portrait-upload precedent — the
+/// first RUST-side use); the zip builds at `<dest>.tmp` then renames (the
+/// atomic-write discipline). IMPORT is manual-unzip by design: the layout
+/// is positional — `card/` drops into `apps/fable/cards/`, `codex/` into
+/// `apps/fable/data/codex/`, `saves/` into
+/// `apps/fable/data/saves/<CardName>/`. Returns the final path ("" when
+/// the user cancelled the dialog).
+#[tauri::command]
+async fn fable_campaign_export(
+    card_id: String,
+    app: tauri::AppHandle,
+) -> Result<String, String> {
+    let fable_root = resolve_apps_dir(&app).join("fable");
+    let cards_root = fable_root.join("cards");
+    let card_folder = resolve_card_folder(&cards_root, &card_id).ok_or_else(|| {
+        format!("no card folder resolves for '{card_id}' — export needs the card on disk")
+    })?;
+    // The linked codex names come from the card's own `<linked_codices>`
+    // sibling (parse the .sim — the same read the link manager performs).
+    let sim_path = crate::iter_card_sim_paths(&cards_root)
+        .into_iter()
+        .find(|p| p.parent() == Some(&card_folder))
+        .ok_or_else(|| format!("no namesake .sim in {}", card_folder.display()))?;
+    let xml = std::fs::read_to_string(&sim_path)
+        .map_err(|e| format!("read card .sim: {e}"))?;
+    let parsed = sim_card::parse_from_xml_str(&xml)
+        .map_err(|e| format!("parse card .sim: {e:#}"))?;
+    let codex_dir = resolve_codex_dir(&app)
+        .ok_or_else(|| "no apps/fable/data/codex/ dir resolved".to_string())?;
+    let mut codex_files: Vec<std::path::PathBuf> = Vec::new();
+    for name in &parsed.linked_codices {
+        match resolve_codex_file(&codex_dir, name) {
+            Some(p) => {
+                if !codex_files.contains(&p) {
+                    codex_files.push(p);
+                }
+            }
+            None => {
+                // A dangling link survives the library's own validation only
+                // when the file vanished since — skip it, note it in the log.
+                tracing::warn!(codex = %name, "export: linked codex missing from the library — skipped");
+            }
+        }
+    }
+    let saves_root = fable_save::resolve_sessions_root(&fable_root, &card_id);
+    let card_stem = card_folder
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("campaign")
+        .to_string();
+
+    // The OS save dialog (blocking inside spawn_blocking — the async face).
+    let dialog_stem = card_stem.clone();
+    let picked = tokio::task::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        app.clone()
+            .dialog()
+            .file()
+            .set_file_name(format!("{dialog_stem} campaign.zip"))
+            .add_filter("WUPI campaign", &["zip"])
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|e| format!("dialog join: {e}"))?;
+    let Some(dest) = picked else {
+        return Ok(String::new()); // user cancelled — not an error
+    };
+    let dest_path = dest
+        .into_path()
+        .map_err(|e| format!("dialog path: {e}"))?;
+    if dest_path.extension().map(|e| e != "zip").unwrap_or(true) {
+        return Err("destination must be a .zip".into());
+    }
+
+    // Build at <dest>.tmp, then rename (never a half-written zip at the
+    // user-visible path).
+    let tmp_path = dest_path.with_extension("zip.exporting");
+    // The rename fence below needs `tmp_path` after the blocking build, so
+    // the closure gets its own clone.
+    let tmp_build_path = tmp_path.clone();
+    let card_folder = card_folder.clone();
+    let codex_files = codex_files.clone();
+    let saves_root = saves_root.clone();
+    let build = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::ZipWriter;
+        let file = std::fs::File::create(&tmp_build_path)?;
+        let mut zw = ZipWriter::new(file);
+        let opts = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        fn add_file(
+            zw: &mut ZipWriter<std::fs::File>,
+            opts: SimpleFileOptions,
+            path: &std::path::Path,
+            archive_name: &str,
+        ) -> std::io::Result<()> {
+            let bytes = std::fs::read(path)?;
+            zw.start_file(archive_name, opts)?;
+            zw.write_all(&bytes)
+        }
+        fn add_tree(
+            zw: &mut ZipWriter<std::fs::File>,
+            opts: SimpleFileOptions,
+            dir: &std::path::Path,
+            prefix: &str,
+            skip_exts: &[&str],
+        ) -> std::io::Result<()> {
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let p = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if p.is_dir() {
+                    add_tree(zw, opts, &p, &format!("{prefix}{name}/"), skip_exts)?;
+                } else {
+                    let ext = p
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    if skip_exts.contains(&ext.as_str()) {
+                        continue;
+                    }
+                    add_file(zw, opts, &p, &format!("{prefix}{name}"))?;
+                }
+            }
+            Ok(())
+        }
+        add_tree(&mut zw, opts, &card_folder, "card/", &["lnk", "ico"])?;
+        for codex in &codex_files {
+            let name = codex
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if !name.is_empty() {
+                add_file(&mut zw, opts, codex, &format!("codex/{name}"))?;
+            }
+        }
+        if saves_root.is_dir() {
+            add_tree(&mut zw, opts, &saves_root, "saves/", &[])?;
+        }
+        zw.finish()?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("zip join: {e}"))?
+    .map_err(|e| format!("build campaign zip: {e}"))?;
+    let _ = build;
+    std::fs::rename(&tmp_path, &dest_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path);
+        format!("finalize campaign zip: {e}")
+    })?;
+    tracing::info!(card_id = %card_id, path = %dest_path.display(), "campaign exported");
+    Ok(dest_path.to_string_lossy().to_string())
 }
 
 /// Write a portrait/cover image as a sibling of an EXPLICIT card_id's `.sim`.
@@ -17469,6 +23054,14 @@ fn fable_card_portrait_write(
         return Err(format!("unsupported portrait ext '{ext}': png/jpg only"));
     }
     let bytes = base64_decode(&bytes_b64)?;
+    // (2026-08-24 review fix) Size cap — see PORTRAIT_MAX_BYTES.
+    if bytes.len() > PORTRAIT_MAX_BYTES {
+        return Err(format!(
+            "portrait is too large ({} bytes; max {})",
+            bytes.len(),
+            PORTRAIT_MAX_BYTES
+        ));
+    }
     // (P3) Magic-byte validation — mirrors fable_player_portrait_upload_bytes
     // + the background import: a non-image payload must never land on disk
     // as a portrait file (the ext allowlist alone doesn't check content).
@@ -17496,8 +23089,7 @@ fn fable_card_portrait_write(
     write_atomic(&path, &bytes).map_err(|e| format!("write portrait: {e}"))?;
     // (#61) Reap stale siblings: discovery prefers png > jpg > jpeg, so
     // uploading a new JPEG over an old PNG left the stale PNG winning
-    // forever. The just-written file is the only truth — and a fresh write
-    // also folds away any lingering legacy `portrait.<ext>` files.
+    // forever. The just-written file is the only truth.
     reap_stale_portraits(&card_dir, file_ext);
     // (2026-08-19) The .lnk/.ico derive from the portrait, but the CREATE
     // flow writes the portrait AFTER the card — the shortcut built at
@@ -17508,7 +23100,6 @@ fn fable_card_portrait_write(
     // shortcut failure must never fail the portrait write.
     if file_ext != "png" {
         let _ = std::fs::remove_file(card_dir.join(format!("{stem}.ico")));
-        let _ = std::fs::remove_file(card_dir.join("portrait.ico"));
     }
     if let Err(e) = build_card_shortcut(&app, &card_id, false) {
         tracing::warn!(card_id = %card_id, err = %e, "portrait write: shortcut refresh failed (non-fatal)");
@@ -17518,20 +23109,16 @@ fn fable_card_portrait_write(
 }
 
 /// Remove every stale portrait sibling in `dir` except the just-written
-/// `<stem>.<keep_ext>` (#61 + the 2026-08-19 namesake rename): other-ext
-/// namesake files AND every legacy `portrait.<ext>` (all exts — a fresh
-/// write folds the folder fully onto the namesake convention). The
-/// case-insensitive keep-guard covers a folder literally named "portrait",
-/// where the namesake + legacy names denote the SAME file on Windows.
-/// Best-effort: a failed removal is logged, never fatal — worst case the
-/// stale file lingers until the next portrait write.
+/// `<stem>.<keep_ext>` (#61): other-ext namesake files. Best-effort: a
+/// failed removal is logged, never fatal — worst case the stale file
+/// lingers until the next portrait write.
 fn reap_stale_portraits(dir: &std::path::Path, keep_ext: &str) {
     let Some(stem) = dir.file_name().and_then(|n| n.to_str()).map(|s| s.to_owned()) else {
         return;
     };
     let keep_name = format!("{stem}.{keep_ext}");
     for ext in ["png", "jpg", "jpeg"] {
-        for name in [format!("{stem}.{ext}"), format!("portrait.{ext}")] {
+        for name in [format!("{stem}.{ext}")] {
             if name.eq_ignore_ascii_case(&keep_name) {
                 continue;
             }
@@ -17790,6 +23377,14 @@ async fn fable_background_active_set(
     if !fable_is_active(&state) {
         return Err("no fable game active: call fable_start first".to_string());
     }
+    // (2026-08-24 mid-turn guard) Same refusal as every schema-swapping
+    // sibling: the selection write + its per-session persist must not race
+    // an in-flight turn's bracket apply + autosave.
+    if fable_turn_in_flight(&state) {
+        return Err(
+            "a narrator turn is still in flight: stop it (or wait) before changing the background selection".into(),
+        );
+    }
     match filename {
         None => {
             {
@@ -17846,12 +23441,11 @@ fn safe_shortcut_name(name: &str) -> String {
     }
 }
 
-/// The `.lnk` label for a card's shortcut: the card's parsed `<identity>
-/// <name>`, falling back to the folder slug for pre-reorg (2026-08-01) cards
-/// whose legacy top-level `<name>` the parser doesn't read (parse yields
-/// "unknown") — so a shortcut is "Launch One Piece.lnk", never "Launch
-/// unknown.lnk". Shared by `build_card_shortcut` (create) AND
-/// `fable_card_delete` (Desktop reap) so the two always agree on the filename.
+/// The `.lnk` label for a card's shortcut: the card's parsed name, falling
+/// back to the folder slug when the parse yields no name ("unknown") — so a
+/// shortcut is "Launch One Piece.lnk", never "Launch unknown.lnk". Shared by
+/// `build_card_shortcut` (create) AND `fable_card_delete` (Desktop reap) so
+/// the two always agree on the filename.
 fn card_shortcut_label(sim_path: &std::path::Path, card_slug: &str) -> String {
     let card_name = sim_card::load_or_fallback(sim_path).name;
     let display_name = if card_name.trim().is_empty() || card_name == "unknown" {
@@ -17874,9 +23468,8 @@ fn card_shortcut_label(sim_path: &std::path::Path, card_slug: &str) -> String {
 ///
 /// Shared by the `create_card_shortcut` IPC (manual / desktop export), the
 /// auto-creation hook in `fable_write_card` (in-folder only, best-effort),
-/// the post-portrait refresh in `fable_card_portrait_write` (the CREATE flow
-/// lands the portrait AFTER the card — this is what mints the .ico), + the
-/// boot migration's self-heal (a PNG portrait without its namesake .ico).
+/// + the post-portrait refresh in `fable_card_portrait_write` (the CREATE
+/// flow lands the portrait AFTER the card — this is what mints the .ico).
 fn build_card_shortcut(
     app: &tauri::AppHandle,
     card_slug: &str,
@@ -17919,8 +23512,7 @@ fn build_card_shortcut(
     // (observed live: get_launch_context returned cardSlug "One"). Quoted,
     // it round-trips as the single argv token the parser expects. The token
     // is the DISPLAY FOLDER NAME (the durable on-disk identity — survives
-    // name edits; `find_card_by_id` also matches it case-insensitively as a
-    // fallback, so legacy slug .lnks keep launching too).
+    // name edits; `find_card_by_id` also matches it case-insensitively).
     let folder_name = card_dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -17928,8 +23520,8 @@ fn build_card_shortcut(
         .to_string();
     let args = format!("--card \"{folder_name}\"");
 
-    // Icon: wrap the card's PNG portrait (namesake `<Name>.png`, legacy
-    // `portrait.png` fallback — whichever discovery found) into a namesake
+    // Icon: wrap the card's PNG portrait (namesake `<Name>.png`) into a
+    // namesake
     // `<Name>.ico` (only PNG — ICO can't embed a JPEG). Anything else (jpg /
     // no portrait) → None → fable.exe's F icon.
     let icon_path: Option<std::path::PathBuf> = {
@@ -18041,6 +23633,115 @@ fn tool_delete_targets_active_card(state: &AppState, args: &serde_json::Value) -
         .is_some_and(|a| a.eq_ignore_ascii_case(&slug))
 }
 
+/// Case-insensitive path equality with separator normalization (model tool
+/// paths may arrive with `/` while the resolvers produce `\`).
+fn path_eq_ci(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let norm =
+        |p: &std::path::Path| p.to_string_lossy().replace('\\', "/").to_lowercase();
+    norm(a) == norm(b)
+}
+
+/// (2026-08-24 active-card guards) Mid-session protection for the ACTIVE
+/// card at the tool-dispatch chokepoint. Returns `Some(refusal)` when the
+/// call must not execute:
+/// - `create_sim_card` whose PARSED id matches the active card: the
+///   create/overwrite path derives the folder from the display name and a
+///   true rename MIGRATES the folder + sessions tree mid-game — edit the
+///   active card's .sim in place (`file_write`) instead.
+/// - `file_delete` on the active card's .sim: the same ghost-factory
+///   rationale as `tool_delete_targets_active_card` (the running session's
+///   autosave + archival spawn resurrect it).
+/// - `file_write` to the active card's .sim: allowed only when the content
+///   parses into a PLAYABLE v2 card carrying the SAME id — a model write
+///   must never corrupt the live card file.
+/// No game seated (or benign shapes) → `None` (execute normally). Pure
+/// checks against std mutexes + the walker-resolved folder — no awaits.
+fn active_card_tool_refusal(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    call: &tools::ToolCall,
+) -> Option<String> {
+    let card_id = {
+        let guard = state
+            .active_fable_card
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        guard.as_ref().map(|c| c.id.clone())?
+    };
+    let active_sim = {
+        let cards_root = resolve_fable_cards_dir(app)?;
+        resolve_card_file(&cards_root, &card_id, "sim")
+    };
+    // The same resolution the file tools use (install root + sandboxed rel).
+    let targets_active_sim = |rel: &str| -> bool {
+        match tools::sandbox_path(rel) {
+            Some(clean) => path_eq_ci(&resolve_install_root(app).join(clean), &active_sim),
+            None => false,
+        }
+    };
+
+    match call.name.as_str() {
+        "create_sim_card" => {
+            let xml = call.args.get("xml").and_then(|v| v.as_str()).unwrap_or("");
+            // A parse failure is the tool's own error to report — only the
+            // id collision is ours to refuse.
+            if let Ok(parsed) = sim_card::parse_from_xml_str(xml) {
+                if parsed.id.eq_ignore_ascii_case(&card_id) {
+                    return Some(
+                        "error: that card's game session is active — edit its .sim in \
+                         place with file_write instead (create/overwrite can migrate its \
+                         folder mid-game); replace it from the title screen after ending \
+                         the session"
+                            .to_owned(),
+                    );
+                }
+            }
+            None
+        }
+        "file_delete" => {
+            let rel = call.args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if targets_active_sim(rel) {
+                return Some(
+                    "error: that is the ACTIVE card's .sim — its session is running; end \
+                     the session to the title screen before deleting it"
+                        .to_owned(),
+                );
+            }
+            None
+        }
+        "file_write" => {
+            let (Some(rel), Some(content)) = (
+                call.args.get("path").and_then(|v| v.as_str()),
+                call.args.get("content").and_then(|v| v.as_str()),
+            ) else {
+                return None;
+            };
+            if !targets_active_sim(rel) {
+                return None;
+            }
+            match sim_card::parse_from_xml_str(content) {
+                Err(e) => Some(format!(
+                    "error: active card write refused — not a valid .sim: {e:#}"
+                )),
+                Ok(parsed) => {
+                    if !parsed.id.eq_ignore_ascii_case(&card_id) {
+                        Some(
+                            "error: active card write refused — the .sim must keep its \
+                             current id (rename/replace happens from the title screen)"
+                                .to_owned(),
+                        )
+                    } else {
+                        ensure_playable_v2(&parsed)
+                            .err()
+                            .map(|e| format!("error: active card write refused — {e}"))
+                    }
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
 /// (2026-08-20 audit P2-6) What the `delete_sim_card` TOOL path must capture
 /// BEFORE `tool.execute` removes the folder: the card's PARSED `<id>` (the
 /// true memory-partition key — a legacy stray folder's stem can drift from
@@ -18052,6 +23753,12 @@ fn tool_delete_targets_active_card(state: &AppState, args: &serde_json::Value) -
 struct SimDeleteAftermath {
     parsed_id: Option<String>,
     lnk_name: Option<String>,
+    /// (2026-08-22 session decoupling) The card's sessions tree under
+    /// `data/saves/<Name>/`, resolved PRE-delete — the display folder name
+    /// dies with the card folder, and the post-delete walker fallback can
+    /// miss a collision-relieved stem ("Name 2"). The hook removes it so the
+    /// tool path matches `fable_card_delete`'s total footprint.
+    sessions_tree: Option<std::path::PathBuf>,
 }
 
 fn capture_sim_delete_aftermath(
@@ -18070,12 +23777,23 @@ fn capture_sim_delete_aftermath(
         .and_then(|xml| sim_card::parse_from_xml_str(&xml).ok())
         .map(|c| c.id);
     let lnk_name = Some(format!("Launch {}.lnk", card_shortcut_label(&sim_path, &slug)));
-    Some(SimDeleteAftermath { parsed_id, lnk_name })
+    // Resolve the sessions tree while the card folder still exists (the
+    // display folder name is its key).
+    let sessions_tree = resolve_fable_root(app).and_then(|fable_root| {
+        sim_path
+            .parent()
+            .and_then(|dir| dir.file_name())
+            .and_then(|n| n.to_str())
+            .map(|name| fable_root.join("data").join("saves").join(name))
+    });
+    Some(SimDeleteAftermath { parsed_id, lnk_name, sessions_tree })
 }
 
 async fn purge_deleted_card_memory(state: &AppState, card_id: &str) {
     let Some(engine) = state.memory.get() else { return };
-    match engine.purge_card_partition(card_id).await {
+    // (2026-08-24 Part II D1) FAMILY sweep — the base partition plus
+    // every branch fork `card_id#*`.
+    match engine.purge_card_family(card_id).await {
         Ok(0) => {}
         Ok(n) => tracing::info!(card_id = %card_id, purged = n, "deleted card's memory partition purged"),
         Err(e) => tracing::error!(
@@ -18086,18 +23804,21 @@ async fn purge_deleted_card_memory(state: &AppState, card_id: &str) {
     }
 }
 
-/// Delete a card's entire per-card folder (`cards/<Name>/` — the `.sim` + every
-/// sibling: `.intro`, `.codex`, `world.json`, `player.json`, `npc.json`, the
-/// portrait + `.ico`, the `saves/` tree, AND the in-folder `Launch
-/// <Name>.lnk`). Added 2026-08-05 for the LOAD menu's DELETE action; the
-/// desktop `.lnk` (exported by `create_card_shortcut`) is reaped here too.
-/// Mirrors `fable_player_delete`'s discipline: path-traversal guard on the id
-/// + a confirm-the-folder-is-a-real-card check (the namesake `<id>.sim` must
-/// exist) before `remove_dir_all`, so a stray id can't nuke an unrelated
-/// sibling directory. Idempotent: a missing folder is Ok (and the early
-/// return also purges the memory partition — the legacy-ghost cleanup).
-/// The §4 retention follow-up (2026-08-15) purges the card's memory
-/// partition after the folder falls: see [`purge_deleted_card_memory`].
+/// Delete a card's entire footprint: the STATIC per-card folder
+/// (`cards/<Name>/` — the `.sim`, portraits, `.ico`, the in-folder
+/// `Launch <Name>.lnk`) AND the centralized sessions tree
+/// (`apps/fable/data/saves/<Name>/` — every playthrough's session + schema
+/// + save slots; §6.2). Linked codex library files SURVIVE (they are
+/// universal, `data/codex/`). Added 2026-08-05 for the LOAD menu's DELETE
+/// action; the desktop `.lnk` (exported by `create_card_shortcut`) is
+/// reaped here too. Mirrors `fable_player_delete`'s discipline:
+/// path-traversal guard on the id + a confirm-the-folder-is-a-real-card
+/// check (the namesake `.sim` must exist) before `remove_dir_all`, so a
+/// stray id can't nuke an unrelated sibling directory. Idempotent: a
+/// missing folder is Ok (and the early return also purges the memory
+/// partition — the legacy-ghost cleanup). The §4 retention follow-up
+/// (2026-08-15) purges the card's memory partition after the folder
+/// falls: see [`purge_deleted_card_memory`].
 #[tauri::command]
 async fn fable_card_delete(
     card_id: String,
@@ -18321,6 +24042,24 @@ async fn fable_rollback(
         hist.pop_back().map(|(_tag, snap)| snap)
     };
     let prior = prior.ok_or_else(|| "nothing to roll back: history is empty".to_string())?;
+    let diff = restore_fable_history_entry(&state, &app, prior).await;
+    Ok(diff)
+}
+
+/// (2026-08-23 Playground) The shared restore core behind `fable_rollback`'s
+/// pop and the Playground's `playground_history_restore` — ONE code path so
+/// the two can never drift: diff the restore for the report, wholesale-
+/// overwrite the live schema (bypassing the immutability lock by design —
+/// the user-initiated-restore precedent, same shape as `fable_load_save`),
+/// persist to the reserved autosave immediately (#58 — an abrupt exit after
+/// a restore must never resurrect the pre-restore state from a stale
+/// autosave), and emit the `fable_rollback` event so the drawer/stage UI
+/// refreshes for BOTH callers.
+async fn restore_fable_history_entry(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    prior: schema::WorldSchema,
+) -> RollbackDiff {
     let diff = {
         let live = state.fable_schema.lock().await;
         // diff_schemas(prior=before-rollback-state, live=after-rollback-state):
@@ -18336,7 +24075,7 @@ async fn fable_rollback(
     tracing::info!(
         entities_changed = diff.entities_changed.len(),
         summary_changed = diff.summary_changed,
-        "fable_rollback: restored prior world state"
+        "fable history restore: prior world state reinstalled"
     );
     // (#58) Persist the restored schema to the autosave immediately — an
     // abrupt exit after a rollback used to leave autosave/session.json at
@@ -18346,9 +24085,9 @@ async fn fable_rollback(
     // (2026-08-16 deferred-2) Snapshot-at-enqueue via the shared helper — the
     // restore just completed above, so the captured pairing is the restored
     // state by construction.
-    spawn_reserved_autosave(&app, &state).await;
+    spawn_reserved_autosave(app, state).await;
     let _ = app.emit("fable_rollback", &diff);
-    Ok(diff)
+    diff
 }
 
 /// Return the current depth of the schema history ring buffer. The frontend
@@ -18356,6 +24095,1471 @@ async fn fable_rollback(
 #[tauri::command]
 async fn fable_history_depth(state: tauri::State<'_, AppState>) -> Result<usize, String> {
     Ok(state.fable_schema_history.lock().await.len())
+}
+
+// ===========================================================================
+// (2026-08-23) THE PLAYGROUND — the Sand Table turned player-facing UI.
+//
+// A god-mode control surface over the live world simulation: auto-pass /
+// freeze-clamps flags, wealth + inventory sculpting, hazard dice for
+// testing, the NPC cast sculptor (tiers, interiors, registry surgery,
+// milestone injection, revive), the world engine (time skip, forced tick,
+// asset spawner, threat), and the snapshot-ring inspector. The plan's four
+// baked defaults: (1) FREEZE covers every survival clamp that EXISTS
+// (fatigue floors, Impaired, Starving — sanity wires in when its lane
+// ships); (2) report buttons for every referee + an apply-failure button +
+// a spawn-hostiles shortcut; (3) the god flags are session-scoped
+// AtomicBools, forced off at every session boundary, NEVER persisted;
+// (4) near-name = one shared resolver used by BOTH the Playground cleanup
+// tool AND the live [NPC_REGISTER] guard.
+//
+// Discipline: every MUTATING command follows the `fable_rollback` shape —
+// guard → clone pre-state → `push_fable_history_snapshot` → mutate under
+// `state.fable_schema.lock()` → `spawn_reserved_autosave` → return the new
+// state/report. Report-only commands skip the in-flight check (a rolling
+// narrator never conflicts with a read) but keep the active check. All
+// args are JSON scalars (anti-pattern #5). ZERO prompt-surface changes —
+// the Prime Mandate is untouched (the one new directive line, the
+// near-name bracket teaching, is the live-guard block above).
+// ===========================================================================
+
+/// The shared Playground guard. `report_only` (dice reports + reads + the
+/// pure near-name search) skips the in-flight refusal — a read can never
+/// conflict with a live turn — but keeps the active-session check.
+fn playground_guard(state: &tauri::State<'_, AppState>, report_only: bool) -> Result<(), String> {
+    if !report_only && fable_turn_in_flight(state) {
+        return Err(
+            "a narrator turn is still in flight: stop it (or wait) before using the Playground"
+                .into(),
+        );
+    }
+    if !fable_is_active(state) {
+        return Err("no fable game active: call fable_start first".to_string());
+    }
+    Ok(())
+}
+
+/// "Day N, HH:MM" for the reports (day 1 = the first 1440 minutes).
+fn pg_time_label(minutes: i64) -> String {
+    let day = minutes.div_euclid(1440) + 1;
+    let tod = minutes.rem_euclid(1440);
+    format!("Day {day}, {:02}:{:02}", tod / 60, tod % 60)
+}
+
+/// The Playground time-skip clamp: 1 minute ..= one week (10080). Pure —
+/// pinned by tests. BYPASSES the [TIME] pacing clamp by design (a god skip
+/// is not a narrated bracket); the clamp exists so a typo'd custom field
+/// can't jump the clock a year.
+const PLAYGROUND_SKIP_MIN_MAX: i64 = 10080;
+fn clamp_playground_skip_minutes(minutes: i64) -> i64 {
+    minutes.clamp(1, PLAYGROUND_SKIP_MIN_MAX)
+}
+
+/// The Playground wealth-delta clamp: pocket wealth lives in
+/// `[0, LEDGER_AMOUNT_MAX]`, saturating on negative dips (never a wrap).
+/// Pure — pinned by tests.
+fn apply_playground_wealth_delta(current: u32, delta: i64) -> u32 {
+    // saturating_add: `delta` is a raw IPC i64 — i64::MAX would overflow the
+    // plain `+` (debug panic, release wrap → a clamped-to-zero wallet).
+    i64::from(current)
+        .saturating_add(delta)
+        .clamp(0, i64::from(economy::LEDGER_AMOUNT_MAX)) as u32
+}
+
+/// Lowercase alphanumeric word set (≥3-char words only — "the"/"of"/"a"
+/// noise never matches), shared by the revive sweep + the needs-revive
+/// flag. CHARS-based (anti-pattern #6 discipline).
+fn pg_word_set(s: &str) -> std::collections::HashSet<String> {
+    s.to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .map(str::to_string)
+        .collect()
+}
+
+/// Does a terminal asset's label word-match the NPC name? (The revive
+/// sweep's filter: "Dead Kira" / "Kira (slain)" match "Kira".)
+fn pg_asset_name_matches(asset_name: &str, npc_name: &str) -> bool {
+    let assets = pg_word_set(asset_name);
+    pg_word_set(npc_name).iter().any(|w| assets.contains(w))
+}
+
+/// Summarize the undo ring WITHOUT touching it — the SNAPSHOT RING
+/// INSPECTOR's read. Each entry: index, turn tag (the message count at
+/// push), clock label + raw minutes, day, node, pocket wealth.
+async fn playground_history_list(state: &AppState) -> Vec<serde_json::Value> {
+    let hist = state.fable_schema_history.lock().await;
+    hist.iter()
+        .enumerate()
+        .map(|(index, (tag, snap))| {
+            serde_json::json!({
+                "index": index,
+                "turn_tag": tag,
+                "minutes": snap.world_clock.current_minutes,
+                "clock": pg_time_label(snap.world_clock.current_minutes),
+                "day": snap.world_clock.current_minutes.div_euclid(1440) + 1,
+                "node": snap.travel_graph.current_node.clone().unwrap_or_default(),
+                "wealth": snap.player_state.wealth,
+            })
+        })
+        .collect()
+}
+
+/// The PLAYER panel's read: god flags + wallet + carried stacks + the
+/// survival status lines the FREEZE toggle governs.
+#[tauri::command]
+async fn playground_player_get(
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, true)?;
+    let s = state.fable_schema.lock().await;
+    let now = s.world_clock.current_minutes;
+    let impaired = s
+        .status_tags
+        .iter()
+        .any(|t| t.label.eq_ignore_ascii_case("Impaired") && !t.is_expired(now));
+    let starving = s
+        .status_tags
+        .iter()
+        .any(|t| t.label.eq_ignore_ascii_case("Starving"));
+    let fatigue_band = if s.last_rest_minutes > 0 {
+        schema::rested_band(now.saturating_sub(s.last_rest_minutes)).unwrap_or("")
+    } else {
+        ""
+    };
+    let stacks = |items: &[equipment::StackItem]| {
+        items
+            .iter()
+            .map(|it| {
+                serde_json::json!({
+                    "name": it.name,
+                    "qty": it.qty,
+                    "tags": it.tags.iter().map(|t| t.id().to_string()).collect::<Vec<_>>(),
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    Ok(serde_json::json!({
+        "flags": {
+            "auto_pass": state.playground_auto_pass.load(std::sync::atomic::Ordering::Relaxed),
+            "freeze_clamps": state.playground_freeze_clamps.load(std::sync::atomic::Ordering::Relaxed),
+        },
+        "clock": { "minutes": now, "label": pg_time_label(now) },
+        "wealth": {
+            "amount": s.player_state.wealth,
+            "display": economy::format_money(i64::from(s.player_state.wealth), &s.currency_label),
+            "currency_label": s.currency_label,
+        },
+        "status": {
+            "stamina": s.player_state.stamina.semantic(),
+            "mana": s.player_state.mana.as_ref().map(|m| m.semantic()),
+            "health": consequence::derive_health_tier(
+                &s.player_state.body,
+                &s.status_tags,
+                now,
+            ).semantic(),
+            "impaired": impaired,
+            "starving": starving,
+            "fatigue_band": fatigue_band,
+            "last_rest_minutes": s.last_rest_minutes,
+        },
+        "containers": {
+            "belt": stacks(&s.player_state.belt),
+            "pouch": stacks(&s.player_state.pouch),
+            "pack": stacks(&s.player_state.pack),
+        },
+    }))
+}
+
+/// Set the god flags (AUTO-PASS CHECKS / FREEZE CLAMPS). AppState only — no
+/// schema mutation, no undo entry, no autosave. Partial by design: only the
+/// provided keys flip. Full guard (not report-only): a flag flip mid-turn
+/// changes how the in-flight turn's referee rolls resolve.
+#[tauri::command]
+async fn playground_flags_set(
+    auto_pass: Option<bool>,
+    freeze_clamps: Option<bool>,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    if let Some(v) = auto_pass {
+        state
+            .playground_auto_pass
+            .store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(v) = freeze_clamps {
+        state
+            .playground_freeze_clamps
+            .store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+    tracing::info!(
+        auto_pass = state.playground_auto_pass.load(std::sync::atomic::Ordering::Relaxed),
+        freeze_clamps = state.playground_freeze_clamps.load(std::sync::atomic::Ordering::Relaxed),
+        "[playground] god flags set"
+    );
+    Ok(serde_json::json!({
+        "auto_pass": state.playground_auto_pass.load(std::sync::atomic::Ordering::Relaxed),
+        "freeze_clamps": state.playground_freeze_clamps.load(std::sync::atomic::Ordering::Relaxed),
+    }))
+}
+
+/// Pouch-gold stepper: apply a signed delta to pocket wealth, clamped to
+/// `[0, LEDGER_AMOUNT_MAX]`. Undo-ringed + autosaved (a sculpted wallet is
+/// a real world mutation).
+#[tauri::command]
+async fn playground_wealth_delta(
+    delta: i64,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    let (before, after, display) = {
+        let mut s = state.fable_schema.lock().await;
+        let before = s.player_state.wealth;
+        let after = apply_playground_wealth_delta(before, delta);
+        if after == before {
+            return Ok(serde_json::json!({
+                "before": before, "after": after, "display":
+                economy::format_money(i64::from(after), &s.currency_label),
+            }));
+        }
+        let snap = s.clone();
+        s.player_state.wealth = after;
+        let display = economy::format_money(i64::from(after), &s.currency_label);
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        (before, after, display)
+    };
+    spawn_reserved_autosave(&app, &state).await;
+    Ok(serde_json::json!({ "before": before, "after": after, "display": display }))
+}
+
+/// Inventory tag editor: set one carried stack's behavior-tag set
+/// (consumable / equippable / pouchable). Unknown tags are dropped by
+/// `equipment::parse_tag_list` (the shared parser — the bracket path's
+/// vocabulary, never a free-form write).
+#[tauri::command]
+async fn playground_item_tag_set(
+    container: String,
+    name: String,
+    tags: Vec<String>,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    let parsed = equipment::parse_tag_list(&tags.join(","));
+    let tag_ids: Vec<String> = parsed.iter().map(|t| t.id().to_string()).collect();
+    let target = name.trim().to_string();
+    if target.is_empty() {
+        return Err("item name is required".to_string());
+    }
+    let changed = {
+        let mut s = state.fable_schema.lock().await;
+        // Pre-state snapshot BEFORE the mutation (the discipline every
+        // Playground mutator follows).
+        let snap = s.clone();
+        let items: &mut Vec<equipment::StackItem> = match container.as_str() {
+            "belt" => &mut s.player_state.belt,
+            "pouch" => &mut s.player_state.pouch,
+            "pack" => &mut s.player_state.pack,
+            other => return Err(format!("unknown container \"{other}\" — use belt / pouch / pack")),
+        };
+        let Some(stack) = items.iter_mut().find(|it| it.name == target) else {
+            return Err(format!("no item named \"{target}\" in the {container}"));
+        };
+        if stack.tags == parsed {
+            drop(s);
+            return Ok(serde_json::json!({
+                "container": container, "name": target, "tags": tag_ids,
+            }));
+        }
+        stack.tags = parsed;
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        true
+    };
+    if changed {
+        spawn_reserved_autosave(&app, &state).await;
+    }
+    Ok(serde_json::json!({ "container": container, "name": target, "tags": tag_ids }))
+}
+
+/// The dice-math report buttons. `kind` ∈ travel | rest | loot — the first
+/// two roll the EXACT check the live referee would roll at this minute +
+/// node (parity by construction, hazard::playground_*_report); loot runs
+/// the generator's pure roll (tier + prosperity inputs). PURE — no
+/// mutation, no undo entry.
+#[tauri::command]
+async fn playground_hazard_roll(
+    kind: String,
+    tier: Option<String>,
+    // (2026-08-24 review P2) i64 on the WIRE, validated inside — a bare u8
+    // parameter surfaced Tauri's raw deserialize error for out-of-range
+    // numbers instead of a friendly message.
+    prosperity: Option<i64>,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, true)?;
+    if let Some(p) = prosperity {
+        if !(0..=200).contains(&p) {
+            return Err(format!("prosperity must be 0–200 (got {p})"));
+        }
+    }
+    let prosperity: Option<u8> = prosperity.map(|p| p as u8);
+    let s = state.fable_schema.lock().await;
+    let now = s.world_clock.current_minutes;
+    let cur = s.travel_graph.current_node.clone();
+    match kind.as_str() {
+        "travel" => {
+            let node_id = cur.clone().unwrap_or_default();
+            let report = hazard::playground_travel_report(now, &node_id, &s.rumors);
+            Ok(serde_json::json!({
+                "kind": "travel",
+                "node": node_id,
+                "dc": report.dc,
+                "roll": report.roll,
+                "fired": report.fired,
+                "valence": report.valence.map(|v| v.label()),
+                "detail": report.detail,
+            }))
+        }
+        "rest" => {
+            let node_id = cur.clone().unwrap_or_default();
+            let node = cur
+                .as_deref()
+                .and_then(|c| s.travel_graph.nodes.iter().find(|n| n.id == c));
+            let map_key = cur
+                .as_deref()
+                .and_then(|c| site_map::active_site_map_key(&s.site_maps, Some(c)));
+            let map = map_key.as_deref().and_then(|k| s.site_maps.get(k));
+            let report = hazard::playground_rest_report(now, &node_id, node, map);
+            Ok(serde_json::json!({
+                "kind": "rest",
+                "node": node_id,
+                "dc": report.dc,
+                "roll": report.roll,
+                "fired": report.fired,
+                "valence": report.valence.map(|v| v.label()),
+                "detail": report.detail,
+            }))
+        }
+        "loot" => {
+            let tier_word = tier.as_deref().unwrap_or("soldier").trim().to_lowercase();
+            let tier_parsed = player_state::parse_attacker_tier(&tier_word)
+                .ok_or_else(|| format!("unknown tier \"{tier_word}\" — use minion / soldier / elite / boss / legendary"))?;
+            let prosperity = prosperity
+                .or_else(|| {
+                    cur.as_deref().and_then(|c| {
+                        s.travel_graph.nodes.iter().find(|n| n.id == c)
+                    })
+                    .map(|n| n.prosperity)
+                })
+                .unwrap_or(100);
+            let r = hazard::playground_loot_roll(now, tier_parsed, prosperity);
+            Ok(serde_json::json!({
+                "kind": "loot",
+                "roll": r.roll,
+                "tier_mod": r.tier_mod,
+                "prosperity_mod": r.prosperity_mod,
+                "total": r.total,
+                "rarity": r.rarity.label(),
+                "capped": r.capped,
+                "detail": format!(
+                    "d20 {} + tier {} + prosperity {} = {} → {}{}",
+                    r.roll, r.tier_mod, r.prosperity_mod, r.total, r.rarity.label(),
+                    if r.capped { " (tier-capped)" } else { "" }
+                ),
+            }))
+        }
+        other => Err(format!("unknown roll kind \"{other}\" — use travel / rest / loot")),
+    }
+}
+
+/// FORCE REST — the god rest: full recovery steps + the rested anchor at
+/// the current clock, NO interruption roll (that referee has its own report
+/// button + the apply-failure button beside this).
+#[tauri::command]
+async fn playground_force_rest(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    let report = {
+        let mut s = state.fable_schema.lock().await;
+        if !s.world_clock.is_set() {
+            return Err("the world clock is not set yet — play a turn or set [TIME] first".into());
+        }
+        let snap = s.clone();
+        let steps = schema::rest_recovery_steps(8); // a full night's rest
+        for _ in 0..steps {
+            s.player_state.stamina.recover();
+            if let Some(m) = s.player_state.mana.as_mut() {
+                m.recover();
+            }
+        }
+        s.last_rest_minutes = s.world_clock.current_minutes;
+        let out = serde_json::json!({
+            "steps": steps,
+            "stamina": s.player_state.stamina.semantic(),
+            "mana": s.player_state.mana.as_ref().map(|m| m.semantic()),
+            "anchored_at": pg_time_label(s.world_clock.current_minutes),
+        });
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        out
+    };
+    spawn_reserved_autosave(&app, &state).await;
+    Ok(report)
+}
+
+/// AMBUSH's apply-failure arm — land the 30-minute "Impaired" debuff NOW
+/// (exactly the interrupted-rest stamp). Refused while FREEZE CLAMPS is
+/// on: the flag's whole job is keeping survival clamps off the player.
+#[tauri::command]
+async fn playground_apply_interruption(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    if state.playground_freeze_clamps.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("FREEZE CLAMPS is on — the Impaired debuff is frozen. Unfreeze to apply it.".into());
+    }
+    let expires_at = {
+        let mut s = state.fable_schema.lock().await;
+        if !s.world_clock.is_set() {
+            return Err("the world clock is not set yet — play a turn or set [TIME] first".into());
+        }
+        let snap = s.clone();
+        let expires_at = s.world_clock.current_minutes + hazard::IMPAIRED_TAG_MINUTES;
+        consequence::upsert_tag(
+            &mut s.status_tags,
+            consequence::StatusTag {
+                label: "Impaired".to_string(),
+                polarity: consequence::Polarity::Debuff,
+                expires_at,
+                source: "interrupted rest".to_string(),
+                kind: String::new(),
+            },
+            settings::FABLE_STATUS_TAG_CAP,
+        );
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        expires_at
+    };
+    spawn_reserved_autosave(&app, &state).await;
+    Ok(serde_json::json!({
+        "expires_at": expires_at,
+        "expires_label": pg_time_label(expires_at),
+    }))
+}
+
+/// The NPC panel's read: the full cast with live interiors + relationship
+/// tiers + revive flags, and the default milestone list for the injector's
+/// select.
+#[tauri::command]
+async fn playground_npc_get(
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, true)?;
+    let s = state.fable_schema.lock().await;
+    // needs_revive: an archived interior OR a terminal site asset whose
+    // label word-matches the name (the reaper's stub / a corpse on a map).
+    let dead_marked = |name: &str| {
+        s.site_maps.values().any(|m| {
+            m.assets
+                .iter()
+                .any(|a| site_map::is_terminal(a.state) && pg_asset_name_matches(&a.name, name))
+        })
+    };
+    let cast: Vec<serde_json::Value> = s
+        .npc_registry
+        .entries
+        .iter()
+        .map(|e| {
+            let interior = s.npc_interior.get(&e.id);
+            let rel = s.relationships.get(&e.id);
+            serde_json::json!({
+                "id": e.id,
+                "name": e.name,
+                "role": e.role,
+                "tier": e.tier,
+                "prominence": match e.prominence {
+                    schema::NpcProminence::Core => "core",
+                    schema::NpcProminence::Named => "named",
+                },
+                "aliases": e.aliases,
+                "mood": interior.and_then(|i| i.mood.clone()),
+                "intent": interior.and_then(|i| i.intent.clone()),
+                "archived": interior.and_then(|i| i.archived.clone()),
+                "last_seen_minutes": interior.map(|i| i.last_seen_minutes).unwrap_or(0),
+                "relationship_tier": rel.map(|r| r.tier.tag()),
+                "needs_revive": interior.is_some_and(|i| i.archived.is_some())
+                    || dead_marked(if e.name.is_empty() { &e.id } else { &e.name }),
+            })
+        })
+        .collect();
+    let mut milestones: Vec<serde_json::Value> = relationship::MilestoneRegistry::defaults()
+        .specs
+        .values()
+        .map(|spec| {
+            serde_json::json!({
+                "id": spec.id,
+                "points": spec.points,
+                "hostility": spec.hostility_trigger,
+                "drop": spec.hostility_drop.map(|t| t.tag()),
+            })
+        })
+        .collect();
+    milestones.sort_by(|a, b| {
+        a["id"].as_str().unwrap_or("").cmp(b["id"].as_str().unwrap_or(""))
+    });
+    Ok(serde_json::json!({ "cast": cast, "milestones": milestones }))
+}
+
+/// God tier write (the relationship slider) — the user-initiated trust
+/// class: no gates, no time floors, straight to the categorical tier.
+/// Creating the state if absent; the id must resolve to a registered NPC.
+#[tauri::command]
+async fn playground_relationship_set(
+    npc_id: String,
+    tier: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    let parsed = relationship::parse_tier(&tier)
+        .ok_or_else(|| format!("unknown tier \"{tier}\" — use the ladder nemesis … bonded"))?;
+    let report = {
+        let mut s = state.fable_schema.lock().await;
+        let Some(entry) = schema::resolve_npc_surface(&s.npc_registry.entries, &npc_id) else {
+            return Err(format!("\"{npc_id}\" is not a registered NPC"));
+        };
+        let canonical = entry.id.clone();
+        let snap = s.clone();
+        let rel = s.relationships.entry(canonical.clone()).or_default();
+        let before = rel.tier.tag().to_string();
+        rel.tier = parsed;
+        let out = serde_json::json!({
+            "npc_id": canonical,
+            "before": before,
+            "tier": parsed.tag(),
+        });
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        out
+    };
+    spawn_reserved_autosave(&app, &state).await;
+    Ok(report)
+}
+
+/// Mood + intent overrides (the [MOOD]/[INTENT] caps mirrored: 60 / 160
+/// chars, flattened single-line). Un-archives + stamps last-seen like the
+/// bracket path.
+#[tauri::command]
+async fn playground_npc_interior_set(
+    npc_id: String,
+    mood: Option<String>,
+    intent: Option<String>,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    const PG_MOOD_CAP: usize = 60; // bracket_parser::MOOD_LABEL_MAX mirror
+    const PG_INTENT_CAP: usize = 160; // bracket_parser::INTENT_MAX mirror
+    let flatten = |raw: Option<String>, cap: usize| -> Option<String> {
+        raw.map(|v| {
+            let flat: String = v.split_whitespace().collect::<Vec<_>>().join(" ");
+            flat.chars().take(cap).collect::<String>()
+        })
+        .filter(|v| !v.is_empty())
+    };
+    let mood_clean = flatten(mood, PG_MOOD_CAP);
+    let intent_clean = flatten(intent, PG_INTENT_CAP);
+    if mood_clean.is_none() && intent_clean.is_none() {
+        return Err("provide a mood and/or an intent".to_string());
+    }
+    let report = {
+        let mut s = state.fable_schema.lock().await;
+        let Some(entry) = schema::resolve_npc_surface(&s.npc_registry.entries, &npc_id) else {
+            return Err(format!("\"{npc_id}\" is not a registered NPC"));
+        };
+        let canonical = entry.id.clone();
+        let now = s.world_clock.current_minutes;
+        let snap = s.clone();
+        let interior = s.npc_interior.entry(canonical.clone()).or_default();
+        if let Some(m) = mood_clean.as_deref() {
+            interior.mood = Some(m.to_string());
+        }
+        if let Some(i) = intent_clean.as_deref() {
+            interior.intent = Some(i.to_string());
+        }
+        interior.archived = None;
+        if now > 0 {
+            interior.last_seen_minutes = now;
+            interior.interactions = interior.interactions.saturating_add(1);
+        }
+        let out = serde_json::json!({
+            "npc_id": canonical,
+            "mood": interior.mood,
+            "intent": interior.intent,
+        });
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        out
+    };
+    spawn_reserved_autosave(&app, &state).await;
+    Ok(report)
+}
+
+/// REVIVE — god-mode resurrection: (a) an archived interior resets to a
+/// fresh live stub (last_seen = now); (b) a MISSING registry entry
+/// re-registers as `Named` when a name rides along; (c) every site map's
+/// TERMINAL assets whose label word-matches the NPC's name are removed
+/// (the corpse goes). Resurrection is god-mode-only — the play-canon locks
+/// (`site_map::canon_transition`) stay fully intact for the tick/evolution
+/// paths; this sweep is the sanctioned end-run.
+#[tauri::command]
+async fn playground_npc_revive(
+    npc_id: String,
+    name: Option<String>,
+    role: Option<String>,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    let mut registered = false;
+    let mut interior_reset = false;
+    let mut assets_removed: Vec<serde_json::Value> = Vec::new();
+    {
+        let mut s = state.fable_schema.lock().await;
+        let now = s.world_clock.current_minutes;
+        // (2026-08-24 review P2) The undo snapshot captures the PRE-mutation
+        // state — it used to be cloned AFTER the re-register upsert below,
+        // so a revive-with-re-register's undo restored the post-register
+        // world (the registration itself was un-undoable).
+        let snap = s.clone();
+        // Resolve (alias-tolerant) or re-register. The scoped `.map` clone
+        // ends the registry borrow BEFORE the None arm mutates it (the
+        // [NPC_REGISTER] applier's discipline — a `match` on the borrow
+        // itself would hold it through the arm).
+        let existing: Option<String> = schema::resolve_npc_surface(&s.npc_registry.entries, &npc_id)
+            .map(|e| e.id.clone());
+        let canonical = match existing {
+            Some(id) => id,
+            None => {
+                let id = sanitize_slug(&npc_id);
+                if id.is_empty() {
+                    return Err("npc id is required".to_string());
+                }
+                let provided = name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+                let Some(provided) = provided else {
+                    return Err(format!(
+                        "\"{npc_id}\" is not registered — pass a name (and optionally a role) to re-register them"
+                    ));
+                };
+                let entry = schema::NpcEntry {
+                    id: id.clone(),
+                    name: provided.chars().take(64).collect(),
+                    role: role.as_deref().map(str::trim).filter(|r| !r.is_empty()).map(|r| r.chars().take(120).collect()).unwrap_or_default(),
+                    tier: None,
+                    aliases: vec![id.clone()],
+                    prominence: schema::NpcProminence::Named,
+                };
+                if !s.npc_registry.upsert_entry(entry) {
+                    return Err(format!("could not re-register \"{npc_id}\" (registry cap or collision)"));
+                }
+                registered = true;
+                id
+            }
+        };
+        // (a) Interior: archived (or entirely absent) → fresh live stub.
+        {
+            let interior = s.npc_interior.entry(canonical.clone()).or_default();
+            if interior.archived.is_some() || interior.last_seen_minutes == 0 {
+                interior.archived = None;
+                interior.last_seen_minutes = if now > 0 { now } else { interior.last_seen_minutes };
+                interior_reset = true;
+            }
+        }
+        // (c) The corpse sweep: terminal assets whose label word-matches.
+        let sweep_name = s
+            .npc_registry
+            .find(&canonical)
+            .map(|e| {
+                if e.name.is_empty() {
+                    canonical.clone()
+                } else {
+                    e.name.clone()
+                }
+            })
+            .unwrap_or_else(|| canonical.clone());
+        for (map_key, map) in s.site_maps.iter_mut() {
+            let mut taken: Vec<(String, String)> = Vec::new();
+            map.assets.retain(|a| {
+                if site_map::is_terminal(a.state) && pg_asset_name_matches(&a.name, &sweep_name) {
+                    taken.push((a.id.clone(), a.name.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+            for (asset_id, asset_name) in taken {
+                assets_removed.push(serde_json::json!({
+                    "map": map_key, "id": asset_id, "name": asset_name,
+                }));
+            }
+        }
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+    }
+    spawn_reserved_autosave(&app, &state).await;
+    Ok(serde_json::json!({
+        "registered": registered,
+        "interior_reset": interior_reset,
+        "assets_removed": assets_removed,
+    }))
+}
+
+/// Near-name search — the Registry Management tool's ranked candidate
+/// list (the SAME shared resolver the live [NPC_REGISTER] guard uses).
+/// PURE.
+#[tauri::command]
+async fn playground_near_names(
+    query: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, true)?;
+    let s = state.fable_schema.lock().await;
+    let candidates: Vec<serde_json::Value> = schema::near_name_candidates(&query, &s.npc_registry)
+        .into_iter()
+        .map(|(id, name, distance)| {
+            serde_json::json!({ "id": id, "name": name, "distance": distance })
+        })
+        .collect();
+    Ok(serde_json::json!({ "query": query, "candidates": candidates }))
+}
+
+/// Add an alias to a registry entry (deduped, capped 8, 64 chars).
+#[tauri::command]
+async fn playground_registry_alias_add(
+    npc_id: String,
+    alias: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    const PG_ALIAS_CAP_CHARS: usize = 64;
+    const PG_ALIAS_MAX: usize = 8;
+    let alias_clean: String = alias.split_whitespace().collect::<Vec<_>>().join(" ");
+    let alias_clean = alias_clean.chars().take(PG_ALIAS_CAP_CHARS).collect::<String>();
+    if alias_clean.is_empty() {
+        return Err("alias is required".to_string());
+    }
+    let report = {
+        let mut s = state.fable_schema.lock().await;
+        let Some(entry) = schema::resolve_npc_surface(&s.npc_registry.entries, &npc_id) else {
+            return Err(format!("\"{npc_id}\" is not a registered NPC"));
+        };
+        let canonical = entry.id.clone();
+        if canonical.eq_ignore_ascii_case(&alias_clean)
+            || entry.name.eq_ignore_ascii_case(&alias_clean)
+            || entry
+                .aliases
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(&alias_clean))
+        {
+            return Ok(serde_json::json!({
+                "npc_id": canonical,
+                "aliases": entry.aliases,
+                "added": false,
+            }));
+        }
+        if entry.aliases.len() >= PG_ALIAS_MAX {
+            return Err(format!("alias cap reached ({PG_ALIAS_MAX}) — remove one first"));
+        }
+        let snap = s.clone();
+        let entry = s.npc_registry.find_mut(&canonical).expect("resolved above");
+        entry.aliases.push(alias_clean);
+        let out = serde_json::json!({
+            "npc_id": canonical,
+            "aliases": entry.aliases,
+            "added": true,
+        });
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        out
+    };
+    spawn_reserved_autosave(&app, &state).await;
+    Ok(report)
+}
+
+/// Rename a registry entry's diegetic label (the id never moves). The
+/// near-name check runs AFTER the rename and is REPORTED, not enforced —
+/// the tool user sees the collision they may have just created.
+#[tauri::command]
+async fn playground_registry_rename(
+    npc_id: String,
+    new_name: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    const PG_NAME_CAP_CHARS: usize = 64;
+    let name_clean: String = new_name.split_whitespace().collect::<Vec<_>>().join(" ");
+    let name_clean = name_clean.chars().take(PG_NAME_CAP_CHARS).collect::<String>();
+    if name_clean.is_empty() {
+        return Err("new name is required".to_string());
+    }
+    let report = {
+        let mut s = state.fable_schema.lock().await;
+        let Some(entry) = schema::resolve_npc_surface(&s.npc_registry.entries, &npc_id) else {
+            return Err(format!("\"{npc_id}\" is not a registered NPC"));
+        };
+        let canonical = entry.id.clone();
+        let snap = s.clone();
+        let entry = s.npc_registry.find_mut(&canonical).expect("resolved above");
+        entry.name = name_clean.clone();
+        let warning = schema::near_name_collision(&name_clean, &s.npc_registry, &canonical)
+            .map(|(hit_id, hit_name, dist)| {
+                format!("\"{name_clean}\" resembles {hit_name} [{hit_id}] (distance {dist})")
+            });
+        let out = serde_json::json!({
+            "npc_id": canonical,
+            "name": name_clean,
+            "warning": warning,
+        });
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        out
+    };
+    spawn_reserved_autosave(&app, &state).await;
+    Ok(report)
+}
+
+/// Remove a registry entry — `Named` discoveries only; authored `Core`
+/// entries are pinned forever (the reaper-protection law).
+#[tauri::command]
+async fn playground_registry_remove(
+    npc_id: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    let report = {
+        let mut s = state.fable_schema.lock().await;
+        let Some(entry) = schema::resolve_npc_surface(&s.npc_registry.entries, &npc_id) else {
+            return Err(format!("\"{npc_id}\" is not a registered NPC"));
+        };
+        let canonical = entry.id.clone();
+        if entry.prominence == schema::NpcProminence::Core {
+            return Err(format!(
+                "\"{canonical}\" is an authored Core cast member — Core entries are pinned and cannot be removed"
+            ));
+        }
+        let snap = s.clone();
+        s.npc_registry.entries.retain(|e| e.id != canonical);
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        serde_json::json!({ "removed": canonical })
+    };
+    spawn_reserved_autosave(&app, &state).await;
+    Ok(report)
+}
+
+/// The milestone injector: record a milestone event on the (created-if-
+/// missing) relationship state, then run the FORCED tier re-evaluation
+/// (`relationship::evaluate_transition_forced` — time floors ignored,
+/// points threshold still gating + reported).
+#[tauri::command]
+async fn playground_milestone_inject(
+    npc_id: String,
+    event_id: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    let registry = relationship::MilestoneRegistry::defaults();
+    if registry.get(&event_id).is_none() {
+        return Err(format!("unknown milestone \"{event_id}\""));
+    }
+    let report = {
+        let mut s = state.fable_schema.lock().await;
+        let Some(entry) = schema::resolve_npc_surface(&s.npc_registry.entries, &npc_id) else {
+            return Err(format!("\"{npc_id}\" is not a registered NPC"));
+        };
+        let canonical = entry.id.clone();
+        let now = s.world_clock.current_minutes;
+        let snap = s.clone();
+        let rel = s.relationships.entry(canonical.clone()).or_default();
+        let recorded_new = rel.record_event(&event_id);
+        let tier_before = rel.tier.tag().to_string();
+        let forced = relationship::evaluate_transition_forced(rel, &registry, now);
+        relationship::apply_transition(rel, &forced.outcome, now);
+        let tier_after = rel.tier.tag().to_string();
+        let reason = match &forced.outcome {
+            relationship::TransitionOutcome::Transition { reason, .. } => format!("{reason:?}"),
+            relationship::TransitionOutcome::NoTransition { reason } => format!("{reason:?}"),
+        };
+        let out = serde_json::json!({
+            "npc_id": canonical,
+            "event_id": event_id,
+            "recorded_new": recorded_new,
+            "tier_before": tier_before,
+            "tier_after": tier_after,
+            "points": forced.points,
+            "threshold": forced.threshold,
+            "reason": reason,
+        });
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        out
+    };
+    spawn_reserved_autosave(&app, &state).await;
+    Ok(report)
+}
+
+/// The WORLD panel's read: clock, pacing, node, the active map (threat +
+/// areas + assets), and the snapshot-ring inspector list.
+#[tauri::command]
+async fn playground_world_get(
+    state: tauri::State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, true)?;
+    let s = state.fable_schema.lock().await;
+    let cur = s.travel_graph.current_node.clone();
+    let node = cur.as_deref().and_then(|c| s.travel_graph.find_node(c));
+    let map_key = cur
+        .as_deref()
+        .and_then(|c| site_map::active_site_map_key(&s.site_maps, Some(c)));
+    let map = map_key.as_deref().and_then(|k| s.site_maps.get(k));
+    let map_json = if let (Some(key), Some(m)) = (map_key.as_deref(), map) {
+        serde_json::json!({
+            "key": key,
+            "threat": m.threat.word(),
+            "current_area": m.current_area,
+            "areas": m.areas.iter().map(|a| serde_json::json!({
+                "id": a.id, "name": a.name,
+                "knowledge": match a.knowledge {
+                    site_map::AreaKnowledge::Unrevealed => "unrevealed",
+                    site_map::AreaKnowledge::Discovered => "discovered",
+                    site_map::AreaKnowledge::Visited => "visited",
+                },
+            })).collect::<Vec<_>>(),
+            "assets": m.assets.iter().map(|a| serde_json::json!({
+                "id": a.id, "name": a.name, "kind": a.kind.word(),
+                "state": a.state.word(), "count": a.count,
+                "location": a.location, "tier": a.tier,
+                "origin": a.origin.word(),
+            })).collect::<Vec<_>>(),
+        })
+    } else {
+        serde_json::Value::Null
+    };
+    Ok(serde_json::json!({
+        "clock": {
+            "minutes": s.world_clock.current_minutes,
+            "label": pg_time_label(s.world_clock.current_minutes),
+            "calendar": s.calendar,
+        },
+        "pacing": { "mode": s.scene_pacing.mode.tag() },
+        "node": {
+            "id": cur.clone().unwrap_or_default(),
+            "name": node.map(|n| n.name.clone()).unwrap_or_default(),
+        },
+        "map": map_json,
+        "history": playground_history_list(&state).await,
+    }))
+}
+
+/// TIME MACHINE — direct clock advance. Clamped 1..=10080 minutes,
+/// BYPASSES the [TIME] pacing clamp by design (god skip ≠ narrated
+/// bracket). Economy settle (freeze-aware) + fatigue bands (freeze-aware)
+/// mirror `apply_time_command_and_maybe_tick`; NO tick (the forced tick
+/// has its own button). Settlement directives land in the same
+/// `pending_tick_directives` well the natural path uses.
+#[tauri::command]
+async fn playground_time_skip(
+    minutes: i64,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    let skipped = clamp_playground_skip_minutes(minutes);
+    let freeze = state.playground_freeze_clamps.load(std::sync::atomic::Ordering::Relaxed);
+    let report = {
+        let mut s = state.fable_schema.lock().await;
+        if !s.world_clock.is_set() {
+            return Err("the world clock is not set yet — play a turn or set [TIME] first".into());
+        }
+        let snap = s.clone();
+        let from = s.world_clock.current_minutes;
+        let to = from.saturating_add(skipped);
+        s.world_clock.current_minutes = to;
+        // Economy settle (the step-3a mirror, freeze-aware).
+        let economy_live = !s.properties.is_empty()
+            || !s.player_state.jobs.is_empty()
+            || s.player_state.lifestyle != economy::Lifestyle::Squatter;
+        let mut economy_directives: Vec<String> = Vec::new();
+        if economy_live {
+            let (dirs, _) = economy::settle_daily_economy(&mut s, to, freeze);
+            economy_directives = dirs;
+        }
+        // Fatigue bands (the clamp mirror, freeze-aware).
+        let fatigue_band = if !freeze && s.last_rest_minutes > 0 {
+            let band = schema::rested_band(to.saturating_sub(s.last_rest_minutes));
+            if let Some(band) = band {
+                let (stamina_floor, mana_floor) = player_state::fatigue_floors(band);
+                if s.player_state.stamina > stamina_floor {
+                    s.player_state.stamina = stamina_floor;
+                }
+                if let Some(m) = s.player_state.mana {
+                    if m > mana_floor {
+                        s.player_state.mana = Some(mana_floor);
+                    }
+                }
+            }
+            band.unwrap_or("").to_string()
+        } else {
+            String::new()
+        };
+        // (2026-08-25) Deterministic expiry sweeps — the [TIME] path's step-3b
+        // mirror (entity lapses + site-asset deactivations + stale-thread
+        // collapse) plus the status-tag expiry the natural path runs at the
+        // tick. A god skip is real elapsed time: an effect armed to lapse "at
+        // dusk" must not survive a 12-hour skip — and the skip is exactly the
+        // testing surface where that reads as a bug. All of it rides the SAME
+        // pre-skip undo snapshot cloned above; directives land in the shared
+        // pending_tick_directives well.
+        let (mut expiry_directives, _) = s.sweep_entity_expiry(to);
+        let (asset_dirs, _) = crate::site_map::sweep_asset_expiry(&mut s.site_maps, to);
+        expiry_directives.extend(asset_dirs);
+        let _ = crate::site_map::sweep_stale_threads(&mut s.site_maps, to);
+        let dropped_tags = consequence::expire_tags(&mut s.status_tags, to);
+        if dropped_tags > 0 {
+            tracing::info!(
+                dropped = dropped_tags,
+                "[playground] status tags expired by time skip"
+            );
+        }
+        let out = serde_json::json!({
+            "from": from,
+            "to": to,
+            "minutes": skipped,
+            "label": pg_time_label(to),
+            "economy_directives": economy_directives,
+            "expiry_directives": expiry_directives,
+            "expired_tags": dropped_tags,
+            "fatigue_band": fatigue_band,
+        });
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        if !economy_directives.is_empty() || !expiry_directives.is_empty() {
+            let mut td = state.pending_tick_directives.lock().await;
+            td.extend(economy_directives);
+            td.extend(expiry_directives);
+        }
+        out
+    };
+    spawn_reserved_autosave(&app, &state).await;
+    Ok(report)
+}
+
+/// FORCE WORLD TICK — run the world-progression pass NOW. The guard has
+/// already refused any in-flight turn, and the IPC owns the whole flow, so
+/// the tick's own session-identity guard remains as the second line of
+/// defense (unchanged). The report diffs the schema before/after and
+/// CLONES (never drains) `pending_tick_directives` so the next turn still
+/// sees the tick's world facts.
+#[tauri::command]
+async fn playground_force_tick(
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    let card_id = state
+        .active_card_id
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let generation = state
+        .fable_session_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let before = state.fable_schema.lock().await.clone();
+    // (2026-08-24) Serialized against the natural deferred tick inside
+    // fire_world_progression_tick (single-flight guard): a force-tick that
+    // overlaps the natural tick WAITS instead of double-advancing the world.
+    fire_world_progression_tick(&state, &app, &card_id, generation).await;
+    let after = state.fable_schema.lock().await.clone();
+    let diff = diff_schemas(&before, &after);
+    let directives = state.pending_tick_directives.lock().await.clone();
+    Ok(serde_json::json!({
+        "entities_changed": diff.entities_changed.len(),
+        "summary_changed": diff.summary_changed,
+        "events_before": diff.events_count_before,
+        "events_after": diff.events_count_after,
+        "directives": directives,
+    }))
+}
+
+/// (2026-08-24 Part II B9) TICK LOOP — run the world-progression pass up to
+/// N (≤8) times back-to-back, the session-identity guard re-checked BETWEEN
+/// passes (a Load/End/Start mid-loop stops the loop cleanly at the pass
+/// boundary). ONE diff report covers the whole run (before the first pass →
+/// after the last). The redo (re-rolling a bad loop) stays documented
+/// deferred — the undo ring is restore-only by design; the god tools
+/// re-force effects instead.
+#[tauri::command]
+async fn playground_tick_loop(
+    n: Option<u32>,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    let n = n.unwrap_or(1).clamp(1, 8);
+    let card_id = state
+        .active_card_id
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let generation = state
+        .fable_session_generation
+        .load(std::sync::atomic::Ordering::SeqCst);
+    let before = state.fable_schema.lock().await.clone();
+    let mut ran = 0u32;
+    for _ in 0..n {
+        if !tick_session_live(&state, &card_id, generation).await {
+            tracing::info!(
+                ran,
+                "[playground] tick loop stopped: session swapped mid-loop"
+            );
+            break;
+        }
+        // (2026-08-24) Each pass serializes against any natural/force tick
+        // via the single-flight guard inside fire_world_progression_tick.
+        fire_world_progression_tick(&state, &app, &card_id, generation).await;
+        ran += 1;
+    }
+    let after = state.fable_schema.lock().await.clone();
+    let diff = diff_schemas(&before, &after);
+    let directives = state.pending_tick_directives.lock().await.clone();
+    Ok(serde_json::json!({
+        "ticks_run": ran,
+        "ticks_requested": n,
+        "entities_changed": diff.entities_changed.len(),
+        "summary_changed": diff.summary_changed,
+        "events_before": diff.events_count_before,
+        "events_after": diff.events_count_after,
+        "directives": directives,
+    }))
+}
+
+/// (2026-08-24 Part II B9) The asset REMOVER — the spawner's terminal twin:
+/// sweep ONE asset off the ACTIVE node's map with an explicit cause (the
+/// remove_asset evolution-op shape, god-only, the revive-sanction pattern:
+/// removal is final, re-spawn is the tool's job). Open threads on the
+/// subject/area close.
+#[tauri::command]
+async fn playground_asset_remove(
+    asset_id: String,
+    cause: Option<String>,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    let report = {
+        let mut s = state.fable_schema.lock().await;
+        let cur = s.travel_graph.current_node.clone();
+        let Some(cur) = cur.as_deref() else {
+            return Err("no current location — travel somewhere first".into());
+        };
+        let Some(map_key) = site_map::active_site_map_key(&s.site_maps, Some(cur)) else {
+            return Err(
+                "no site map at the current node — enter a mapped site (or [DISCOVER] one) first".into(),
+            );
+        };
+        // Phase 1 — resolve under an immutable read (the spawner's pattern).
+        let (id, name, location) = {
+            let map = s.site_maps.get(&map_key).expect("key resolved above");
+            let Some(a) = site_map::resolve_asset(map, &asset_id) else {
+                return Err(format!("no asset matches \"{asset_id}\" on this map"));
+            };
+            (a.id.clone(), a.name.clone(), a.location.clone())
+        };
+        let cause_clean = bracket_parser::clean_free_text(
+            cause.as_deref().unwrap_or("Playground removal"),
+            site_map::SITE_DETAIL_CHAR_MAX,
+        );
+        // Phase 2 — pre-state snapshot, close threads, remove the asset.
+        let snap = s.clone();
+        {
+            let map = s.site_maps.get_mut(&map_key).expect("key resolved above");
+            site_map::close_threads_by_subject(map, &id, &cause_clean);
+            site_map::close_threads_by_area(map, &location, &cause_clean);
+            map.assets.retain(|a| a.id != id);
+        }
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        serde_json::json!({
+            "map": map_key,
+            "removed": { "id": id, "name": name },
+            "cause": cause_clean,
+        })
+    };
+    spawn_reserved_autosave(&app, &state).await;
+    Ok(report)
+}
+
+/// The asset spawner — mint a `Known` asset on the ACTIVE node's map.
+/// `origin = Playground` (the audit-distinct provenance variant);
+/// `MAX_SITE_ASSETS` + `ASSET_COUNT_MAX` enforced; buildings refuse on
+/// hosted (room-scale) maps — the depth-2 law, same as the [ASSET] mint.
+#[tauri::command]
+async fn playground_asset_spawn(
+    kind: String,
+    label: Option<String>,
+    tier: Option<String>,
+    // (2026-08-24 review P2) i64 on the wire (validated + clamped inside) —
+    // a bare u32 surfaced raw deserialize errors on negatives/oversize.
+    count: Option<i64>,
+    area: Option<String>,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    let count: Option<u32> = count
+        .map(|c| {
+            if !(0..=site_map::ASSET_COUNT_MAX as i64).contains(&c) {
+                Err(format!(
+                    "count must be 1–{} (got {c})",
+                    site_map::ASSET_COUNT_MAX
+                ))
+            } else {
+                Ok(c as u32)
+            }
+        })
+        .transpose()?;
+    let kind_parsed = match kind.trim().to_lowercase().as_str() {
+        "object" => site_map::AssetKind::Object,
+        "creature" => site_map::AssetKind::Creature,
+        "group" => site_map::AssetKind::Group,
+        "trap" => site_map::AssetKind::Trap,
+        "hazard" => site_map::AssetKind::Hazard,
+        "loot" => site_map::AssetKind::Loot,
+        "building" => site_map::AssetKind::Building,
+        other => {
+            return Err(format!(
+                "unknown kind \"{other}\" — use object / creature / group / trap / hazard / loot / building"
+            ))
+        }
+    };
+    let tier_parsed = match tier.as_deref().map(str::trim).filter(|t| !t.is_empty()) {
+        None => None,
+        Some(word) => Some(
+            player_state::parse_attacker_tier(word)
+                .ok_or_else(|| format!("unknown tier \"{word}\" — use minion / soldier / elite / boss / legendary"))?,
+        ),
+    };
+    let report = {
+        let mut s = state.fable_schema.lock().await;
+        let cur = s.travel_graph.current_node.clone();
+        let Some(cur) = cur.as_deref() else {
+            return Err("no current location — travel somewhere first".into());
+        };
+        let Some(map_key) = site_map::active_site_map_key(&s.site_maps, Some(cur)) else {
+            return Err(
+                "no site map at the current node — enter a mapped site (or [DISCOVER] one) first".into(),
+            );
+        };
+        if kind_parsed == site_map::AssetKind::Building
+            && s.site_maps.get(&map_key).is_some_and(|m| m.host.is_some())
+        {
+            return Err(
+                "buildings exist only on settlement (district) maps — the depth-2 law (buildings never nest)".into(),
+            );
+        }
+        // Phase 1 — COMPUTE the asset under an immutable read (the id
+        // uniqueness + area validation need map reads; keeping this phase
+        // immutable lets the pre-state snapshot clone run between it and
+        // the push without a borrow fight).
+        let (asset, out) = {
+            let map = s.site_maps.get(&map_key).expect("key resolved above");
+            if map.assets.len() >= site_map::MAX_SITE_ASSETS {
+                return Err(format!(
+                    "map asset cap reached ({}) — remove an asset first",
+                    site_map::MAX_SITE_ASSETS
+                ));
+            }
+            // Label → name + kebab id (uniquified on collision).
+            let name: String = label
+                .as_deref()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(|l| l.chars().take(64).collect())
+                .unwrap_or_else(|| {
+                    let w = kind_parsed.word();
+                    let mut c = w.chars();
+                    match c.next() {
+                        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                        None => String::new(),
+                    }
+                });
+            if name.is_empty() {
+                return Err("label is required".to_string());
+            }
+            let mut id = site_map::kebabify(&name);
+            if id.is_empty() {
+                id = "playground_asset".to_string();
+            }
+            // (2026-08-24 review P2) Uniquify with a KEBAB dash, not an
+            // underscore — `goblin_2` fails `is_kebab_id` (the validator
+            // the whole module runs under), so the spawned asset used to
+            // mint a map the module's own validator rejects. The base is
+            // re-truncated per suffix so the pair never exceeds
+            // SITE_ID_CHAR_MAX either.
+            let mut suffix = 2u32;
+            while map.assets.iter().any(|a| a.id == id) {
+                let suffix_str = format!("-{suffix}");
+                let room = site_map::SITE_ID_CHAR_MAX.saturating_sub(suffix_str.chars().count());
+                // Trim trailing dashes after the cut — a cut landing on a
+                // joining dash would mint `xxx--2` (double-dash is not a
+                // kebab id either).
+                let base: String = site_map::kebabify(&name)
+                    .chars()
+                    .take(room)
+                    .collect::<String>()
+                    .trim_end_matches('-')
+                    .to_string();
+                id = format!("{base}{suffix_str}");
+                suffix += 1;
+            }
+            // Area: explicit (validated) → current_area → entrance → first.
+            let area_id = match area.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+                Some(a) => {
+                    if !map.areas.iter().any(|x| x.id == a) {
+                        return Err(format!("unknown area \"{a}\" on this map"));
+                    }
+                    a.to_string()
+                }
+                None => map
+                    .current_area
+                    .clone()
+                    .filter(|a| !a.is_empty())
+                    .or_else(|| {
+                        let entrance = map.entrance.clone();
+                        (!entrance.is_empty()).then_some(entrance)
+                    })
+                    .or_else(|| map.areas.first().map(|a| a.id.clone()))
+                    .ok_or_else(|| "the map has no areas to place the asset in".to_string())?,
+            };
+            let effective_count = if kind_parsed == site_map::AssetKind::Group {
+                count.unwrap_or(1).clamp(1, site_map::ASSET_COUNT_MAX)
+            } else {
+                0
+            };
+            let tier_word_out = tier_parsed.map(|_| {
+                tier.as_deref().map(str::trim).unwrap_or_default().to_lowercase()
+            });
+            let asset = site_map::SiteAsset {
+                id: id.clone(),
+                name: name.clone(),
+                kind: kind_parsed,
+                location: area_id.clone(),
+                state: site_map::AssetState::Active,
+                knowledge: site_map::AssetKnowledge::Known,
+                count: effective_count,
+                detail: "Playground spawn".to_string(),
+                tier: tier_word_out.clone(),
+                origin: site_map::AssetOrigin::Playground,
+                ..Default::default()
+            };
+            let out = serde_json::json!({
+                "map": map_key,
+                "asset": {
+                    "id": id, "name": name, "kind": kind_parsed.word(),
+                    "area": area_id, "count": effective_count,
+                    "tier": tier_word_out,
+                },
+            });
+            (asset, out)
+        };
+        // Phase 2 — pre-state snapshot, then the push.
+        let snap = s.clone();
+        s.site_maps
+            .get_mut(&map_key)
+            .expect("key resolved above")
+            .assets
+            .push(asset);
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        out
+    };
+    spawn_reserved_autosave(&app, &state).await;
+    Ok(report)
+}
+
+/// Node threat select — set the ACTIVE map's danger band.
+#[tauri::command]
+async fn playground_site_threat_set(
+    threat: String,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<serde_json::Value, String> {
+    playground_guard(&state, false)?;
+    let parsed = match threat.trim().to_lowercase().as_str() {
+        "low" => site_map::SiteThreat::Low,
+        "moderate" => site_map::SiteThreat::Moderate,
+        "high" => site_map::SiteThreat::High,
+        "deadly" => site_map::SiteThreat::Deadly,
+        other => return Err(format!("unknown threat \"{other}\" — use low / moderate / high / deadly")),
+    };
+    let report = {
+        let mut s = state.fable_schema.lock().await;
+        let cur = s.travel_graph.current_node.clone();
+        let Some(cur) = cur.as_deref() else {
+            return Err("no current location — travel somewhere first".into());
+        };
+        let Some(map_key) = site_map::active_site_map_key(&s.site_maps, Some(cur)) else {
+            return Err("no site map at the current node — enter a mapped site first".into());
+        };
+        let snap = s.clone();
+        let map = s.site_maps.get_mut(&map_key).expect("key resolved above");
+        map.threat = parsed;
+        drop(s);
+        push_fable_history_snapshot(&state, snap).await;
+        serde_json::json!({ "map": map_key, "threat": parsed.word() })
+    };
+    spawn_reserved_autosave(&app, &state).await;
+    Ok(report)
+}
+
+/// SNAPSHOT RING INSPECTOR's RESTORE — pop every entry ABOVE `index`, then
+/// restore entry `index` itself through the SAME shared helper
+/// `fable_rollback` uses (one code path: diff + wholesale overwrite +
+/// reserved autosave + the `fable_rollback` event).
+#[tauri::command]
+async fn playground_history_restore(
+    index: usize,
+    state: tauri::State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<RollbackDiff, String> {
+    playground_guard(&state, false)?;
+    let prior = {
+        let mut hist = state.fable_schema_history.lock().await;
+        if index >= hist.len() {
+            return Err(format!(
+                "no snapshot at index {index} — the ring holds {} entries",
+                hist.len()
+            ));
+        }
+        // Drop every entry above the target, then the target itself.
+        while hist.len() > index + 1 {
+            hist.pop_back();
+        }
+        hist.pop_back().map(|(_tag, snap)| snap)
+    };
+    let prior = prior.ok_or_else(|| "nothing to restore: history is empty".to_string())?;
+    let diff = restore_fable_history_entry(&state, &app, prior).await;
+    Ok(diff)
 }
 
 /// Save the current game state into a named slot. `save_id` of "autosave"
@@ -18522,12 +25726,7 @@ async fn fable_load_save(
         })
         .collect();
     *state.fable_session.lock().await = loaded_session;
-    // (2026-08-18 clothing-as-inventory ruling) A save slot installs its
-    // schema directly (bypassing load_split), so run the one-shot legacy
-    // `outfit` delta → typed inventory migration here too — an old save's
-    // clothing line becomes items the moment it's loaded.
-    let mut loaded_schema = save.schema;
-    loaded_schema.migrate_legacy_outfit();
+    let loaded_schema = save.schema;
     *state.fable_schema.lock().await = loaded_schema;
     // (2026-08-21 resume-attach fix) Re-attach the SAVE's bound player: a
     // slot switch can cross timelines run with different SavedPlayers — the
@@ -18586,11 +25785,35 @@ async fn fable_load_save(
     state.pending_tick_directives.lock().await.clear();
     state.failed_progression_queue.lock().await.clear();
     state.failed_translation_queue.lock().await.clear();
+    // (2026-08-24 fix) The delta queue joins the boundary drains (both
+    // surfaces — the loaded save's timeline never inherits a foreign
+    // exchange's failure).
+    state.failed_delta_queue.lock().await.clear();
     // (2026-08-22 tracker feedback loop) Same session-boundary rule.
     state.tracker_emit_errors.lock().await.clear();
+    // (2026-08-22 living-world) The rest backstop flag is one-shot per
+    // timeline too — a dead session's referee signal never stamps a rest
+    // onto this one's clock.
+    state
+        .pending_rest
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     // (2026-08-16 audit fix #11) Same session-boundary rule as fable_end: an
     // armed manual player_action belongs to the PREVIOUS timeline.
     *state.pending_player_action.lock().await = None;
+    // (2026-08-24 Part II B3) The armed pinned skill DC is the same
+    // one-shot tactile intent — never inherited across a boundary.
+    *state.pending_pinned_skill_dc.lock().await = None;
+    // (2026-08-24 review P1) The playground god flags are one-shot per
+    // timeline too — `enter_fable_session` and `fable_end` both reset them;
+    // this drain site is the third boundary (a warm save-load swap). Loading
+    // an earlier save with FREEZE CLAMPS on used to silently carry the
+    // clamps into the loaded timeline (starvation/fatigue never fired).
+    state
+        .playground_auto_pass
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    state
+        .playground_freeze_clamps
+        .store(false, std::sync::atomic::Ordering::Relaxed);
     tracing::info!(save_id = %meta.save_id, "game state loaded");
     // intro is None on a save-load: resumed games render their feed from
     // `messages`, not from the card's opening beat. Only fresh starts
@@ -18621,8 +25844,8 @@ struct FableLoadResult {
 /// `variants` + `active_idx` carry the swipeable-reroll state (2026-07-29) so
 /// the feed can render the `1/N` control + recover older variants on swipe.
 /// `variants` holds the INACTIVE siblings only (parallel to
-/// `session::Message::variants`); `content` is the active variant. Omitted from
-/// serialization when empty so legacy frontends/JSON stay clean.
+/// `session::Message::variants`); `content` is the active variant. Omitted
+/// from serialization when empty.
 ///
 /// `timestamp` (2026-08-01): the message's epoch-millis stamp, surfaced for
 /// the hover-only message header's time line. Decorative-only (the UI omits
@@ -19001,6 +26224,11 @@ async fn edit_message(
     if is_intro {
         write_intro_variant_to_card(&app, &card_id, Some(intro_active_idx), &new_text)?;
     }
+    // (2026-08-24) Arm the re-track window BEFORE the text mutates — the
+    // marker (not the re-track's cancel token, minted much later) is what
+    // refuses a mid-window Save / narrator turn. Only assistant beats
+    // re-track; user + intro edits pair no schema.
+    let _retrack_armed = (is_assistant && !is_intro).then(|| RetrackArmedGuard::arm(&state));
     {
         let mut gs = state.fable_session.lock().await;
         apply_edit(&mut gs, index, new_text)?;
@@ -19128,6 +26356,11 @@ async fn retrack_edited_assistant_message(
         );
         return;
     };
+    // (2026-08-24) Ring depth BEFORE the displaced push: every failure path
+    // below restores `displaced` as the live schema — the pushed entry then
+    // duplicates the live state as a stale no-op undo step (and FIFO-evicted
+    // a real one if the ring was at cap). Truncate back on each restore.
+    let retrack_ring_depth = state.fable_schema_history.lock().await.len();
     push_fable_history_snapshot(state, displaced.clone()).await;
     {
         let mut s = state.fable_schema.lock().await;
@@ -19161,6 +26394,7 @@ async fn retrack_edited_assistant_message(
     let Some(card) = card else {
         tracing::warn!("edit re-track: no active card; skipping");
         *state.fable_schema.lock().await = displaced;
+        truncate_fable_history_to_depth(state, retrack_ring_depth).await;
         return;
     };
     let pacing_text = player_action
@@ -19216,6 +26450,7 @@ async fn retrack_edited_assistant_message(
                      shrink the prompt per the Prime Directive, never raise the context."
                 );
                 *state.fable_schema.lock().await = displaced;
+                truncate_fable_history_to_depth(state, retrack_ring_depth).await;
                 return;
             }
         };
@@ -19276,11 +26511,23 @@ async fn retrack_edited_assistant_message(
             // slot like any live turn (2026-08-22). Notices are dropped: a
             // re-track is an edit repair, not a live turn the player watches.
             let mut retrack_notices: Vec<(&'static str, String)> = Vec::new();
-            let (_, retrack_rejects) =
+            let (_, retrack_rejects, retrack_events) =
                 apply_phase3_bracket_commands(&parsed, state, true, &tracker_window, &mut retrack_notices).await;
             *state.tracker_emit_errors.lock().await =
                 distill_tracker_emit_errors(&retrack_rejects);
-            tick_armed = apply_time_command_and_maybe_tick(&parsed, state).await;
+            let (retrack_time_armed, retrack_directives, _dropped_rest_notice) =
+                apply_time_command_and_maybe_tick(&parsed, state).await;
+            // (2026-08-23 hazard referees) No narrator render happens in a
+            // re-track: the hazard-event + time-channel directives forward
+            // into pending_tick_directives (next turn's block), and the
+            // rest notice drops with retrack_notices (an edit repair, not
+            // a live turn the player watches).
+            {
+                let mut td = state.pending_tick_directives.lock().await;
+                td.extend(retrack_events);
+                td.extend(retrack_directives);
+            }
+            tick_armed = retrack_time_armed;
         }
         Ok(())
     }
@@ -19296,6 +26543,7 @@ async fn retrack_edited_assistant_message(
             "edit re-track failed; restoring the pre-edit world schema (the prose edit stands)"
         );
         *state.fable_schema.lock().await = displaced;
+        truncate_fable_history_to_depth(state, retrack_ring_depth).await;
         restore_tick_directives(state, &directives_at_start).await;
         return;
     }
@@ -19334,7 +26582,7 @@ async fn retrack_edited_assistant_message(
         // cleared, so it self-guards on the ENTRY-captured identity (card +
         // generation — the fire-time fresh read compared the live slot
         // against itself and could never trip).
-        fire_world_progression_tick(state, &tick_card_id, tick_generation).await;
+        fire_world_progression_tick(state, app, &tick_card_id, tick_generation).await;
     }
 }
 
@@ -19771,6 +27019,12 @@ async fn ghostwriter_continue(
     // the write; the re-track (which manages its own cancel slot + locks)
     // runs after the scope drops.
     {
+        // (2026-08-24) Arm the re-track window BEFORE the session text
+        // mutates — between `apply_edit` and the re-track's cancel-token
+        // mint nothing else marked the beat as mid-re-track, so a Save (or
+        // a narrator turn) could snapshot the edited session paired with
+        // the pre-re-track schema.
+        let _retrack_armed = RetrackArmedGuard::arm(&state);
         let mut gs = state.fable_session.lock().await;
         let still_tail = gs
             .messages
@@ -19778,8 +27032,11 @@ async fn ghostwriter_continue(
             .map(|m| m.id == last_id && m.role == session::Role::Assistant)
             .unwrap_or(false)
             && gs.messages.len() == last_index + 1;
+        // (the armed marker above now blocks new turns; the still-tail +
+        // generation checks catch anything already appended during the
+        // HTTP wait — `fable_turn_in_flight` would self-trip on our own
+        // marker here.)
         if !still_tail
-            || fable_turn_in_flight(&state)
             || state.fable_session_generation.load(std::sync::atomic::Ordering::SeqCst)
                 != generation_at_entry
         {
@@ -19904,7 +27161,7 @@ async fn guided_crossroads_messages(
 /// want the plain authoritative state).
 async fn guided_world_state(state: &tauri::State<'_, AppState>) -> Option<String> {
     let s = state.fable_schema.lock().await;
-    let rendered = render_fable_world_state(&s, &[], false);
+    let rendered = render_fable_world_state(&s, &[], false, false);
     if rendered.trim().is_empty() { None } else { Some(rendered) }
 }
 
@@ -20026,7 +27283,6 @@ async fn rewind_and_edit_user(
 /// live at `<exe_dir>/apps/fable/cards/`. Returns `None` if no such dir
 /// exists in any candidate location (graceful: the picker shows empty).
 fn resolve_fable_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
-    use tauri::Manager;
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     // §8C layout FIRST: scenario cards are user-state, live under
     // `<exe_dir>/apps/fable/cards/` (shipped empty; populated by the future
@@ -20037,8 +27293,7 @@ fn resolve_fable_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf>
     // `target/{debug,release}/apps` — NOT the project-root `apps/` where
     // scenario cards actually live during development. Walk up from the exe
     // dir looking for `apps/fable/cards` so dev finds the source-tree cards
-    // (e.g. `C:\WUPI\apps\fable/cards`). Same climb pattern as the legacy
-    // `cards/fable_cards` walk-up below; in a shipped portable build the exe
+    // (the dev source tree). In a shipped portable build the exe
     // sits at the install root so `<exe_dir>/apps/fable/cards` already hit on
     // candidate #1 and these never fire.
     if let Some(exe) = std::env::current_exe().ok() {
@@ -20052,24 +27307,6 @@ fn resolve_fable_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf>
             }
         }
     }
-    // Legacy pre-§8C layout (`cards/fable_cards/`) + dev-repo paths. Kept as
-    // fallbacks so a v0.2.4 → v0.3.0 in-place upgrade still finds any
-    // pre-existing scenarios under the old path.
-    if let Some(d) = app.path().resource_dir().ok() {
-        candidates.push(d.join("cards").join("fable_cards"));
-    }
-    if let Some(exe) = std::env::current_exe().ok() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("cards").join("fable_cards"));
-            if let Some(grand) = parent.parent().and_then(|g| g.parent()) {
-                candidates.push(grand.join("cards").join("fable_cards"));
-            }
-            if let Some(gg) = parent.parent().and_then(|g| g.parent()).and_then(|g| g.parent()) {
-                candidates.push(gg.join("cards").join("fable_cards"));
-            }
-        }
-    }
-
     for dir in &candidates {
         if dir.is_dir() {
             tracing::info!("resolved fable_cards dir: {}", dir.display());
@@ -20090,18 +27327,27 @@ fn resolve_fable_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf>
 fn find_card_by_id(dir: &std::path::Path, target_id: &str) -> Result<sim_card::SimCard, String> {
     for path in iter_card_sim_paths(dir) {
         let card = sim_card::load_or_fallback(&path);
-        if card.id == target_id && card.card_type == "simulation" {
+        // (v0.30.0 clean break) warn on a pre-v2 SKIP — the same per-skip
+        // visibility fable_cards_list carries, so a legacy card that blocks
+        // a by-id launch names itself in the log.
+        if card.id == target_id && card.card_type == "simulation" && !card.format_v2 {
+            tracing::warn!(
+                path = %path.display(),
+                "find_card_by_id: skipping pre-v2 card (recreate it via the Creator)"
+            );
+        }
+        if card.id == target_id && card.card_type == "simulation" && card.format_v2 {
             return Ok(card);
         }
     }
     // Folder-name fallback (case-insensitive): the launch shortcut carries
-    // the display folder name; a pre-2026-08-19 .lnk carries the old slug.
+    // the display folder name.
     let want = target_id.to_lowercase();
     for path in iter_card_sim_paths(dir) {
         let folder = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str());
         if folder.is_some_and(|f| f.to_lowercase() == want) {
             let card = sim_card::load_or_fallback(&path);
-            if card.card_type == "simulation" {
+            if card.card_type == "simulation" && card.format_v2 {
                 return Ok(card);
             }
         }
@@ -20212,8 +27458,8 @@ pub(crate) fn safe_display_stem(name: &str, fallback: &str) -> String {
 
 /// `safe_display_stem` + collision relief: when `<root>/<stem>` already
 /// exists (Windows folders are case-insensitive — "aether" collides with
-/// "Aether"), append " 2", " 3", … until free. Used by card/player writes +
-/// the boot migration. `respect_existing` is the folder we're ALLOWED to
+/// "Aether"), append " 2", " 3", … until free. Used by card/player writes.
+/// `respect_existing` is the folder we're ALLOWED to
 /// keep (an edit/rename writing its own folder).
 pub(crate) fn unique_display_stem(
     root: &std::path::Path,
@@ -20245,8 +27491,8 @@ pub(crate) fn unique_display_stem(
 
 /// Process-wide card-folder resolution cache: memory-partition slug → the
 /// ACTUAL on-disk folder (display-named since 2026-08-19). Populated by the
-/// walker + the writers; folders are stable within a boot (the migration
-/// runs before any IPC). Keyed by `<cards_root>|<slug>` so tests with
+/// walker + the writers; folders are stable within a boot. Keyed by
+/// `<cards_root>|<slug>` so tests with
 /// tempdirs can't cross-pollute.
 static CARD_FOLDER_CACHE: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, std::path::PathBuf>>,
@@ -20257,8 +27503,8 @@ fn card_folder_cache(
     CARD_FOLDER_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Record a card folder under its partition slug (writers + migration call
-/// this so subsequent by-id resolutions skip the walk).
+/// Record a card folder under its partition slug (writers call this so
+/// subsequent by-id resolutions skip the walk).
 pub(crate) fn cache_card_folder(cards_root: &std::path::Path, card_id: &str, folder: &std::path::Path) {
     let key = format!("{}|{}", cards_root.display(), card_id);
     card_folder_cache().lock().unwrap_or_else(|e| e.into_inner()).insert(key, folder.to_path_buf());
@@ -20280,7 +27526,7 @@ fn resolve_card_folder(cards_root: &std::path::Path, card_id: &str) -> Option<st
     }
     for path in iter_card_sim_paths(cards_root) {
         let card = sim_card::load_or_fallback(&path);
-        if card.id == want && card.card_type == "simulation" {
+        if card.id == want && card.card_type == "simulation" && card.format_v2 {
             let folder = path.parent()?.to_path_buf();
             cache_card_folder(cards_root, &want, &folder);
             return Some(folder);
@@ -20319,51 +27565,14 @@ fn resolve_card_file(
     dir.join(format!("{stem}.{ext}"))
 }
 
-/// Fold legacy fixed-name portraits (`portrait.<ext>`) onto the folder's
-/// namesake stem (`<Folder>.<ext>`) — the 2026-08-19 ruling that portraits
-/// ride the `<Name>.sim` / `<Name>.player` naming. Idempotent; returns true
-/// when anything moved (callers refresh the derived `.lnk`/`.ico`). A
-/// namesake file of the SAME ext wins (the legacy copy is reaped as a stale
-/// twin); the derived legacy `portrait.ico` goes too when any fold happened
-/// (`build_card_shortcut` regenerates it under the stem). Skipped outright
-/// for a folder literally named "portrait" — there the namesake + legacy
-/// names denote the SAME file on case-insensitive Windows.
-pub(crate) fn rename_legacy_portraits(dir: &std::path::Path) -> bool {
-    let Some(stem) = dir.file_name().and_then(|n| n.to_str()).map(|s| s.to_owned()) else {
-        return false;
-    };
-    if stem.eq_ignore_ascii_case("portrait") {
-        return false;
-    }
-    let mut moved = false;
-    for ext in ["png", "jpg", "jpeg"] {
-        let legacy = dir.join(format!("portrait.{ext}"));
-        if !legacy.is_file() {
-            continue;
-        }
-        let namesake = dir.join(format!("{stem}.{ext}"));
-        if namesake.is_file() {
-            // The namesake is canonical; the legacy copy is a stale twin.
-            let _ = std::fs::remove_file(&legacy);
-        } else if std::fs::rename(&legacy, &namesake).is_ok() {
-            moved = true;
-        }
-    }
-    if moved {
-        let _ = std::fs::remove_file(dir.join("portrait.ico"));
-    }
-    moved
-}
-
 /// Move every per-card file from `old` into `new` (a rename: the card's
 /// name changed → new display folder). Fixed-name files (`saves/`,
 /// `session.json`) ride as-is; stem-named files (`<stem>.codex`,
 /// `<stem>.world.json`, the namesake portrait `<stem>.<ext>` + `.ico`, …)
-/// re-stem onto the new folder name; a legacy `portrait.<ext>` rides as-is
-/// (the boot migration's `rename_legacy_portraits` pass folds it). The old
-/// `.sim` + `.lnk` are skipped (the caller writes the fresh `.sim`; the
-/// `.lnk` re-derives). Best-effort, logged, never fatal — a leftover old
-/// folder is inert (the walker only lists the new namesake).
+/// re-stem onto the new folder name. The old `.sim` + `.lnk` are skipped
+/// (the caller writes the fresh `.sim`; the `.lnk` re-derives). Best-effort,
+/// logged, never fatal — a leftover old folder is inert (the walker only
+/// lists the new namesake).
 pub(crate) fn migrate_card_folder_contents(old: &std::path::Path, new: &std::path::Path) {
     let old_stem = old
         .file_name()
@@ -20385,6 +27594,7 @@ pub(crate) fn migrate_card_folder_contents(old: &std::path::Path, new: &std::pat
         tracing::warn!(from = %old.display(), to = %new.display(), err = %e, "card folder migration mkdir failed");
         return;
     }
+    let mut failed_moves: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else { continue };
@@ -20405,10 +27615,22 @@ pub(crate) fn migrate_card_folder_contents(old: &std::path::Path, new: &std::pat
         }
         if let Err(e) = std::fs::rename(&path, &dest) {
             tracing::warn!(file = %name_str, err = %e, "card folder migration: file move failed (continuing)");
+            failed_moves.push(name_str.to_owned());
         }
     }
-    // Everything movable has moved; drop the husk (its .sim/.lnk remain).
-    let _ = std::fs::remove_dir_all(old);
+    // (2026-08-23 audit fix) Drop the husk ONLY when every movable file
+    // actually moved — a locked file (a portrait open in a viewer — a
+    // Windows sharing violation) that failed its rename used to be deleted
+    // with the husk anyway: permanent data loss on a mere rename.
+    if failed_moves.is_empty() {
+        let _ = std::fs::remove_dir_all(old);
+    } else {
+        tracing::warn!(
+            files = ?failed_moves,
+            old = %old.display(),
+            "card folder migration: husk KEPT — files failed to move (locked?); they stay in the old folder"
+        );
+    }
     // (2026-08-22 session decoupling) The card's SESSION TREE is keyed by
     // the display folder name — it follows the rename too (the sessions
     // live OUTSIDE the card folder now). The card's linked codex files are
@@ -20437,482 +27659,6 @@ pub(crate) fn migrate_card_folder_contents(old: &std::path::Path, new: &std::pat
     }
 }
 
-/// The ONE-SHOT boot migration to the v2 card/player format (Chloe ruling
-/// 2026-08-19). Runs in `setup()` BEFORE any window exists, so no IPC can
-/// race it. Idempotent per boot: a card/player already in the v2 shape +
-/// display-named folder is only cached; a legacy one is rewritten
-/// (`.sim` re-serialized v2 / `.json` converted to `.player`) + its folder
-/// renamed to the display name. Best-effort + logged under SYS — a failed
-/// entry is skipped, never fatal (the legacy back-compat parser keeps it
-/// loadable; the next boot retries).
-pub(crate) fn migrate_cards_v2(app: &tauri::AppHandle) {
-    let fable_dir = resolve_apps_dir(app).join("fable");
-    migrate_sim_cards_v2(&fable_dir.join("cards"), app);
-    migrate_players_v2(&fable_dir.join("players"));
-}
-
-fn migrate_sim_cards_v2(cards_root: &std::path::Path, app: &tauri::AppHandle) {
-    let Ok(entries) = std::fs::read_dir(cards_root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let Some(folder_name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let sim_path = path.join(format!("{folder_name}.sim"));
-        if !sim_path.is_file() {
-            continue;
-        }
-        let Ok(xml) = std::fs::read_to_string(&sim_path) else {
-            continue;
-        };
-        let Ok(card) = sim_card::parse_from_xml_str(&xml) else {
-            continue;
-        };
-        // System cards (wupi.sim never lives here, but belt-and-suspenders)
-        // keep the legacy shape forever.
-        if card.card_type != "simulation" {
-            continue;
-        }
-        // (2026-08-19 portrait namesake fold) Any legacy `portrait.<ext>` in
-        // the folder moves onto the stem BEFORE the rename branches below
-        // (`migrate_card_folder_contents` then re-stems it like every other
-        // namesake file). Runs for already-v2 folders too — idempotent.
-        let folded_portrait = rename_legacy_portraits(&path);
-        if folded_portrait {
-            tracing::info!(folder = %path.display(), "boot migration: folded legacy card portrait onto stem");
-        }
-        let display = safe_display_stem(&card.name, folder_name);
-        // (2026-08-20 audit M6) Guard: legacy content the v2 serializer
-        // CANNOT express is load-bearing at session entry — the authored
-        // <cast> seeds npc_registry, the <locations> graph seeds travel,
-        // <player_name> is the attach anchor, <introductions> feeds the
-        // boot-bubble picker. Rewriting such a card to v2 would destroy
-        // that data one-way (serialize_v2 has no slot for it). Those cards
-        // keep their legacy bytes verbatim — the back-compat parse serves
-        // them fully — and only the folder rename proceeds. A `<cast>`-
-        // free card with authored locations still guards: the graph is the
-        // irreplaceable part. Introductions only guard when they carry
-        // MORE than the <intro> sibling already preserves (parse derives
-        // introductions from intro lines, so equality means no loss).
-        let intro_lines: Vec<String> = card
-            .intro
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty())
-            .map(|l| l.strip_prefix("- ").unwrap_or(l).trim().to_owned())
-            .collect();
-        let carries_unmappable = !card.cast.is_empty()
-            || !card.locations.is_empty()
-            || card.player_name.is_some()
-            || card.introductions != intro_lines;
-        let needs_rewrite = !card.format_v2 && !carries_unmappable;
-        if !card.format_v2 && carries_unmappable {
-            tracing::info!(
-                card_id = %card.id,
-                "boot migration: legacy card carries v2-unmappable authored data (cast/locations/player_name/introductions); keeping legacy bytes, rename-only"
-            );
-        }
-        let needs_rename = display != folder_name;
-        if !needs_rewrite && !needs_rename {
-            cache_card_folder(cards_root, &card.id, &path);
-            // The fold removed the legacy portrait.ico the .lnk pointed at —
-            // rebuild the shortcut (regenerates the namesake .ico + repoints
-            // the .lnk). The rewrite/rename branches below hit the shared
-            // tail refresh instead.
-            //
-            // Shortcut self-heal (2026-08-19): the .lnk/.ico derive from the
-            // portrait, but the CREATE flow writes the portrait AFTER the
-            // card — a shortcut built at card-write time saw no portrait and
-            // fell back to the F icon, and nothing regenerated it. When a
-            // PNG portrait exists without its namesake .ico, build it now.
-            // Converges: once the .ico exists, later boots no-op.
-            let png_portrait = portrait_path_for(cards_root, &card.id)
-                .map_or(false, |n| n.to_lowercase().ends_with(".png"));
-            let missing_icon = png_portrait
-                && !path.join(format!("{folder_name}.ico")).is_file();
-            if folded_portrait || missing_icon {
-                if let Err(e) = build_card_shortcut(app, &card.id, false) {
-                    tracing::warn!(card_id = %card.id, err = %e, "portrait fold: shortcut refresh failed (non-fatal)");
-                }
-            }
-            continue;
-        }
-        let target = if needs_rename {
-            cards_root.join(unique_display_stem(cards_root, &card.name, folder_name, Some(&path)))
-        } else {
-            path.clone()
-        };
-        // The .sim is written fresh into the TARGET folder (v2 layout when
-        // the card was legacy; verbatim when only the folder name changes).
-        let out_xml = if needs_rewrite { card.serialize_v2() } else { xml };
-        if needs_rename && target != path {
-            if let Err(e) = std::fs::create_dir_all(&target) {
-                tracing::warn!(card_id = %card.id, err = %e, "v2 migration: target folder create failed (skipped)");
-                continue;
-            }
-            let new_stem = target
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(folder_name)
-                .to_owned();
-            if let Err(e) = write_atomic(&target.join(format!("{new_stem}.sim")), out_xml.as_bytes()) {
-                tracing::warn!(card_id = %card.id, err = %e, "v2 migration: renamed card write failed (skipped)");
-                continue;
-            }
-            // Carry saves/session/codex/schema-split/portrait; re-stem the
-            // id-keyed files onto the display stem; reap the husk + old .lnk.
-            migrate_card_folder_contents(&path, &target);
-            cache_card_folder(cards_root, &card.id, &target);
-        } else {
-            if let Err(e) = write_atomic(&sim_path, out_xml.as_bytes()) {
-                tracing::warn!(card_id = %card.id, err = %e, "v2 migration: card rewrite failed (skipped)");
-                continue;
-            }
-            cache_card_folder(cards_root, &card.id, &path);
-        }
-        // Refresh the in-folder .lnk (label + --card arg now display-named).
-        if let Err(e) = build_card_shortcut(app, &card.id, false) {
-            tracing::warn!(card_id = %card.id, err = %e, "v2 migration: shortcut refresh failed (non-fatal)");
-        }
-    }
-}
-
-/// (2026-08-22 session decoupling) One-shot-per-card boot migration: move
-/// all DYNAMIC game data out of the card folders into the centralized tree.
-///
-/// For every simulation card folder that still carries in-folder dynamic
-/// state (the pre-2026-08-22 layout — split JSONs, `session.json`,
-/// `saves/`): mint a session under `data/saves/<CardName>/<session_id>/`,
-/// move the files in, write the manifest ("Session 1"). The card's
-/// `.codex` sibling moves to the universal `data/codex/` library
-/// (collision-relieved) AND is `<linked_codices>`-linked to the card, so
-/// every install's lore survives the decoupling verbatim.
-///
-/// Same boot discipline as `migrate_cards_v2`: runs BEFORE any window
-/// exists (no frontend IPC can race it), idempotent (a migrated card
-/// folder holds none of the trigger files → every step no-ops), failures
-/// log + retry next boot. Runs AFTER `migrate_cards_v2` so folder names
-/// are final.
-pub(crate) fn migrate_dynamic_data_v2(app: &tauri::AppHandle) {
-    let Some(fable_root) = resolve_fable_root(app) else { return };
-    migrate_dynamic_data_in(&fable_root);
-}
-
-/// The pure core of the dynamic-data migration (takes the fable root
-/// directly so tests can drive it over a tempdir).
-fn migrate_dynamic_data_in(fable_root: &std::path::Path) {
-    let cards_root = fable_root.join("cards");
-    let saves_root = fable_root.join("data").join("saves");
-    let codex_root = fable_root.join("data").join("codex");
-    if std::fs::create_dir_all(&saves_root).is_err() || std::fs::create_dir_all(&codex_root).is_err() {
-        tracing::warn!("dynamic-data migration: could not create the data/saves + data/codex roots");
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(&cards_root) else { return };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let Some(folder_name) = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(str::to_owned)
-        else {
-            continue;
-        };
-        let sim_path = path.join(format!("{folder_name}.sim"));
-        let Ok(xml) = std::fs::read_to_string(&sim_path) else { continue };
-        let Ok(card) = sim_card::parse_from_xml_str(&xml) else {
-            tracing::warn!(folder = %folder_name, "dynamic-data migration: unparsable .sim — skipping folder");
-            continue;
-        };
-        if card.card_type != "simulation" {
-            continue;
-        }
-
-        // 1) Session data → data/saves/<CardName>/<session_id>/.
-        // (2026-08-22 review) PARTIAL-FAILURE SAFETY: per-file renames can
-        // fail (a locked file on Windows) and the migration retries next
-        // boot — always MINTING then would split one campaign across two
-        // session folders (its live state in one, its save slots in the
-        // other). A `.migration-pending` marker in the session dir makes the
-        // re-run ADOPT the interrupted session instead of minting a new one;
-        // the marker is removed only once the card folder carries no trigger
-        // files left to move.
-        let has_dynamic = path.join("session.json").is_file()
-            || path.join("world.json").is_file()
-            || path.join("player.json").is_file()
-            || path.join("npc.json").is_file()
-            || path.join("saves").is_dir();
-        if has_dynamic {
-            let card_saves_root = saves_root.join(&folder_name);
-            if let Err(e) = std::fs::create_dir_all(&card_saves_root) {
-                tracing::warn!(folder = %folder_name, err = %e, "dynamic-data migration: session root create failed (skipping)");
-                continue;
-            }
-            let session_dir = match find_pending_migration_session(&card_saves_root) {
-                Some(adopt) => {
-                    tracing::info!(
-                        folder = %folder_name,
-                        session = %adopt.display(),
-                        "dynamic-data migration: adopting an interrupted session migration"
-                    );
-                    adopt
-                }
-                None => {
-                    let session_id = fable_save::mint_session_id();
-                    let dir = card_saves_root.join(&session_id);
-                    if let Err(e) = std::fs::create_dir_all(&dir) {
-                        tracing::warn!(folder = %folder_name, err = %e, "dynamic-data migration: session dir create failed (skipping)");
-                        continue;
-                    }
-                    if let Err(e) = std::fs::write(dir.join(MIGRATION_PENDING_MARKER), b"") {
-                        tracing::warn!(err = %e, "dynamic-data migration: marker write failed (non-fatal)");
-                    }
-                    dir
-                }
-            };
-            let mut moved_any = false;
-            for name in ["session.json", "world.json", "player.json", "npc.json"] {
-                let from = path.join(name);
-                if from.exists() {
-                    match std::fs::rename(&from, session_dir.join(name)) {
-                        Ok(()) => moved_any = true,
-                        Err(e) => tracing::warn!(file = name, err = %e, "dynamic-data migration: file move failed"),
-                    }
-                }
-            }
-            let saves_dir = path.join("saves");
-            if saves_dir.is_dir() {
-                match std::fs::rename(&saves_dir, session_dir.join("saves")) {
-                    Ok(()) => moved_any = true,
-                    Err(e) => tracing::warn!(err = %e, "dynamic-data migration: saves/ move failed"),
-                }
-            }
-            let leftovers = path.join("session.json").is_file()
-                || path.join("world.json").is_file()
-                || path.join("player.json").is_file()
-                || path.join("npc.json").is_file()
-                || path.join("saves").is_dir();
-            if moved_any && !leftovers {
-                let _ = std::fs::remove_file(session_dir.join(MIGRATION_PENDING_MARKER));
-            }
-            if moved_any {
-                // (adoption path) the manifest only mints when absent — an
-                // adopted session keeps its original "Session 1" identity.
-                let session_id = session_dir
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("")
-                    .to_owned();
-                if !session_dir.join("manifest.json").is_file() {
-                    let manifest = fable_save::SessionManifest {
-                        session_id: session_id.clone(),
-                        card_id: card.id.clone(),
-                        name: "Session 1".to_owned(),
-                        created_at: std::fs::metadata(session_dir.join("session.json"))
-                            .and_then(|m| m.modified())
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(0),
-                    };
-                    if let Err(e) = fable_save::write_manifest(&session_dir, &manifest) {
-                        tracing::warn!(err = %e, "dynamic-data migration: manifest write failed (non-fatal)");
-                    }
-                }
-                tracing::info!(
-                    card_id = %card.id,
-                    session_id = %session_id,
-                    "dynamic-data migration: session moved into the centralized saves tree"
-                );
-            }
-        }
-
-        // 2) The `.codex` sibling → the universal library + a link.
-        // (2026-08-22 review) LINK FIRST, MOVE SECOND. The old order renamed
-        // the `.codex` into the library before rewriting the `.sim` — a
-        // link-write failure left the lore file in the library with no card
-        // pointing at it (the trigger `codex_src.is_file()` went permanently
-        // false, so it never retried), and the empty-links reconcile then
-        // purged the card's seeded rows on the next session entry. Writing
-        // the link first keeps the trigger alive until the move commits; a
-        // failed move rolls the `.sim` back so the pair stays atomic.
-        let codex_src = path.join(format!("{folder_name}.codex"));
-        if codex_src.is_file() {
-            let planned = plan_codex_library_name(&codex_src, &codex_root, &folder_name);
-            let mut links = card.linked_codices.clone();
-            if !links.iter().any(|n| n.eq_ignore_ascii_case(&planned)) {
-                links.push(planned.clone());
-            }
-            let link_write = sim_card::with_linked_codices(&xml, &links)
-                .map_err(|e| format!("{e:#}"))
-                .and_then(|out_xml| {
-                    write_atomic(&sim_path, out_xml.as_bytes()).map_err(|e| format!("{e}"))
-                });
-            match link_write {
-                Ok(()) => {
-                    match move_codex_to_library_as(&codex_src, &codex_root, &planned) {
-                        Ok(()) => {
-                            tracing::info!(
-                                card_id = %card.id,
-                                codex = %planned,
-                                "dynamic-data migration: .codex moved to the universal library + linked"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(err = %e, "dynamic-data migration: .codex library move failed — rolling the .sim link back (retry next boot)");
-                            if let Err(rb) = write_atomic(&sim_path, xml.as_bytes()) {
-                                tracing::warn!(err = %rb, "dynamic-data migration: .sim link rollback failed (manual relink needed)");
-                            }
-                        }
-                    }
-                }
-                Err(e) => tracing::warn!(err = %e, "dynamic-data migration: linked_codices rewrite failed (retry next boot)"),
-            }
-        }
-    }
-}
-
-/// (2026-08-22 review) Marker file stamped into a freshly minted migration
-/// session dir and removed only when the card folder no longer carries any
-/// dynamic-data trigger file — a re-run that finds it ADOPTS that session
-/// instead of minting another (a partial migration must never split one
-/// campaign across two session folders).
-const MIGRATION_PENDING_MARKER: &str = ".migration-pending";
-
-/// Find a session dir under `card_saves_root` still carrying the
-/// `.migration-pending` marker (an interrupted migration). Newest wins by
-/// directory-name sort — session ids are `session_<unix_ms>`, so a lexical
-/// sort is a chronological sort.
-fn find_pending_migration_session(card_saves_root: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut pending: Vec<std::path::PathBuf> = std::fs::read_dir(card_saves_root)
-        .ok()?
-        .flatten()
-        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-        .map(|e| e.path())
-        .filter(|p| p.join(MIGRATION_PENDING_MARKER).is_file())
-        .collect();
-    pending.sort();
-    pending.pop()
-}
-
-/// Plan the collision-free library stem for a `.codex` being moved into the
-/// universal library (extension-aware — library members are `<stem>.codex`
-/// files, so `unique_display_stem`'s bare-stem existence check can't see
-/// them). Boot-time + pre-window: the plan-then-rename window has no other
-/// writer, and the dest-exists guard in `move_codex_to_library_as` is the
-/// backstop regardless.
-fn plan_codex_library_name(
-    src: &std::path::Path,
-    codex_root: &std::path::Path,
-    fallback_name: &str,
-) -> String {
-    let stem = src
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(fallback_name);
-    let base = safe_display_stem(stem, "Codex");
-    let mut candidate = base.clone();
-    let mut n = 1usize;
-    // No early cap exit with an occupied candidate: the old `n < 100` bound
-    // could fall through to a rename against an existing dest (which fails
-    // on Windows — the migration never converged). The 10k break is
-    // unreachable and backs onto the dest-exists guard below.
-    while codex_root.join(format!("{candidate}.codex")).exists() {
-        n += 1;
-        candidate = format!("{base} {n}");
-        if n > 10_000 {
-            break;
-        }
-    }
-    candidate
-}
-
-/// Move one `.codex` file into the universal library under an
-/// ALREADY-PLANNED stem (see `plan_codex_library_name`). The caller writes
-/// the card's `<linked_codices>` FIRST — a link-write failure must leave
-/// the `.codex` in the card folder so the migration retries next boot.
-fn move_codex_to_library_as(
-    src: &std::path::Path,
-    codex_root: &std::path::Path,
-    lib_name: &str,
-) -> Result<(), String> {
-    let dest = codex_root.join(format!("{lib_name}.codex"));
-    if dest.exists() {
-        return Err(format!("collision: {} already exists", dest.display()));
-    }
-    std::fs::rename(src, &dest).map_err(|e| format!("rename: {e}"))
-}
-
-fn migrate_players_v2(players_root: &std::path::Path) {
-    let Ok(entries) = std::fs::read_dir(players_root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let Some(folder_name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        let player_file = path.join(format!("{folder_name}.player"));
-        let legacy_json = path.join(format!("{folder_name}.json"));
-        let Some(sp) = load_player_at(&player_file).or_else(|| load_player_at(&legacy_json)) else {
-            continue;
-        };
-        let sp = player::fold_legacy_lists(&sp);
-        // (2026-08-19 portrait namesake fold) legacy `portrait.<ext>` →
-        // `<folder>.<ext>` before the carry below (no-op once folded).
-        if rename_legacy_portraits(&path) {
-            tracing::info!(folder = %path.display(), "boot migration: folded legacy player portrait onto stem");
-        }
-        let display = safe_display_stem(&sp.name, folder_name);
-        let needs_rename = display != folder_name;
-        let target = if needs_rename {
-            players_root.join(unique_display_stem(players_root, &sp.name, folder_name, Some(&path)))
-        } else {
-            path.clone()
-        };
-        if let Err(e) = std::fs::create_dir_all(&target) {
-            tracing::warn!(player = %sp.name, err = %e, "player migration: target folder create failed (skipped)");
-            continue;
-        }
-        let new_stem = target
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(folder_name)
-            .to_owned();
-        let xml = player::render_player_xml(&sp);
-        if let Err(e) = write_atomic(&target.join(format!("{new_stem}.player")), xml.as_bytes()) {
-            tracing::warn!(player = %sp.name, err = %e, "player migration: player write failed (skipped)");
-            continue;
-        }
-        // Carry the portrait (the namesake `<folder>.<ext>` — the fold above
-        // already moved any legacy `portrait.<ext>` onto it); drop the
-        // legacy .json (converted) + the husk.
-        for ext in ["png", "jpg", "jpeg"] {
-            let src = path.join(format!("{folder_name}.{ext}"));
-            let dest = target.join(format!("{new_stem}.{ext}"));
-            if src.is_file() && src != dest {
-                let _ = std::fs::rename(&src, &dest);
-            }
-        }
-        let _ = std::fs::remove_file(&legacy_json);
-        if target != path {
-            let _ = std::fs::remove_dir_all(&path);
-        }
-        cache_player_folder(players_root, &sp.id, &target);
-    }
-}
-
 // === SAVED PLAYERS (2026-08-02) ===========================================
 // A standalone, reusable player identity library at apps/fable/players/.
 // Mirrors the per-card folder discipline (§6B) at a sibling root. Each
@@ -20926,36 +27672,6 @@ fn migrate_players_v2(players_root: &std::path::Path) {
 fn resolve_fable_players_dir(app: &tauri::AppHandle) -> std::path::PathBuf {
     resolve_apps_dir(app).join("fable").join("players")
 }
-
-/// Sanitize a player id to a bare slug segment (`[alnum_-]+`, dashes trimmed;
-/// Unicode alphanumerics kept) — the player-side id/partition discipline.
-/// PATH resolution no longer joins this directly (2026-08-19: folders are
-/// display-named + walker-resolved, mirroring the card side).
-fn sanitize_player_slug(id: &str) -> String {
-    let safe: String = id
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
-        .collect();
-    // (2026-08-15 audit fix) Same 64-char cap as the card sanitizer (the JS
-    // slugify's contract).
-    let safe = cap_slug_chars(safe.trim_matches('-').to_string());
-    // (2026-08-16 audit LOW) Windows reserved-stem suffix — the JS slugify
-    // already appends `-card` for `nul`/`con`/`com1-9`…, so ids that arrived
-    // THROUGH it are already suffixed (idempotent here); an id that reached
-    // the backend without the JS slug used to derive a reserved folder stem
-    // → a clean-but-confusing "could not create folder" failure.
-    let safe = if WINDOWS_RESERVED_STEMS.contains(&safe.as_str()) {
-        format!("{safe}-card")
-    } else {
-        safe
-    };
-    if safe.is_empty() {
-        "__unknown_player__".to_string()
-    } else {
-        safe
-    }
-}
-
 /// Process-wide player-folder resolution cache (slug id → actual display-
 /// named folder), mirroring the card side.
 static PLAYER_FOLDER_CACHE: std::sync::OnceLock<
@@ -21011,10 +27727,8 @@ fn load_player_portrait(app: &tauri::AppHandle, id: &str) -> Option<String> {
 }
 
 /// Enumerate every saved player's namesake identity file under a players
-/// root: `<folder>/<folder>.player` (canonical, 2026-08-19) with the legacy
-/// `<folder>/<folder>.json` as the migration-era fallback (the boot
-/// migration converts them; stray un-migrated ones still list). Returns the
-/// file paths; callers parse + skip malformed entries.
+/// root: `<folder>/<folder>.player` (the one format since 2026-08-19).
+/// Returns the file paths; callers parse + skip malformed entries.
 fn iter_player_paths(players_root: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
     let Ok(entries) = std::fs::read_dir(players_root) else {
@@ -21031,29 +27745,18 @@ fn iter_player_paths(players_root: &std::path::Path) -> Vec<std::path::PathBuf> 
         let player_file = path.join(format!("{name}.player"));
         if player_file.is_file() {
             out.push(player_file);
-            continue;
-        }
-        let legacy = path.join(format!("{name}.json"));
-        if legacy.is_file() {
-            out.push(legacy);
         }
     }
     out
 }
 
-/// Load + parse a SavedPlayer from a namesake path — `.player` XML
-/// (canonical) or legacy `.json`. Returns None on any read/parse error
-/// (malformed entries are skipped by the list IPC, not fatal).
+/// Load + parse a SavedPlayer from a namesake `.player` XML path. Returns
+/// None on any read/parse error (malformed entries are skipped by the list
+/// IPC, not fatal).
 fn load_player_at(path: &std::path::Path) -> Option<player::SavedPlayer> {
     let bytes = std::fs::read(path).ok()?;
-    if path.extension().and_then(|x| x.to_str()) == Some("player") {
-        let text = String::from_utf8(bytes).ok()?;
-        let p = player::parse_player_xml(&text).ok()?;
-        // Fold legacy JSON-era lists into the v2 inventory model.
-        return Some(player::fold_legacy_lists(&p));
-    }
-    let p: player::SavedPlayer = serde_json::from_slice(&bytes).ok()?;
-    Some(player::fold_legacy_lists(&p))
+    let text = String::from_utf8(bytes).ok()?;
+    player::parse_player_xml(&text).ok()
 }
 
 /// Enumerate every saved player + return lightweight metadata for the
@@ -21073,8 +27776,8 @@ fn fable_players_list(app: tauri::AppHandle) -> Result<Vec<player::PlayerMeta>, 
             }
         };
         // Portrait exists? A stat fact — the .player XML carries no portrait
-        // field; the namesake `<Name>.<ext>` sibling (legacy `portrait.<ext>`
-        // fallback) is the truth (`find_portrait_sibling`).
+        // field; the namesake `<Name>.<ext>` sibling is the truth
+        // (`find_portrait_sibling`).
         let has_portrait = path
             .parent()
             .map(|d| find_portrait_sibling(d).is_some())
@@ -21114,9 +27817,7 @@ fn fable_player_get(id: String, app: tauri::AppHandle) -> Result<player::SavedPl
         .unwrap_or("Player")
         .to_owned();
     let player_file = folder.join(format!("{stem}.player"));
-    let legacy_json = folder.join(format!("{stem}.json"));
     let mut player = load_player_at(&player_file)
-        .or_else(|| load_player_at(&legacy_json))
         .ok_or_else(|| format!("no saved player with id '{id}'"))?;
     // Resolve the portrait to an absolute path via the shared helper.
     player.portrait = load_player_portrait(&app, &id);
@@ -21155,9 +27856,7 @@ fn fable_active_player_get(
         .unwrap_or("Player")
         .to_owned();
     let player_file = folder.join(format!("{stem}.player"));
-    let legacy_json = folder.join(format!("{stem}.json"));
     let mut player = load_player_at(&player_file)
-        .or_else(|| load_player_at(&legacy_json))
         .ok_or_else(|| format!("attached player '{id}' not found on disk"))?;
     player.portrait = load_player_portrait(&app, &id);
     Ok(Some(player))
@@ -21181,36 +27880,73 @@ fn fable_player_write(
     // 1. Validate structure + content BEFORE any disk touch.
     player::validate_player(&player)
         .map_err(|e| format!("Invalid player: {e}"))?;
-    // 2. (Re-)slugify the id from the name. If the caller's slug is
-    //    unusable, derive from the name; if THAT'S unusable, the
-    //    validator already rejected an empty name, so this is a hard
-    //    error only on a logic bug.
-    let slug = player::slugify_player_id(&player.name)
-        .or_else(|| player::slugify_player_id(&id))
-        .ok_or_else(|| "could not derive a valid player id".to_string())?;
+    // 2. (2026-08-24 review fix) Identity pin — the card-side `renaming_id`
+    //    contract. An EXISTING player (walker-resolved by the CALLER'S id)
+    //    keeps its id: a rename changes the display folder, never the
+    //    identity. The old code re-derived the slug from the (new) name on
+    //    every write, so a renamed player never resolved to its own folder
+    //    — `existing` keyed on the NEW slug found nothing, a fresh folder
+    //    was minted, the old folder sat orphaned as a duplicate forever,
+    //    and the rename/migrate branch below was unreachable by
+    //    construction (the stem always came from the resolved folder's own
+    //    name, making `player_dir == old` for every write that resolved).
+    //    A fresh create derives the id from the name as before.
     let dir = resolve_fable_players_dir(&app);
+    let existing = resolve_player_folder(&dir, &id);
+    let slug = match &existing {
+        Some(_) => id.clone(),
+        None => player::slugify_player_id(&player.name)
+            .or_else(|| player::slugify_player_id(&id))
+            .ok_or_else(|| "could not derive a valid player id".to_string())?,
+    };
     // 3. (2026-08-19) The FOLDER is display-named ("Alex"); the id stays the
     //    slug. An EXISTING player with this id keeps its folder (an edit);
     //    a fresh create derives the display folder from the name. A rename
-    //    (name changed → new display folder) migrates the portrait + kills
-    //    the legacy .json.
-    let existing = resolve_player_folder(&dir, &slug);
-    let stem = match &existing {
-        Some(folder) => folder
+    //    (name changed → new display folder) migrates the portrait. Rename
+    //    detection reads the OLD player from disk BEFORE this write
+    //    replaces it (the card-side pattern): the folder only moves on a
+    //    TRUE display-name change, so a historically collision-relieved
+    //    folder ("Alex 2") never drifts back on a mere edit-save. The old
+    //    created_at rides along too — a rename writes a NEW path, so the
+    //    stamp must come from the OLD file or the identity resets its age.
+    let (old_name, old_created_ms): (Option<String>, Option<i64>) = existing
+        .as_ref()
+        .and_then(|old| {
+            let old_stem = old
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            if old_stem.is_empty() {
+                return None;
+            }
+            load_player_at(&old.join(format!("{old_stem}.player"))).map(|p| {
+                (
+                    Some(p.name),
+                    (p.created_at_ms > 0).then_some(p.created_at_ms),
+                )
+            })
+        })
+        .unwrap_or((None, None));
+    let rename_moves = old_name.as_deref().is_some_and(|n| n != player.name);
+    let stem = match (&existing, rename_moves) {
+        (Some(old), true) => unique_display_stem(&dir, &player.name, "Player", Some(old)),
+        (Some(folder), _) => folder
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or(&player.name)
             .to_owned(),
-        None => unique_display_stem(&dir, &player.name, "Player", None),
+        (None, _) => unique_display_stem(&dir, &player.name, "Player", None),
     };
     let player_dir = dir.join(&stem);
     let player_path = player_dir.join(format!("{stem}.player"));
     if let Some(old) = &existing {
         if *old != player_dir && old.is_dir() {
-            // Rename: carry the portrait (any ext) to the new folder under
-            // the NEW stem — namesake first, then a legacy `portrait.<ext>`
-            // folded onto it — then drop the husk. The legacy .json (if
-            // any) converts below.
+            // Rename: carry the namesake portrait (any ext) to the new
+            // folder under the NEW stem, then drop the husk. (2026-08-23
+            // audit fix) The husk is dropped ONLY when every portrait
+            // actually moved — a locked file (a viewer holding it open)
+            // used to be deleted with the husk: permanent portrait loss on
+            // a mere rename.
             if let Err(e) = std::fs::create_dir_all(&player_dir) {
                 return Err(format!("could not create player folder: {e}"));
             }
@@ -21219,45 +27955,49 @@ fn fable_player_write(
                 .and_then(|n| n.to_str())
                 .unwrap_or(&player.name)
                 .to_owned();
+            let mut failed_moves: Vec<String> = Vec::new();
             for ext in ["png", "jpg", "jpeg"] {
                 let dest = player_dir.join(format!("{stem}.{ext}"));
                 let namesake = old.join(format!("{old_stem}.{ext}"));
                 if namesake.is_file() {
-                    let _ = std::fs::rename(&namesake, &dest);
-                } else {
-                    let legacy = old.join(format!("portrait.{ext}"));
-                    if legacy.is_file() {
-                        let _ = std::fs::rename(&legacy, &dest);
+                    if let Err(e) = std::fs::rename(&namesake, &dest) {
+                        tracing::warn!(
+                            file = %namesake.display(),
+                            err = %e,
+                            "player rename: portrait move failed (kept in the old folder)"
+                        );
+                        failed_moves.push(ext.to_string());
                     }
                 }
             }
-            let _ = std::fs::remove_dir_all(old);
+            if failed_moves.is_empty() {
+                let _ = std::fs::remove_dir_all(old);
+            } else {
+                tracing::warn!(
+                    old = %old.display(),
+                    exts = ?failed_moves,
+                    "player rename: husk KEPT — portraits failed to move (locked?)"
+                );
+            }
         }
     }
     std::fs::create_dir_all(&player_dir)
         .map_err(|e| format!("could not create player folder: {e}"))?;
-    // 4. Serialize as the v2 `.player` XML (Rust owns the rendering — the
-    //    DTO over IPC, XML on disk), preserving a prior created_at when the
-    //    file already exists.
-    let mut to_write = player::fold_legacy_lists(&player);
+    // 4. Serialize as the `.player` XML (Rust owns the rendering — the DTO
+    //    over IPC, XML on disk), preserving a prior created_at when the file
+    //    already exists.
+    let mut to_write = player;
     to_write.id = slug.clone();
     if to_write.created_at_ms == 0 {
-        let old_json = player_dir.join(format!("{stem}.json"));
         to_write.created_at_ms = load_player_at(&player_path)
-            .or_else(|| load_player_at(&old_json))
             .map(|p| p.created_at_ms)
             .filter(|ms| *ms > 0)
+            .or(old_created_ms)
             .unwrap_or_else(current_unix_ms_i64);
     }
     let xml = player::render_player_xml(&to_write);
     write_atomic(&player_path, xml.as_bytes())
         .map_err(|e| format!("could not write player: {e}"))?;
-    // The legacy .json is dead once the .player exists — remove it so the
-    // walker never sees two identities for one player.
-    let legacy_json = player_dir.join(format!("{stem}.json"));
-    if legacy_json.is_file() {
-        let _ = std::fs::remove_file(&legacy_json);
-    }
     cache_player_folder(&dir, &slug, &player_dir);
     // 5. Best-effort portrait flag for the returned meta (a stat fact).
     let has_portrait = find_portrait_sibling(&player_dir).is_some();
@@ -21272,6 +28012,15 @@ fn fable_player_write(
         weight: to_write.weight.clone(),
     })
 }
+
+/// (2026-08-24 review fix) Hard cap on portrait payload size across every
+/// portrait IPC (path upload, cropped bytes, card portrait write, the
+/// cropper's source read). The magic-byte gates prove the bytes are an
+/// IMAGE but never bounded them — a dialog-picked multi-GB file rode RAM
+/// verbatim (and the read/bytes paths base64 it over IPC, a 4/3 inflation
+/// on top). 20 MiB is far above any real cropped portrait and far below
+/// anything that could stress the machine.
+const PORTRAIT_MAX_BYTES: usize = 20 * 1024 * 1024;
 
 /// Upload (copy) a portrait image into a player's folder. `src_path` is
 /// an OS-native path from the file dialog (read server-side — the
@@ -21295,6 +28044,14 @@ fn fable_player_portrait_upload(
     // 1. Read the picked file's bytes server-side (no plugin-fs).
     let bytes = std::fs::read(&src_path)
         .map_err(|e| format!("could not read portrait: {e}"))?;
+    // (2026-08-24 review fix) Size cap — see PORTRAIT_MAX_BYTES.
+    if bytes.len() > PORTRAIT_MAX_BYTES {
+        return Err(format!(
+            "portrait is too large ({} bytes; max {})",
+            bytes.len(),
+            PORTRAIT_MAX_BYTES
+        ));
+    }
     // 2. Validate magic bytes BEFORE disk touch (the load-bearing gate).
     let ext = player::validate_image_magic(&bytes)?;
     // Namesake destination: `<Name>.<ext>` beside the `<Name>.player`.
@@ -21308,9 +28065,8 @@ fn fable_player_portrait_upload(
         .map_err(|e| format!("could not write portrait: {e}"))?;
     // (#61 hygiene, 2026-08-15 audit fix) Reap stale siblings — a lingering
     // other-ext file next to the new one is dead weight any ext-order scan
-    // would still see, and a fresh write folds away legacy `portrait.<ext>`
-    // files too. (No JSON patch: portrait presence is a stat fact — the
-    // `.player` XML carries no portrait field.)
+    // would still see. (No JSON patch: portrait presence is a stat fact —
+    // the `.player` XML carries no portrait field.)
     reap_stale_portraits(&player_dir, &ext);
     Ok(dest.to_string_lossy().into_owned())
 }
@@ -21351,6 +28107,14 @@ fn fable_player_portrait_upload_bytes(
         .trim();
     let bytes = base64_decode(b64)
         .map_err(|e| format!("could not decode portrait bytes: {e}"))?;
+    // (2026-08-24 review fix) Size cap — see PORTRAIT_MAX_BYTES.
+    if bytes.len() > PORTRAIT_MAX_BYTES {
+        return Err(format!(
+            "portrait is too large ({} bytes; max {})",
+            bytes.len(),
+            PORTRAIT_MAX_BYTES
+        ));
+    }
     // 1. Validate magic bytes BEFORE disk touch (same gate as the path IPC).
     let detected = player::validate_image_magic(&bytes)?;
     // Use the detected ext for the filename (the magic bytes are
@@ -21364,7 +28128,7 @@ fn fable_player_portrait_upload_bytes(
     let dest = player_dir.join(format!("{stem}.{detected}"));
     write_atomic(&dest, &bytes)
         .map_err(|e| format!("could not write portrait: {e}"))?;
-    // (#61 hygiene) Reap stale siblings (other-ext + legacy names). No JSON
+    // (#61 hygiene) Reap stale siblings (other-ext names). No JSON
     // patch — portrait presence is a stat fact (see the path-based variant).
     reap_stale_portraits(&player_dir, &detected);
     Ok(dest.to_string_lossy().into_owned())
@@ -21461,6 +28225,16 @@ fn base64_encode(bytes: &[u8]) -> String {
 fn fable_player_portrait_read_bytes(src_path: String) -> Result<String, String> {
     let bytes = std::fs::read(&src_path)
         .map_err(|e| format!("could not read portrait: {e}"))?;
+    // (2026-08-24 review fix) Size cap — see PORTRAIT_MAX_BYTES. This path
+    // base64-encodes the whole file over IPC (a 4/3 inflation), so the cap
+    // matters double here.
+    if bytes.len() > PORTRAIT_MAX_BYTES {
+        return Err(format!(
+            "portrait is too large ({} bytes; max {})",
+            bytes.len(),
+            PORTRAIT_MAX_BYTES
+        ));
+    }
     let ext = player::validate_image_magic(&bytes)?;
     let mime = if ext == "png" { "image/png" } else { "image/jpeg" };
     Ok(format!("data:{mime};base64,{}", base64_encode(&bytes)))
@@ -21515,18 +28289,12 @@ async fn fable_player_delete(id: String, app: tauri::AppHandle) -> Result<(), St
     // (2026-08-19) Walker resolution — the folder is display-named; the
     // reject-style guard above has already filtered hostile ids.
     let player_dir = resolve_player_folder(&dir, &id)
-        .or_else(|| {
-            // Legacy pre-migration slug folder (no .player yet, folder == slug).
-            let fallback = dir.join(sanitize_player_slug(&id));
-            fallback.is_dir().then_some(fallback)
-        })
         .ok_or_else(|| format!("no saved player with id '{id}'"))?;
     if !player_dir.exists() {
         return Ok(()); // idempotent
     }
     // Best-effort: confirm the folder actually contains a namesake identity
-    // file (.player or legacy .json) so a stray id can't nuke an unrelated
-    // sibling directory.
+    // file so a stray id can't nuke an unrelated sibling directory.
     let stem = player_dir
         .file_name()
         .and_then(|n| n.to_str())
@@ -21765,7 +28533,9 @@ mod tests {
     ) -> Vec<String> {
         let mut rejects = Vec::new();
         let mut snap = None;
-        apply_ledger_commands(s, &[&cmd], player_slug, &mut rejects, &mut snap);
+        // Empty corpus = fail-open grounding (the narrative_grounded
+        // convention) — these tests exercise the money math, not the gate.
+        apply_ledger_commands(s, &[&cmd], player_slug, &[], &mut rejects, &mut snap);
         rejects
     }
 
@@ -21885,7 +28655,7 @@ mod tests {
         s.player_state.wealth = 5;
         let mut rejects = Vec::new();
         let mut snap = None;
-        apply_ledger_commands(&mut s, &[&cmd], "", &mut rejects, &mut snap);
+        apply_ledger_commands(&mut s, &[&cmd], "", &[], &mut rejects, &mut snap);
         assert!(rejects.is_empty(), "{rejects:?}");
         assert!(snap.is_none(), "a no-change emission takes no undo snapshot");
     }
@@ -21992,6 +28762,117 @@ mod tests {
         assert!(item_name_is_a_person(&entries, "ferenc-illes"));
         assert!(!item_name_is_a_person(&entries, "Ferenc's Letter"));
         assert!(!item_name_is_a_person(&entries, ""));
+    }
+
+    /// (2026-08-22 second playtest pass) The UNREGISTERED person guard: a
+    /// final person-noun word reads as a person description, never an object
+    /// ("[NPC_ITEM wevlan +Elven figure]" — the registry half can't catch
+    /// people it never met). Real items — including the playtest's garbage
+    /// names — never trip it.
+    #[test]
+    fn item_name_looks_like_person_gate() {
+        assert!(item_name_looks_like_person("Elven figure"));
+        assert!(item_name_looks_like_person("bound man"));
+        assert!(item_name_looks_like_person("The Old Woman"));
+        assert!(item_name_looks_like_person("hooded-figure"));
+        assert!(item_name_looks_like_person("prisoner"));
+        // The playtest's real + garbage item names stay items.
+        assert!(!item_name_looks_like_person("Roy"));
+        assert!(!item_name_looks_like_person("Field Points"));
+        assert!(!item_name_looks_like_person("Farm-bow Made"));
+        assert!(!item_name_looks_like_person("arrow chaces"));
+        assert!(!item_name_looks_like_person("tea gone cold"));
+        assert!(!item_name_looks_like_person("Ash Polearm"));
+        assert!(!item_name_looks_like_person("straw doll"));
+        assert!(!item_name_looks_like_person(""));
+    }
+
+    /// (2026-08-22 second playtest pass) The dual-verb echo ledger: track →
+    /// consult (case-insensitive) → removal re-opens the name.
+    #[test]
+    fn player_item_add_tracking_gate() {
+        let mut tracked: Vec<String> = Vec::new();
+        assert!(!player_item_added_this_turn(&tracked, "Goblin Ear"));
+        track_player_item_add(&mut tracked, "Goblin Ear");
+        track_player_item_add(&mut tracked, "goblin ear"); // dedupes, case-folded
+        assert_eq!(tracked.len(), 1);
+        assert!(player_item_added_this_turn(&tracked, " GOBLIN EAR "));
+        // A removal re-opens the name (the taught -x +x replace pattern).
+        untrack_player_item_add(&mut tracked, "goblin ear");
+        assert!(!player_item_added_this_turn(&tracked, "Goblin Ear"));
+        // Empty names never track nor match.
+        track_player_item_add(&mut tracked, "   ");
+        assert!(!player_item_added_this_turn(&tracked, ""));
+    }
+
+    /// (2026-08-22 Chloe ruling — auto-registration) The stub mint: a
+    /// grounded unknown surface slugifies into a Named (reaper-archivable)
+    /// entry whose id rides as its own alias so every later emission
+    /// resolves; illegal-character keys slugify to nothing and stay on the
+    /// coached reject path (the ruling's carve-out).
+    #[test]
+    fn auto_register_presence_stub_mints_named_stubs() {
+        let stub = auto_register_presence_stub("Rhet").expect("a clean name mints");
+        assert_eq!(stub.id, "rhet");
+        assert_eq!(stub.name, "Rhet");
+        assert_eq!(stub.aliases, vec!["rhet".to_string()]);
+        assert_eq!(stub.prominence, schema::NpcProminence::Named);
+        assert!(stub.role.is_empty());
+        assert!(stub.tier.is_none());
+        // Display-form surfaces keep their spacing in the name, slug in the
+        // id — the playtest's "Elven figure".
+        let stub = auto_register_presence_stub("Elven figure").expect("multi-word mints");
+        assert_eq!(stub.id, "elven_figure");
+        assert_eq!(stub.name, "Elven figure");
+        assert_eq!(stub.aliases, vec!["elven_figure".to_string()]);
+        // Illegal-character keys slugify to nothing → the coached reject.
+        assert!(auto_register_presence_stub("   ").is_none());
+        assert!(auto_register_presence_stub("!!!").is_none());
+        assert!(auto_register_presence_stub("").is_none());
+    }
+
+    /// (2026-08-22 second playtest pass — the fabricated wealth gain) A gain
+    /// with NO transfer verb in the window rejects (the playtest's
+    /// "counting the coins in my coinpurse" minted +12); the same emission
+    /// grounded by a payment applies. Spends stay ungated.
+    #[test]
+    fn ledger_wealth_gain_requires_transfer_signal() {
+        let mut s = economy_schema();
+        s.player_state.wealth = 0;
+        let mut cmd = ledger_cmd(bracket_parser::LedgerOp::Wealth, "");
+        if let bracket_parser::BracketCommand::Ledger { wealth_delta, .. } = &mut cmd {
+            *wealth_delta = 12;
+        }
+        // The playtest's exact fabrication corpus — mention, not exchange.
+        let counting = [
+            "*I whistle, counting the coins in my coinpurse now with this*",
+        ];
+        let mut rejects = Vec::new();
+        let mut snap = None;
+        apply_ledger_commands(&mut s, &[&cmd], "", &counting, &mut rejects, &mut snap);
+        assert!(
+            rejects.iter().any(|r| r.contains("nothing in this scene moves coin")),
+            "{rejects:?}"
+        );
+        assert_eq!(s.player_state.wealth, 0, "the ungrounded gain never lands");
+        assert!(snap.is_none(), "a rejected gain takes no undo snapshot");
+        // Grounded by an actual payment → applies.
+        let paid = ["\"Fine work,\" the guildmaster says, and paid me twelve silver."];
+        let mut rejects = Vec::new();
+        let mut snap = None;
+        apply_ledger_commands(&mut s, &[&cmd], "", &paid, &mut rejects, &mut snap);
+        assert!(rejects.is_empty(), "{rejects:?}");
+        assert_eq!(s.player_state.wealth, 12);
+        // Spends never gate (the insufficient-funds check owns them).
+        let mut spend = ledger_cmd(bracket_parser::LedgerOp::Wealth, "");
+        if let bracket_parser::BracketCommand::Ledger { wealth_delta, .. } = &mut spend {
+            *wealth_delta = -5;
+        }
+        let mut rejects = Vec::new();
+        let mut snap = None;
+        apply_ledger_commands(&mut s, &[&spend], "", &counting, &mut rejects, &mut snap);
+        assert!(rejects.is_empty(), "{rejects:?}");
+        assert_eq!(s.player_state.wealth, 7);
     }
 
     /// (2026-08-22 playtest, Chloe directive) Presence grounding: an NPC the
@@ -22414,51 +29295,9 @@ mod tests {
         // Unknown ids resolve to nothing.
         assert!(resolve_card_folder(&cards, "no-such").is_none());
     }
-
-    #[test]
-    fn player_migration_converts_json_to_player_xml() {
-        // The one-shot boot migration: `<slug>/<slug>.json` →
-        // `<Name>/<Name>.player` (folder renamed to the display name, the
-        // legacy JSON converted + removed, the portrait carried + folded
-        // onto the namesake stem).
-        let tmp = tempfile::tempdir().unwrap();
-        let players = tmp.path().join("players");
-        let old = players.join("kael-brightwood");
-        std::fs::create_dir_all(&old).unwrap();
-        let json = r#"{"id":"kael-brightwood","name":"Kael Brightwood","gender":"Nonbinary","clothing":["cloak","boots"],"gear":["rope"],"created_at_ms":123}"#;
-        std::fs::write(old.join("kael-brightwood.json"), json).unwrap();
-        std::fs::write(old.join("portrait.png"), [0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
-
-        migrate_players_v2(&players);
-
-        let new = players.join("Kael Brightwood");
-        assert!(new.is_dir(), "folder renamed to the display name");
-        let player_file = new.join("Kael Brightwood.player");
-        assert!(player_file.is_file(), "the .player file exists");
-        assert!(!old.exists(), "the legacy folder is gone");
-        assert!(new.join("Kael Brightwood.png").is_file(), "the portrait rode the rename onto the namesake stem");
-        assert!(!new.join("portrait.png").exists(), "no legacy portrait name lingers");
-        let sp = crate::player::parse_player_xml(
-            &std::fs::read_to_string(&player_file).unwrap(),
-        )
-        .expect("migrated .player parses");
-        assert_eq!(sp.id, "kael-brightwood");
-        assert_eq!(sp.name, "Kael Brightwood");
-        assert_eq!(sp.gender.as_deref(), Some("Nonbinary"));
-        let inv = sp.inventory.expect("legacy lists folded into the inventory");
-        assert_eq!(inv.clothing, vec!["cloak".to_string(), "boots".to_string()]);
-        assert_eq!(inv.stored, vec!["rope".to_string()]);
-        // Idempotent: a second run is a no-op.
-        migrate_players_v2(&players);
-        assert!(new.join("Kael Brightwood.player").is_file());
-        assert!(!new.join("Kael Brightwood.json").exists());
-        assert!(new.join("Kael Brightwood.png").is_file());
-    }
-
     // ─────────────────────────────────────────────────────────────────────
     // Namesake portraits (2026-08-19): `<Name>.<ext>` beside the
-    // `<Name>.sim` / `<Name>.player`, legacy `portrait.<ext>` folded at
-    // boot + tolerated at discovery.
+    // `<Name>.sim` / `<Name>.player`.
     // ─────────────────────────────────────────────────────────────────────
 
     #[test]
@@ -22470,11 +29309,7 @@ mod tests {
         // Nothing → None.
         assert_eq!(find_portrait_sibling(&dir), None);
 
-        // Legacy-only folder → the legacy name (read-side fallback).
-        std::fs::write(dir.join("portrait.jpg"), b"x").unwrap();
-        assert_eq!(find_portrait_sibling(&dir), Some("portrait.jpg".to_string()));
-
-        // A namesake of a LOWER-preference ext still beats the legacy name.
+        // Ext order among namesakes: png > jpg > jpeg.
         std::fs::write(dir.join("Liam.jpeg"), b"x").unwrap();
         assert_eq!(find_portrait_sibling(&dir), Some("Liam.jpeg".to_string()));
 
@@ -22490,39 +29325,10 @@ mod tests {
         std::fs::write(dir2.join("One Piece.png"), b"x").unwrap();
         assert_eq!(find_portrait_sibling(&dir2), Some("One Piece.png".to_string()));
     }
-
-    #[test]
-    fn rename_legacy_portraits_folds_and_is_idempotent() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("Mara");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("portrait.png"), b"png").unwrap();
-        std::fs::write(dir.join("portrait.jpg"), b"jpg").unwrap();
-        std::fs::write(dir.join("portrait.ico"), b"ico").unwrap();
-
-        assert!(rename_legacy_portraits(&dir), "the fold reports action");
-        assert!(dir.join("Mara.png").is_file(), "png folded onto the stem");
-        assert!(dir.join("Mara.jpg").is_file(), "jpg folded onto the stem");
-        assert!(!dir.join("portrait.png").exists());
-        assert!(!dir.join("portrait.jpg").exists());
-        assert!(!dir.join("portrait.ico").exists(), "the derived legacy icon goes with the fold");
-        assert!(!rename_legacy_portraits(&dir), "second run is a no-op");
-
-        // Namesake of the same ext WINS: the legacy twin is reaped, not
-        // allowed to clobber the canonical file.
-        std::fs::write(dir.join("portrait.png"), b"stale").unwrap();
-        std::fs::write(dir.join("portrait.ico"), b"ico").unwrap();
-        assert!(rename_legacy_portraits(&dir));
-        let kept = std::fs::read(dir.join("Mara.png")).unwrap();
-        assert_eq!(kept, b"png", "the namesake content survives");
-        assert!(!dir.join("portrait.png").exists());
-    }
-
     #[test]
     fn card_folder_rename_restems_the_namesake_portrait() {
         // `fable_write_card`'s rename path: the namesake portrait re-stems
-        // with the folder (it's a stem-named file now), a legacy
-        // `portrait.<ext>` rides as-is for the boot fold.
+        // with the folder (it's a stem-named file).
         let tmp = tempfile::tempdir().unwrap();
         let old = tmp.path().join("Old Name");
         let new = tmp.path().join("New Name");
@@ -22536,42 +29342,6 @@ mod tests {
         assert!(new.join("New Name.codex").is_file());
         assert!(!old.exists(), "the husk is gone");
     }
-
-    // ─────────────────────────────────────────────────────────────────────
-    // Path-traversal regression tests (2026-08-15 audit H2/H3). The card
-    // filename half + every raw-id player join must stay under their roots.
-    // ─────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn resolve_card_file_sanitizes_both_segments_legacy() {
-        let root = std::path::Path::new("/wupi/apps/fable/cards");
-        let p = resolve_card_file(root, "../../x", "sim");
-        assert!(p.starts_with(root), "card path must stay under the cards root: {p:?}");
-        let p2 = resolve_card_file(root, "..\\..\\C:", "codex");
-        assert!(p2.starts_with(root), "card path must stay under the cards root: {p2:?}");
-        let p3 = resolve_card_file(root, "../../..", "sim");
-        assert!(p3.starts_with(root), "card path must stay under the cards root: {p3:?}");
-    }
-
-    #[test]
-    fn player_paths_stay_under_players_root() {
-        let dir = std::path::Path::new("/wupi/apps/fable/players");
-        // The read/rename/portrait IPCs join BOTH segments from the sanitized
-        // stem — `../..` used to reach `players/../../<id>.json` (arbitrary
-        // read) and the write path's rename branch could MOVE an arbitrary
-        // directory into the tree.
-        let safe = sanitize_player_slug("../..");
-        let json = dir.join(&safe).join(format!("{safe}.json"));
-        assert!(json.starts_with(dir), "player path must stay under the players root: {json:?}");
-        let old_dir = dir.join(sanitize_player_slug("../.."));
-        assert!(old_dir.starts_with(dir), "rename source must stay under the players root: {old_dir:?}");
-        // Legit slugs pass through; empty/hostile-only ids hit the sentinel.
-        assert_eq!(sanitize_player_slug("nyx"), "nyx");
-        assert_eq!(sanitize_player_slug("kael-the-bold"), "kael-the-bold");
-        assert_eq!(sanitize_player_slug(""), "__unknown_player__");
-        assert_eq!(sanitize_player_slug("---"), "__unknown_player__");
-    }
-
     #[test]
     fn effective_local_ctx_always_returns_with_api_constant() {
         // Wupi chat is LOCAL-ONLY (2026-08-08 override): the chat backend
@@ -22622,10 +29392,21 @@ mod tests {
             .map(|p| p.render_for_prompt())
             .filter(|s| !s.trim().is_empty())
             .or_else(|| Some("<user_profile>\nname: User\n</user_profile>".to_owned()));
+        // (2026-08-24) A representative `<active_card>` block rides the
+        // prefix while a Fable session is seated — fold a realistic one into
+        // the pin so the block can never silently outgrow the budget.
+        let active_card = Some(
+            "<active_card>\nname: Some Long Card Name Here\nid: some-long-card-name-here\n\
+             subtype: scenario\ncard_file: apps/fable/cards/Some Long Card Name Here/Some Long Card Name Here.sim\n\
+             session_id: session_1234567890123\nsession_file: apps/fable/data/saves/Some Long Card Name Here/session_1234567890123/session.json\n\
+             User is playing this card right now. \"This card\" means THIS card.\n\
+             Edits apply at the next session start.\n</active_card>",
+        );
         let system = assemble_wupi_system_prompt(
             Some(prompts.role.as_str()),
             persona.as_deref(),
             profile.as_deref(),
+            active_card.as_deref(),
             settings::CTX_LOCAL_WITH_API,
             8000,
         );
@@ -22637,6 +29418,73 @@ mod tests {
             "system prefix ~{approx_tokens} tokens (worst case) must stay under budget−200 ({}) — a larger authored prompt locks the copilot out",
             budget.saturating_sub(200)
         );
+    }
+
+    // === hybrid chat helpers (2026-08-24) ===================================
+
+    #[test]
+    fn render_tool_activity_bounds_entries_and_caps_lines() {
+        let mut transcript = Vec::new();
+        for i in 0..10 {
+            transcript.push(ToolTurn {
+                name: format!("tool_{i}"),
+                args: serde_json::json!({"path": "some/very/long/install/relative/path/that/must/be/capped/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}),
+                ok: i % 2 == 0,
+                output: "x".repeat(1_000),
+            });
+        }
+        let rendered = render_tool_activity(&transcript);
+        assert!(rendered.starts_with("<tool_activity>"));
+        assert!(rendered.ends_with("</tool_activity>"));
+        // 8 entries max + the overflow note.
+        assert_eq!(rendered.matches("\n- ").count(), 8);
+        assert!(rendered.contains("(+2 more)"));
+        // Both the args + the output are char-capped on every line.
+        assert!(rendered.lines().all(|l| l.chars().count() < 700));
+    }
+
+    #[test]
+    fn trim_chars_counts_chars_not_bytes() {
+        assert_eq!(trim_chars("hello", 10), "hello");
+        assert_eq!(trim_chars("hello", 4), "hell…");
+        // 猫 is 3 UTF-8 bytes; a byte-indexed take would panic or overshoot.
+        assert_eq!(trim_chars("猫猫猫", 2), "猫猫…");
+    }
+
+    #[test]
+    fn compact_args_renders_null_empty_and_caps_long() {
+        assert_eq!(compact_args(&serde_json::Value::Null, 10), "");
+        assert_eq!(
+            compact_args(&serde_json::json!({"a": 1}), 10),
+            "{\"a\":1}"
+        );
+        let long = compact_args(&serde_json::json!({"k": "vvvvvvvvvvvvvvvv"}), 12);
+        assert!(long.ends_with('…'));
+        assert_eq!(long.chars().count(), 13); // 12 kept + the ellipsis
+    }
+
+    #[test]
+    fn sanitize_api_reply_markers_strips_protocol_tokens() {
+        let mut out = chat_format::ParsedOutput {
+            content: "before <|tool_call>call:file_read{}<tool_call|> after".into(),
+            reasoning: String::new(),
+            raw: "<|tool>x<tool|><|tool_response>y<tool_response|>".into(),
+        };
+        sanitize_api_reply_markers(&mut out);
+        assert!(!out.content.contains("<|tool_call>"), "content: {}", out.content);
+        assert!(!out.raw.contains("<|tool>"), "raw: {}", out.raw);
+        assert!(out.content.contains("before") && out.content.contains("after"));
+    }
+
+    #[test]
+    fn install_relative_normalizes_separators_and_guards_outside() {
+        let root = std::path::Path::new("C:\\WUPI");
+        assert_eq!(
+            install_relative(std::path::Path::new("C:\\WUPI\\apps\\fable\\cards"), root),
+            "apps/fable/cards"
+        );
+        // A path outside the install root yields "" (caller omits the line).
+        assert_eq!(install_relative(std::path::Path::new("C:\\other\\x.txt"), root), "");
     }
 
     /// Scratch dir for `pick_sd_checkpoint` tests: unique per test (tests run
@@ -22791,13 +29639,7 @@ mod tests {
             intro_variants: Vec::new(),
             setting: Some("A test place.".into()),
             plot: None,
-            tone: None,
-            start_npc_ids: Vec::new(),
-            declared_activities: Vec::new(),
             player_name: Some("Tester".into()),
-            locations: Vec::new(),
-            cast: Vec::new(),
-            start: sim_card::CardStart::default(),
             custom_tags: Default::default(),
         }
     }
@@ -22823,76 +29665,6 @@ mod tests {
     // data/saves/<CardName>/<session_id>/, the .codex sibling moves into the
     // universal library + is <linked_codices>-linked, and the whole thing is
     // IDEMPOTENT (a second run is a no-op).
-
-    #[test]
-    fn migrate_dynamic_data_moves_sessions_and_codex_idempotently() {
-        let tmp = tempfile::tempdir().unwrap();
-        let fable = tmp.path();
-        let card_dir = fable.join("cards").join("One Piece");
-        std::fs::create_dir_all(card_dir.join("saves")).unwrap();
-        let sim_xml = "<sim_card>\n  <metadata><id>one-piece</id><type>simulation</type></metadata>\n  <identity><name>One Piece</name></identity>\n</sim_card>\n";
-        std::fs::write(card_dir.join("One Piece.sim"), sim_xml).unwrap();
-        std::fs::write(card_dir.join("session.json"), "{}").unwrap();
-        std::fs::write(card_dir.join("world.json"), "{}").unwrap();
-        std::fs::write(card_dir.join("player.json"), "{}").unwrap();
-        std::fs::write(card_dir.join("npc.json"), "{}").unwrap();
-        std::fs::write(
-            card_dir.join("saves").join("autosave.json"),
-            r#"{"card_id":"one-piece","save_id":"autosave","name":"Auto","summary":"s","timestamp":5,"is_autosave":true,"session":{},"schema":{}}"#,
-        ).unwrap();
-        std::fs::write(
-            card_dir.join("One Piece.codex"),
-            "---\ntitle: Lore\ntags: myth\n---\n\nThe seas are endless.\n",
-        ).unwrap();
-
-        migrate_dynamic_data_in(fable);
-
-        // The session landed under data/saves/One Piece/<session_*>/ with ALL
-        // its files + a manifest.
-        let sessions_root = fable.join("data").join("saves").join("One Piece");
-        let session_dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&sessions_root)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        assert_eq!(session_dirs.len(), 1, "one session minted");
-        let session_dir = &session_dirs[0];
-        for name in ["session.json", "world.json", "player.json", "npc.json", "manifest.json"] {
-            assert!(session_dir.join(name).is_file(), "{name} moved into the session folder");
-        }
-        assert!(session_dir.join("saves").join("autosave.json").is_file(), "saves/ moved with it");
-        // The card folder is STATIC now.
-        for name in ["session.json", "world.json", "player.json", "npc.json"] {
-            assert!(!card_dir.join(name).exists(), "{name} left the card folder");
-        }
-        assert!(!card_dir.join("saves").exists(), "saves/ left the card folder");
-
-        // The .codex moved into the universal library + the card links it.
-        assert!(
-            fable.join("data").join("codex").join("One Piece.codex").is_file(),
-            "the .codex sibling moved into the universal library"
-        );
-        assert!(!card_dir.join("One Piece.codex").exists());
-        let sim_after = std::fs::read_to_string(card_dir.join("One Piece.sim")).unwrap();
-        assert!(sim_after.contains("<linked_codices>"), "the link block was written");
-        assert!(sim_after.contains("One Piece"));
-        let parsed = sim_card::parse_from_xml_str(&sim_after).unwrap();
-        assert_eq!(parsed.linked_codices, vec!["One Piece".to_owned()]);
-
-        // Idempotent: a second run is a NO-OP (no second session, no dupes).
-        migrate_dynamic_data_in(fable);
-        let session_dirs_after: Vec<_> = std::fs::read_dir(&sessions_root)
-            .unwrap()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.is_dir())
-            .collect();
-        assert_eq!(session_dirs_after.len(), 1, "the second run mints nothing");
-        let sim_twice = std::fs::read_to_string(card_dir.join("One Piece.sim")).unwrap();
-        assert_eq!(sim_twice.matches("<linked_codices>").count(), 1, "no duplicate link blocks");
-    }
-
     #[test]
     fn continue_target_picks_most_recent_save_across_worlds() {
         let tmp = tempfile::tempdir().unwrap();
@@ -22993,13 +29765,7 @@ mod tests {
             intro_variants: Vec::new(),
             setting: Some("A test.".to_owned()),
             plot: None,
-            tone: Some("atmospheric".to_owned()),
             player_name: Some("Kaelen".to_owned()),
-            start_npc_ids: Vec::new(),
-            declared_activities: Vec::new(),
-            locations: Vec::new(),
-            cast: Vec::new(),
-            start: crate::sim_card::CardStart::default(),
             custom_tags: Default::default(),
         };
         let pacing = ScenePacing {
@@ -23212,6 +29978,37 @@ mod tests {
         assert!(
             full_prompt.contains("<emit_errors>"),
             "the reject-feedback block must survive the maxed-world render"
+        );
+        // (2026-08-22 living-world) The living-world surfaces ride the
+        // maxed-world render too: the quest line + verb teaching, the
+        // rested anchor, and the activated mana line.
+        assert!(
+            full_prompt.contains("quests:"),
+            "the quest line must survive the maxed-world render"
+        );
+        assert!(
+            full_prompt.contains("[QUEST new"),
+            "the quest verb teaching must survive the maxed-world render"
+        );
+        // (2026-08-22 multihog WS1) The expiry verb teaching rides the
+        // maxed-world render (the worst-case tracker-budget pin builds from
+        // the real bracket list, so its bounded cost is counted honestly).
+        assert!(
+            full_prompt.contains("[EXPIRY"),
+            "the expiry verb teaching must survive the maxed-world render"
+        );
+        // (2026-08-22 multihog WS2) The unlock verb teaching rides it too.
+        assert!(
+            full_prompt.contains("[UNLOCK"),
+            "the unlock verb teaching must survive the maxed-world render"
+        );
+        assert!(
+            full_prompt.contains("rested: 8h since last rest"),
+            "the rested anchor line must survive the maxed-world render"
+        );
+        assert!(
+            full_prompt.contains("mana: Strained"),
+            "the activated arcane pool must survive the maxed-world render"
         );
 
         // PIN 2 — the realistic case: a Liam-shaped world state (real
@@ -23500,7 +30297,7 @@ mod tests {
     fn lean_tracker_world_state_caps_and_drops() {
         let schema = maxed_world_schema();
         let lean = render_tracker_world_state(&schema);
-        let rich = render_fable_world_state(&schema, &[], false);
+        let rich = render_fable_world_state(&schema, &[], false, false);
 
         // (2026-08-21 evening follow-up) The lean render is a near
         // PASSTHROUGH at the raised caps — the RATIO assert of the
@@ -23551,6 +30348,98 @@ mod tests {
             .map(|l| l.chars().count())
             .unwrap_or(0);
         assert!(summary_len <= STAGE0.summary + 40, "summary capped in the lean render (STAGE0 max), got {summary_len}");
+    }
+
+    /// (2026-08-22 multihog WS2) The GM hidden-contents block: rides the
+    /// NARRATOR world-state render (the `gm_hidden` flag), never the
+    /// tracker's (hidden truth reaching the E4B would leak straight into
+    /// its brackets); bounded at the entity cap; strictly 1-hop.
+    #[test]
+    fn gm_hidden_block_rides_narrator_render_only() {
+        use crate::site_map::{
+            AreaKnowledge, AssetKind, AssetKnowledge, AssetState, ConnState, SiteArea, SiteAsset,
+            SiteConnection, SiteMap, SiteThreat,
+        };
+        let mut s = schema::WorldSchema::default();
+        s.summary = "the scene is set".to_string();
+        s.world_clock.current_minutes = 1_000;
+        let area = |id: &str, k: AreaKnowledge, conns: Vec<SiteConnection>| SiteArea {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            knowledge: k,
+            geometry: vec![],
+            connections: conns,
+        };
+        let conn = |to: &str, st: ConnState| SiteConnection {
+            to: to.to_owned(),
+            state: st,
+            detail: String::new(),
+        };
+        let asset = |id: &str, loc: &str, k: AssetKnowledge| SiteAsset {
+            id: id.to_owned(),
+            name: id.to_owned(),
+            kind: AssetKind::Creature,
+            location: loc.to_owned(),
+            state: AssetState::Active,
+            knowledge: k,
+            count: 0,
+            detail: String::new(),
+            tier: None,
+            ..Default::default()
+        };
+        let mut map = SiteMap {
+            node_id: "warren".to_owned(),
+            threat: SiteThreat::High,
+            entrance: "gatehouse".to_owned(),
+            current_area: Some("gatehouse".to_owned()),
+            last_visit_minutes: 1_000,
+            ..Default::default()
+        };
+        map.areas = vec![
+            area("gatehouse", AreaKnowledge::Visited, vec![conn("hall", ConnState::Open)]),
+            area("hall", AreaKnowledge::Unrevealed, vec![
+                conn("gatehouse", ConnState::Open),
+                conn("vault", ConnState::Locked),
+            ]),
+            area("vault", AreaKnowledge::Unrevealed, vec![conn("hall", ConnState::Locked)]),
+        ];
+        map.assets = vec![
+            asset("hall-stalker", "hall", AssetKnowledge::Unrevealed),
+            asset("vault-horror", "vault", AssetKnowledge::Unrevealed),
+        ];
+        s.site_maps.insert("warren".to_owned(), map);
+        s.travel_graph.nodes = vec![schema::Node {
+            id: "warren".to_owned(),
+            name: "The Warren".to_owned(),
+            ..Default::default()
+        }];
+        s.travel_graph.current_node = Some("warren".to_owned());
+
+        // Narrator render: the block rides, right after the site slice.
+        let narrator = render_fable_world_state(&s, &[], false, true);
+        assert!(narrator.contains("<hidden_truth>"), "the block rides: {narrator}");
+        assert!(narrator.contains("hall-stalker"), "the 1-hop hidden truth rides");
+        assert!(
+            !narrator.contains("vault-horror"),
+            "2-hop truth stays out (locked door included): {narrator}"
+        );
+        // The block sits directly after the site block's last indented line.
+        let site_pos = narrator.find("site:").expect("site slice present");
+        let gm_pos = narrator.find("<hidden_truth>").expect("gm block");
+        let present_pos = narrator.find("present:").unwrap_or(narrator.len());
+        assert!(
+            site_pos < gm_pos && gm_pos < present_pos,
+            "the block follows the site slice"
+        );
+
+        // Tracker render: the block NEVER rides (the leak gate).
+        let tracker = render_tracker_world_state(&s);
+        assert!(!tracker.contains("<hidden_truth>"), "hidden truth never reaches the tracker");
+        assert!(!tracker.contains("hall-stalker"));
+
+        // Flag off (the aids' render): absent too.
+        let aids = render_fable_world_state(&s, &[], false, false);
+        assert!(!aids.contains("<hidden_truth>"));
     }
 
     /// (2026-08-18 audit; bounds updated 2026-08-21 morning + evening)
@@ -23615,7 +30504,7 @@ mod tests {
                 },
             );
         }
-        let rich = render_fable_world_state(&s, &[], false);
+        let rich = render_fable_world_state(&s, &[], false, false);
         let stage2 = lean_world_state_surgery(&rich, &STAGE2);
         let minds = stage2
             .lines()
@@ -23674,7 +30563,7 @@ mod tests {
         assert!(!lean.contains("site:\n"), "site block must be single-line");
 
         // The RICH render (narrator path) keeps the prose + hides truth.
-        let rich = render_fable_world_state(&s, &[], false);
+        let rich = render_fable_world_state(&s, &[], false, false);
         assert!(rich.contains("site:\n"), "rich render keeps the block");
         assert!(rich.contains("cold draft"), "rich render keeps geometry");
         assert!(!rich.contains("Great Hall"), "unrevealed area stays hidden");
@@ -23701,6 +30590,129 @@ mod tests {
         assert_eq!(untouched, "location: Town\ncast: mara");
     }
 
+    /// (2026-08-23 hosted interiors) The resolver law through BOTH render
+    /// paths: while the player stands in a building, the site surface is
+    /// the CHILD map led by the breadcrumb — the district's ids stay out.
+    fn hosted_render_schema() -> schema::WorldSchema {
+        let mut s = schema::WorldSchema::default();
+        s.world_clock.current_minutes = 10_000;
+        s.travel_graph.nodes = vec![schema::Node {
+            id: "oakhaven".into(),
+            name: "Oakhaven".into(),
+            neighbors: vec![],
+            setting: "settlement".into(),
+            ..Default::default()
+        }];
+        s.travel_graph.current_node = Some("oakhaven".into());
+        // The parent district map: two areas + the Building asset.
+        let mut parent = site_map::SiteMap::default();
+        parent.node_id = "oakhaven".into();
+        parent.entrance = "market_row".into();
+        parent.current_area = Some("market_row".into());
+        parent.areas = vec![
+            site_map::SiteArea {
+                id: "market_row".into(),
+                name: "Market Row".into(),
+                knowledge: site_map::AreaKnowledge::Visited,
+                geometry: vec!["stalls".into()],
+                connections: vec![site_map::SiteConnection {
+                    to: "temple_hill".into(),
+                    state: site_map::ConnState::Open,
+                    detail: String::new(),
+                }],
+            },
+            site_map::SiteArea {
+                id: "temple_hill".into(),
+                name: "Temple Hill".into(),
+                knowledge: site_map::AreaKnowledge::Discovered,
+                geometry: vec![],
+                connections: vec![site_map::SiteConnection {
+                    to: "market_row".into(),
+                    state: site_map::ConnState::Open,
+                    detail: String::new(),
+                }],
+            },
+        ];
+        parent.assets = vec![site_map::SiteAsset {
+            id: "the-sunken-flagon".into(),
+            name: "The Sunken Flagon".into(),
+            kind: site_map::AssetKind::Building,
+            location: "market_row".into(),
+            state: site_map::AssetState::Active,
+            knowledge: site_map::AssetKnowledge::Known,
+            ..Default::default()
+        }];
+        parent.current_building = Some("the-sunken-flagon".into());
+        // The hosted child: a small room map.
+        let mut child = site_map::SiteMap::default();
+        child.node_id = "oakhaven".into();
+        child.entrance = "common_room".into();
+        child.current_area = Some("common_room".into());
+        child.areas = vec![
+            site_map::SiteArea {
+                id: "common_room".into(),
+                name: "Common Room".into(),
+                knowledge: site_map::AreaKnowledge::Visited,
+                geometry: vec!["sawdust floor".into()],
+                connections: vec![site_map::SiteConnection {
+                    to: "cellar".into(),
+                    state: site_map::ConnState::Locked,
+                    detail: "hatch".into(),
+                }],
+            },
+            site_map::SiteArea {
+                id: "cellar".into(),
+                name: "Cellar".into(),
+                knowledge: site_map::AreaKnowledge::Unrevealed,
+                geometry: vec![],
+                connections: vec![],
+            },
+        ];
+        child.host = Some(site_map::HostRef {
+            parent_key: "oakhaven".into(),
+            building_asset_id: "the-sunken-flagon".into(),
+            exit_area_id: "market_row".into(),
+        });
+        s.site_maps.insert("oakhaven".into(), parent);
+        s.site_maps
+            .insert(site_map::hosted_key("oakhaven", "the-sunken-flagon"), child);
+        s
+    }
+
+    #[test]
+    fn tracker_slice_rides_active_child_with_breadcrumb() {
+        let s = hosted_render_schema();
+        let lean = render_tracker_world_state(&s);
+        assert!(
+            lean.contains("in Oakhaven > The Sunken Flagon"),
+            "the breadcrumb leads the compact slice: {lean}"
+        );
+        assert!(
+            lean.contains("common_room:v doors=cellar:locked"),
+            "the CHILD's ids ride the slice, not the district's: {lean}"
+        );
+        assert!(
+            !lean.contains("market_row:v"),
+            "the district map stays out while the player is inside: {lean}"
+        );
+    }
+
+    #[test]
+    fn narrator_site_block_carries_child_breadcrumb() {
+        let s = hosted_render_schema();
+        let rich = render_fable_world_state(&s, &[], false, false);
+        assert!(rich.contains("site:\n"), "rich render keeps the block");
+        assert!(
+            rich.contains("in Oakhaven > The Sunken Flagon"),
+            "breadcrumb line leads the block: {rich}"
+        );
+        assert!(rich.contains("sawdust floor"), "the child's geometry renders");
+        assert!(
+            !rich.contains("Market Row"),
+            "the district's visited area stays out (bounded composition): {rich}"
+        );
+    }
+
     /// (2026-08-19) The architect prompt carries the JSON contract + the
     /// full site brief (protocol-shaped: `<|turn>` open/close).
     #[test]
@@ -23711,7 +30723,10 @@ mod tests {
             tone: "grim".into(),
             elapsed_days: 12,
             seeds: vec!["goblin warband moved in".into()],
+            pressure: vec![],
             premise: "You duck through the collapsed palisade.".into(),
+            scale: ArchitectScale::Rooms,
+            building: None,
         };
         let p = render_site_architect_prompt(&b);
         assert!(p.starts_with("<|turn>system\n"));
@@ -23721,6 +30736,27 @@ mod tests {
         assert!(p.contains("The Rotting Warren"));
         assert!(p.contains("goblin warband moved in"), "seeds ride the brief");
         assert!(p.contains("~12 day(s)"), "watermark age rides the brief");
+        assert!(
+            !p.contains("DISTRICT scale"),
+            "room-scale briefs carry no settlement law"
+        );
+        // (2026-08-23 hosted interiors) The district + building variants.
+        let mut d = b.clone();
+        d.scale = ArchitectScale::Districts;
+        let dp = render_site_architect_prompt(&d);
+        assert!(dp.contains("DISTRICT scale"), "the settlement law rides");
+        assert!(dp.contains("\"kind\": \"building\"") || dp.contains("building"), "building kind taught");
+        let mut c = b;
+        c.building = Some(BuildingBrief {
+            building_name: "The Sunken Flagon".into(),
+            building_detail: "a leaning tavern".into(),
+            parent_name: "Oakhaven".into(),
+        });
+        let cp = render_site_architect_prompt(&c);
+        assert!(cp.contains("INTERIOR of ONE structure"), "the child law rides");
+        assert!(cp.contains("FORBIDDEN here"), "the depth-2 law rides");
+        assert!(cp.contains("The Sunken Flagon"));
+        assert!(cp.contains("Oakhaven"));
     }
 
     /// Helper for the budget tests: a world schema with every rendered
@@ -23747,8 +30783,8 @@ mod tests {
         use crate::player_state::{BodyPart, BodyPartState, PlayerState, Stamina};
         use crate::rumor::Rumor;
         use crate::schema::{
-            Node, NpcEntry, NpcProminence, NpcRegistry, Presence, Promise, TravelGraph, Weather,
-            WorldClock,
+            Node, NpcEntry, NpcProminence, NpcRegistry, Presence, Promise, Quest, QuestObjective,
+            TravelGraph, Weather, WorldClock,
         };
 
         let mut s = schema::WorldSchema::default();
@@ -23790,20 +30826,26 @@ mod tests {
             id: "grand_market".to_owned(),
             name: "The Grand Market of Ashfall".to_owned(),
             neighbors: (0..12).map(|i| format!("district_{i}")).collect(),
-            setting: String::new(), ..Default::default()
+            // (2026-08-23 hosted interiors) The settlement classification —
+            // this node maps at DISTRICT scale.
+            setting: "settlement".to_owned(),
+            ..Default::default()
         });
         s.travel_graph = TravelGraph {
             nodes,
             current_node: Some("grand_market".to_owned()),
         };
-        // (2026-08-21 evening) A FULL site on the current node — the
-        // fog-of-war slice at the architect caps: 6 visited areas with 6
-        // doors each + 1 discovered + 1 unrevealed, 16 known assets. The
-        // tracker's compact slice must carry every revealed id.
+        // (2026-08-21 evening → 2026-08-23 hosted interiors) The worst case
+        // is now INSIDE A BUILDING: a district-scale parent carrying a
+        // Building asset + `current_building`, hosting a FULL child map
+        // (6 visited areas with 6 doors each + 1 discovered + 1 unrevealed,
+        // 16 known assets). The tracker slice renders the CHILD at the caps
+        // + the breadcrumb prefix — the parent's slice stays out (bounded
+        // composition), so the worst case is the child + breadcrumb.
         {
             use crate::site_map::{
-                AreaKnowledge, AssetKind, AssetKnowledge, AssetState, ConnState, SiteArea,
-                SiteAsset, SiteConnection, SiteMap, SiteThreat,
+                AreaKnowledge, AssetKind, AssetKnowledge, AssetState, ConnState, HostRef,
+                SiteArea, SiteAsset, SiteConnection, SiteMap, SiteThreat,
             };
             let visited = [
                 "entry_hall", "guard_room", "crypt", "library", "cellar", "chapel",
@@ -23865,17 +30907,118 @@ mod tests {
                     count: if j % 4 == 0 { 3 } else { 0 },
                     detail: String::new(),
                     tier: Some("elite".to_owned()),
+                    // (2026-08-22 living-world) Provenance + the remnants
+                    // fixture: j 3 + 6 died off-screen >1 day ago (they
+                    // collapse into the `remnants:` line at render); the
+                    // fresh Dead rows (0, 9, 12, 15) render in place.
+                    origin: if j == 3 || j == 6 {
+                        crate::site_map::AssetOrigin::Evolved
+                    } else {
+                        crate::site_map::AssetOrigin::InitialMap
+                    },
+                    changed_at_minutes: if j == 3 || j == 6 {
+                        14_400 - 2 * crate::site_map::DEAD_ASSET_COLLAPSE_MINUTES
+                    } else {
+                        0
+                    },
+                    cause: if j == 3 || j == 6 {
+                        "scavengers stripped the cores".to_owned()
+                    } else {
+                        String::new()
+                    },
+                    actor: if j == 3 || j == 6 {
+                        "the underguild".to_owned()
+                    } else {
+                        String::new()
+                    },
+                    expires_at_minutes: None,
+                    carries: Vec::new(),
                 })
                 .collect();
             s.site_maps.insert(
-                "grand_market".to_owned(),
+                // The hosted CHILD — the full map the fixture always built.
+                "grand_market::the_sunken_flagon".to_owned(),
                 SiteMap {
                     node_id: "grand_market".to_owned(),
                     threat: SiteThreat::High,
                     entrance: "entry_hall".to_owned(),
+                    // (2026-08-22 multihog WS2) The player stands at the
+                    // entrance (the [ROOM] stamp's post-arrival shape).
+                    current_area: Some("entry_hall".to_owned()),
                     areas,
                     assets,
                     last_visit_minutes: 14_400,
+                    // (2026-08-22 living-world) A pending re-entry digest
+                    // line — the narrator slice renders it first.
+                    pending_digest: vec![
+                        "Sentry Golem 7 — gone (hauled off toward the vault)".to_owned(),
+                    ],
+                    threads: Vec::new(),
+                    host: Some(HostRef {
+                        parent_key: "grand_market".to_owned(),
+                        building_asset_id: "the_sunken_flagon".to_owned(),
+                        exit_area_id: "market_row".to_owned(),
+                    }),
+                    current_building: None,
+                },
+            );
+            // The PARENT district map — small (its slice never renders while
+            // the player is inside); the Building asset is the child's host.
+            s.site_maps.insert(
+                "grand_market".to_owned(),
+                SiteMap {
+                    node_id: "grand_market".to_owned(),
+                    threat: SiteThreat::Moderate,
+                    entrance: "market_row".to_owned(),
+                    current_area: Some("market_row".to_owned()),
+                    areas: vec![
+                        SiteArea {
+                            id: "market_row".to_owned(),
+                            name: "Market Row".to_owned(),
+                            knowledge: AreaKnowledge::Visited,
+                            geometry: vec!["stalls under awnings".to_owned()],
+                            connections: vec![SiteConnection {
+                                to: "temple_hill".to_owned(),
+                                state: ConnState::Open,
+                                detail: String::new(),
+                            }],
+                        },
+                        SiteArea {
+                            id: "temple_hill".to_owned(),
+                            name: "Temple Hill".to_owned(),
+                            knowledge: AreaKnowledge::Discovered,
+                            geometry: Vec::new(),
+                            connections: vec![SiteConnection {
+                                to: "market_row".to_owned(),
+                                state: ConnState::Open,
+                                detail: String::new(),
+                            }],
+                        },
+                    ],
+                    assets: vec![SiteAsset {
+                        id: "the_sunken_flagon".to_owned(),
+                        name: "The Sunken Flagon".to_owned(),
+                        kind: AssetKind::Building,
+                        location: "market_row".to_owned(),
+                        state: AssetState::Active,
+                        knowledge: AssetKnowledge::Known,
+                        count: 0,
+                        detail: "a leaning half-timber tavern".to_owned(),
+                        tier: None,
+                        origin: crate::site_map::AssetOrigin::InitialMap,
+                        changed_at_minutes: 0,
+                        cause: String::new(),
+                        actor: String::new(),
+                        expires_at_minutes: None,
+                        carries: Vec::new(),
+                    }],
+                    last_visit_minutes: 14_400,
+                    pending_digest: Vec::new(),
+                    threads: Vec::new(),
+                    host: None,
+                    // The player stands INSIDE the Flagon — the resolver's
+                    // state anchor.
+                    current_building: Some("the_sunken_flagon".to_owned()),
                 },
             );
         }
@@ -23938,8 +31081,41 @@ mod tests {
                 description: "d".repeat(100),
                 accepted_at_minutes: 14_000,
                 deadline_minutes: 14_400 + i * 60,
+                ..Default::default()
             })
             .collect();
+        // (2026-08-22 living-world) Quests past the render cap (10 stored →
+        // 5 shown + marker), one self-given, one overdue (giver band), each
+        // with two countable objectives — the honest worst case for the
+        // `quests:` line.
+        s.quests = (0..10)
+            .map(|i| Quest {
+                id: format!("thread-{i}"),
+                giver: if i == 0 { "player".to_owned() } else { format!("npc_{i}_with_a_long_slug") },
+                title: format!("Conspiracy thread number {i} of the deep plot"),
+                objectives: vec![
+                    QuestObjective {
+                        text: "cull the mark's escort".to_owned(),
+                        cur: 3,
+                        total: 6,
+                        done: false,
+                    },
+                    QuestObjective {
+                        text: "burn the ledger house".to_owned(),
+                        done: true,
+                        cur: 0,
+                        total: 0,
+                    },
+                ],
+                reward: "30 silver and a favor".to_owned(),
+                deadline_minutes: if i == 1 { 13_800 } else { 0 },
+                accepted_at_minutes: 13_000,
+                ..Default::default()
+            })
+            .collect();
+        // (2026-08-22 living-world) The rested anchor at a healthy delta (8h
+        // — no band) so the `rested:` line renders without the weary clamp.
+        s.last_rest_minutes = 14_400 - 8 * 60;
         // (2026-08-21 evening) Loud relationships on 12 present NPCs — the
         // `bonds:` line at its raised cap (10 shown).
         for i in 0..12 {
@@ -23990,10 +31166,14 @@ mod tests {
                 born_minutes: 14_000,
             })
             .collect();
-        // Belt full (4), pack past the cap (20 → 16 shown + marker),
-        // custom at the cap (16).
+        // Belt full (4), pouch at the cap (16), pack past the cap (20 → 16
+        // shown + marker), custom at the cap (16).
         let mut ps = PlayerState {
             stamina: Stamina::Exhausted,
+            // (2026-08-22 living-world) An ACTIVATED arcane pool — the
+            // `mana:` line renders under stamina.
+            mana: Some(crate::player_state::Mana::Strained),
+            mana_label: "mana".to_owned(),
             wealth: 9_999,
             reputation: -420,
             ..PlayerState::default()
@@ -24001,6 +31181,14 @@ mod tests {
         ps.belt = (0..4)
             .map(|i| crate::equipment::StackItem {
                 name: format!("Belt Item Number {i}"),
+                ..crate::equipment::StackItem::default()
+            })
+            .collect();
+        // (2026-08-23 pouch ruling) The wallet at its render cap.
+        ps.pouch = (0..16)
+            .map(|i| crate::equipment::StackItem {
+                name: format!("Foreign Coin Pouch {i} of the many"),
+                qty: 9,
                 ..crate::equipment::StackItem::default()
             })
             .collect();
@@ -24093,13 +31281,7 @@ mod tests {
             intro_variants: Vec::new(),
             setting: Some("s".repeat(2_000)),
             plot: Some("p".repeat(1_000)),
-            tone: Some("grim atmospheric long-winded".to_owned()),
             player_name: Some("Kaelen".to_owned()),
-            start_npc_ids: Vec::new(),
-            declared_activities: Vec::new(),
-            locations: Vec::new(),
-            cast: Vec::new(),
-            start: crate::sim_card::CardStart::default(),
             custom_tags: Default::default(),
         }
     }
@@ -24168,6 +31350,96 @@ mod tests {
             ring.back().unwrap().entities.get("turn").and_then(|v| v.as_str()),
             Some("6"),
             "newest snapshot must be at the back"
+        );
+    }
+
+    // --- (2026-08-23 Playground) pure helpers --------------------------------
+    // Same discipline as the ring tests above: AppState-dependent flows are
+    // compile-checked at their call sites; the isolated math is pinned here.
+
+    #[test]
+    fn playground_skip_minutes_clamp() {
+        assert_eq!(clamp_playground_skip_minutes(0), 1, "a zero/negative skip floors at 1 minute");
+        assert_eq!(clamp_playground_skip_minutes(-500), 1);
+        assert_eq!(clamp_playground_skip_minutes(60), 60);
+        assert_eq!(clamp_playground_skip_minutes(1440), 1440, "24h passes verbatim");
+        assert_eq!(
+            clamp_playground_skip_minutes(10080),
+            10080,
+            "exactly one week is the ceiling"
+        );
+        assert_eq!(
+            clamp_playground_skip_minutes(999_999),
+            10080,
+            "a typo'd year clamps to the week ceiling"
+        );
+    }
+
+    #[test]
+    fn playground_wealth_delta_clamps_to_ledger_band() {
+        assert_eq!(apply_playground_wealth_delta(100, 50), 150);
+        assert_eq!(apply_playground_wealth_delta(100, -10_000), 0, "dips floor at 0, never wraps");
+        assert_eq!(apply_playground_wealth_delta(0, 10), 10);
+        assert_eq!(
+            apply_playground_wealth_delta(90_000, 500_000),
+            economy::LEDGER_AMOUNT_MAX,
+            "caps at LEDGER_AMOUNT_MAX"
+        );
+        assert_eq!(apply_playground_wealth_delta(100, 0), 100);
+    }
+
+    #[test]
+    fn playground_time_label_day_and_clock() {
+        // The bracket parser's convention (bracket_parser: "Day 1, 00:00 →
+        // 0; Day 2 → 1440") — the label mirrors it exactly.
+        assert_eq!(pg_time_label(0), "Day 1, 00:00");
+        assert_eq!(pg_time_label(540), "Day 1, 09:00");
+        assert_eq!(pg_time_label(1440), "Day 2, 00:00");
+        assert_eq!(pg_time_label(1980), "Day 2, 09:00");
+        assert_eq!(pg_time_label(1440 * 9 + 23 * 60 + 59), "Day 10, 23:59");
+    }
+
+    #[test]
+    fn playground_asset_name_word_match() {
+        assert!(pg_asset_name_matches("Dead Kira", "Kira"));
+        assert!(pg_asset_name_matches("Kira (slain herbalist)", "Kira"));
+        assert!(pg_asset_name_matches("kira", "Kira Vane"), "one shared real word matches");
+        assert!(!pg_asset_name_matches("Dead Goblin", "Kira"), "no shared word");
+        // ≥3-char word floor: "the"/"of" noise never matches.
+        assert!(!pg_asset_name_matches("The Dead of the Marsh", "Kira the Herbalist"));
+    }
+
+    /// The restore-pop arithmetic `playground_history_restore` runs: drop
+    /// every entry ABOVE the target, then the target itself — the shared
+    /// `restore_fable_history_entry` then installs it (mirrors the exact
+    /// pop loop; AppState-free simulation per the ring-test discipline).
+    #[test]
+    fn playground_history_restore_pop_arithmetic() {
+        let mut ring: std::collections::VecDeque<(usize, schema::WorldSchema)> =
+            std::collections::VecDeque::new();
+        for i in 0..5 {
+            ring.push_back((i, make_test_schema(&[("turn", &i.to_string())])));
+        }
+        let index = 2usize;
+        // The exact loop from playground_history_restore.
+        let prior = {
+            assert!(index < ring.len());
+            while ring.len() > index + 1 {
+                ring.pop_back();
+            }
+            ring.pop_back().map(|(_tag, snap)| snap)
+        };
+        let prior = prior.expect("target entry pops");
+        assert_eq!(
+            prior.entities.get("turn").and_then(|v| v.as_str()),
+            Some("2"),
+            "the restored snapshot is the one AT the index"
+        );
+        assert_eq!(ring.len(), 2, "entries above + the target are consumed; older survive");
+        assert_eq!(
+            ring.back().unwrap().entities.get("turn").and_then(|v| v.as_str()),
+            Some("1"),
+            "the ring now ends just below the restored point"
         );
     }
 
@@ -25220,6 +32492,85 @@ mod phase3_integration_tests {
         );
     }
 
+    /// (2026-08-23 hazard referees) The FULL `<directives>` assembly order,
+    /// pinned: combat → disguise → skills → recovery → loot → tick →
+    /// bracket rejects → bracket events → time-channel events. The hazard
+    /// layers slot around the pre-existing stack without displacing any of
+    /// it — a future refactor must not silently reorder the narrator's
+    /// hard facts.
+    #[test]
+    fn hazard_referee_directives_full_ordering_pin() {
+        let combat_directive: Option<String> =
+            Some("Lethal blow (soldier tier, DC 18): the player is DOWNED".to_string());
+        let disguise_directive: Option<String> =
+            Some(player_state::DisguiseDirective::AutoPass {
+                label: "city guard uniform".into(),
+                tier_tag: "soldier",
+            }.render());
+        let skill_directives: Vec<String> = vec![
+            "Lockpick (DC 12): FAIL. The pick snaps.".to_string(),
+        ];
+        let recovery_directive: Option<String> =
+            Some("The player rests and recovers: stamina improves to Fresh.".to_string());
+        let loot_directive: Option<String> = Some(
+            "Loot check — rarity Rare (weapon): the best recoverable find here is exactly Rare quality, grounded in this place".to_string(),
+        );
+        let tick_directives: Vec<String> = vec![
+            "Marcus returned from scouting — failure.".to_string(),
+        ];
+        let reject_directives: Vec<String> = vec![
+            "Travel to \"the sun\" is not possible — that location is not in the world.".to_string(),
+        ];
+        let bracket_event_directives: Vec<String> = vec![
+            "Road event (valence: negative) — an encounter colors the journey to The Ridge; weave it into this beat.".to_string(),
+        ];
+        let time_event_directives: Vec<String> = vec![
+            "Time-skip event (valence: ambiguous) — the hours passing around Camp Ash bring an encounter; weave it into this beat.".to_string(),
+        ];
+
+        // Mirror the fable_send assembly + the bracket-apply merge order
+        // exactly (the referee block, then the tracker-apply site, then
+        // the time-channel merge).
+        let mut turn_directives: Vec<String> = Vec::new();
+        if let Some(cd) = &combat_directive { turn_directives.push(cd.clone()); }
+        if let Some(dd) = &disguise_directive { turn_directives.push(dd.clone()); }
+        for sc in &skill_directives { turn_directives.push(sc.clone()); }
+        if let Some(rd) = &recovery_directive { turn_directives.push(rd.clone()); }
+        if let Some(ld) = &loot_directive { turn_directives.push(ld.clone()); }
+        for td in &tick_directives { turn_directives.push(td.clone()); }
+        turn_directives.extend(reject_directives);
+        turn_directives.extend(bracket_event_directives);
+        turn_directives.extend(time_event_directives);
+
+        let pos = |needle: &str| {
+            turn_directives
+                .iter()
+                .position(|d| d.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing from the block"))
+        };
+        let order = [
+            ("DOWNED", "combat"),
+            ("ACCEPTED", "disguise"),
+            ("Lockpick", "skills"),
+            ("rests and recovers", "recovery"),
+            ("Loot check", "loot"),
+            ("Marcus returned", "tick"),
+            ("not possible", "bracket rejects"),
+            ("Road event", "bracket events"),
+            ("Time-skip event", "time-channel events"),
+        ];
+        for pair in order.windows(2) {
+            let (earlier, later) = (pair[0], pair[1]);
+            assert!(
+                pos(earlier.0) < pos(later.0),
+                "order must be {} before {}; got {:?}",
+                earlier.1,
+                later.1,
+                turn_directives
+            );
+        }
+    }
+
     #[test]
     fn component1_gate_autopass_renders_into_directives_block() {
         // End-to-end: the gate produces a DisguiseDirective whose render()
@@ -25243,6 +32594,7 @@ mod phase3_integration_tests {
             &tags,
             &entities,
             &present,
+            0,
             0,
             0,
             0,
@@ -25274,6 +32626,7 @@ mod phase3_integration_tests {
             &tags,
             &entities,
             &[],
+            0,
             0,
             0,
             0,
@@ -26855,5 +34208,231 @@ mod phase3_wiring_tests {
         } else {
             unreachable!();
         }
+    }
+
+    // ── ensure_playable_v2 (v0.30.0 clean-break write boundary) ──────────
+    // The walkers skip pre-v2 simulation cards; the WRITE paths must reject
+    // them, or a pre-v2 backup restored through the raw editor lands on disk
+    // and silently vanishes from every list.
+    #[test]
+    fn ensure_playable_v2_rejects_legacy_shapes_before_write() {
+        // A pre-v2 simulation card (persona nested inside <identity>): parses
+        // (the legacy elements feed wupi.sim) but must fail the guard.
+        let legacy_xml = r#"<sim_card>
+  <metadata><type>simulation</type><id>old-card</id></metadata>
+  <identity><name>Old Card</name><persona>Legacy nested persona.</persona></identity>
+</sim_card>"#;
+        let parsed = sim_card::parse_from_xml_str(legacy_xml).expect("legacy shape still parses");
+        assert!(parsed.card_type == "simulation" && !parsed.format_v2);
+        assert!(
+            ensure_playable_v2(&parsed).is_err(),
+            "pre-v2 simulation card must be rejected at the write boundary"
+        );
+
+        // A v2 simulation card passes.
+        let v2_xml = r#"<sim_card>
+  <metadata><type>simulation</type><id>new-card</id></metadata>
+  <identity><![CDATA[Name: New Card]]></identity>
+  <persona><![CDATA[Personality: Calm.]]></persona>
+</sim_card>"#;
+        let parsed = sim_card::parse_from_xml_str(v2_xml).expect("v2 shape parses");
+        assert!(ensure_playable_v2(&parsed).is_ok());
+
+        // A non-simulation type (the parse's "system" default — e.g. a card
+        // whose <metadata> block was deleted in the raw editor) is equally
+        // unwalkable and must be rejected.
+        let mut system_shaped = parsed;
+        system_shaped.card_type = "system".into();
+        assert!(
+            ensure_playable_v2(&system_shaped).is_err(),
+            "non-simulation card_type must be rejected at the write boundary"
+        );
+    }
+
+    /// (2026-08-24 sentinel gate) A card id (or Creator name-slug) landing on
+    /// a memory sentinel is refused at the boundaries — entering one would
+    /// hijack the Wupi-chat memory partition and fable_end would silently
+    /// skip every session persist.
+    #[test]
+    fn sentinel_ids_are_refused_at_write_and_start_boundaries() {
+        for sentinel in [
+            memory::WUPI_CARD_ID,
+            memory::WUPI_SYSTEM_CARD_ID,
+            memory::FABLE_SYSTEM_CARD_ID,
+            memory::CODEX_CARD_ID,
+        ] {
+            assert!(is_memory_sentinel_id(sentinel), "{sentinel}");
+            // The shared write/validate contract.
+            let mut card = sim_card::parse_from_xml_str(
+                r#"<sim_card>
+  <metadata><type>simulation</type><id>plain-card</id></metadata>
+  <identity><![CDATA[Name: Plain Card]]></identity>
+  <persona><![CDATA[Personality: Calm.]]></persona>
+</sim_card>"#,
+            )
+            .expect("v2 shape parses");
+            card.id = sentinel.to_string();
+            assert!(
+                ensure_playable_v2(&card).is_err(),
+                "{sentinel} must be refused as a card id"
+            );
+            // The Creator write path's name-slug gate.
+            assert!(
+                is_memory_sentinel_id(&slugify_card_stem(sentinel).unwrap_or_default()),
+                "slugify must not launder the sentinel away for the gate check"
+            );
+        }
+        // Ordinary ids stay legal.
+        assert!(!is_memory_sentinel_id("liam"));
+        assert!(!is_memory_sentinel_id("wupi"));
+    }
+
+    // ---------- (2026-08-23) NPC export / import ----------
+
+    fn export_facts_fixture() -> NpcExportFacts {
+        NpcExportFacts {
+            id: "marcus".into(),
+            name: "Marcus the Cooper".into(),
+            role: "cooper of the lower town".into(),
+            tier: Some("elite".into()),
+            aliases: vec!["Marcus".into(), "the cooper".into()],
+            mood: Some("wary".into()),
+            intent: Some("to buy his daughter's medicine".into()),
+            worn: vec!["leather apron".into(), "rough linen shirt".into()],
+            held: vec!["cooper's adze".into(), "three silver bits".into()],
+            relationship: Some("Friendly".into()),
+            milestones: vec![
+                "shared soup during the flood".into(),
+                "vouched for the player at the gate".into(),
+            ],
+            entities: vec![("npc.marcus.flavor".into(), "smells of oak shavings".into())],
+            memories: vec![
+                "Marcus gripped his adze white-knuckled when the watch came asking questions.".into(),
+            ],
+        }
+    }
+
+    /// The dossier carries every fact surface; the prompts teach the fence,
+    /// the never-invent law, and the exact JSON contract.
+    #[test]
+    fn npc_export_dossier_and_prompts_carry_facts() {
+        let dossier = build_npc_export_dossier(&export_facts_fixture());
+        assert!(dossier.contains("Marcus the Cooper"));
+        assert!(dossier.contains("cooper of the lower town"));
+        assert!(dossier.contains("leather apron"), "worn rack rides");
+        assert!(dossier.contains("vouched for the player"), "milestones ride");
+        assert!(dossier.contains("oak shavings"), "entity traits ride");
+        assert!(dossier.contains("white-knuckled"), "memories ride");
+        assert!(dossier.contains("Also known as: the cooper"), "learned aliases ride");
+        assert!(!dossier.contains("Also known as: Marcus"), "name/id aliases dedupe out");
+        let (system, user) = build_npc_export_prompts(&dossier);
+        assert!(system.contains("NEVER invent"), "the curation law is taught");
+        assert!(system.contains("hair_style"), "the full identity contract is taught");
+        assert!(system.contains("conversation_style"), "the 8-label persona contract");
+        assert!(user.contains("```json"), "the fence is demanded");
+        assert!(user.contains("Marcus the Cooper"));
+    }
+
+    /// The draft parser: clean fence, bare JSON, and repairable damage all
+    /// land; prose-only garbage rejects (None).
+    #[test]
+    fn npc_card_draft_parse_tolerates_fences_and_damage() {
+        let body = r#"{"identity": {"race": "human"}, "persona": {"personality": "dry"}}"#;
+        let fenced = format!("```json\n{body}\n```");
+        assert_eq!(
+            parse_npc_card_draft(&fenced).unwrap().get("persona").unwrap().get("personality"),
+            Some(&serde_json::json!("dry"))
+        );
+        assert!(parse_npc_card_draft(body).is_some(), "bare JSON parses");
+        // A trailing comma is genuinely invalid for serde — the repair
+        // pipeline must rescue it.
+        let trailing = "{\"identity\": {}, \"persona\": {},}";
+        assert!(
+            parse_npc_card_draft(&format!("```json\n{trailing}\n```")).is_some(),
+            "the json_repair pipeline rescues a trailing comma"
+        );
+        assert!(parse_npc_card_draft("no json here at all").is_none());
+    }
+
+    /// The card builder: draft prose + mechanical facts fold into a v2 npc
+    /// card that round-trips through serialize_v2 → parse (Rust serializes;
+    /// GLM never writes XML — pinned here).
+    #[test]
+    fn build_npc_card_from_draft_round_trips() {
+        let facts = export_facts_fixture();
+        let draft = serde_json::json!({
+            "identity": {"race": "human", "age": "forty", "eyes": "brown"},
+            "persona": {
+                "personality": "dry-witted, stubborn",
+                "occupation": "cooper",
+                "backstory": "Flooded with the lower town twice; kept making barrels."
+            },
+            "setting": "a river town under strain",
+            "plot": "his daughter's medicine debt"
+        });
+        let card = build_npc_card_from_draft(&draft, &facts);
+        assert_eq!(card.card_type, "simulation");
+        assert_eq!(card.subtype.as_deref(), Some("npc"));
+        assert!(card.format_v2);
+        // (2026-08-23 audit fix) The LIVE registry id rides the card (a
+        // name-slug id could duplicate the character on re-import when the
+        // registry id differs from the name slug).
+        assert_eq!(card.id, "marcus", "id == the registry id");
+        // Inventory is pure FACTS: worn → Clothing, held → Stored.
+        assert_eq!(card.inventory.clothing, vec!["leather apron", "rough linen shirt"]);
+        assert_eq!(card.inventory.stored, vec!["cooper's adze", "three silver bits"]);
+        assert_eq!(card.custom_tags.get("tier").map(String::as_str), Some("elite"));
+        assert_eq!(card.custom_tags.get("relationship").map(String::as_str), Some("Friendly"));
+        // The persona-only law: no world/location/intro siblings.
+        assert!(card.world.is_empty());
+        assert!(card.location.is_none());
+        assert!(card.intro.is_empty());
+        // Round-trip through the real serializer.
+        let xml = card.serialize_v2();
+        let back = sim_card::parse_from_xml_str(&xml).expect("round-trip parses");
+        assert_eq!(back.id, card.id);
+        assert_eq!(back.identity.race.as_deref(), Some("human"));
+        assert_eq!(back.persona.backstory.as_deref(), Some("Flooded with the lower town twice; kept making barrels."));
+        assert_eq!(back.inventory.clothing, card.inventory.clothing);
+        assert!(ensure_playable_v2(&back).is_ok(), "the exported card is walker-visible");
+    }
+
+    /// The registration helper (the import engine): Core entry + garment
+    /// routing, the collision guards, and idempotent seeding.
+    #[test]
+    fn register_npc_card_seeds_racks_and_guards_collisions() {
+        let mut card = sim_card::fallback();
+        card.id = "tilda".into();
+        card.name = "Tilda".into();
+        card.inventory = sim_card::CardInventory {
+            clothing: vec!["wool dress".into()],
+            equipped: vec!["hunting bow".into(), "linen gloves".into()],
+            accessories: vec![],
+            stored: vec!["field rations".into()],
+        };
+        let mut s = schema::WorldSchema::default();
+        let pushed = register_npc_card_in_schema(&mut s, &card, "", false).expect("fresh register");
+        assert!(pushed);
+        assert_eq!(s.npc_registry.entries.len(), 1);
+        assert_eq!(s.npc_registry.entries[0].prominence, schema::NpcProminence::Core);
+        let rack = s.npc_interior.get("tilda").expect("rack seeded");
+        let worn: Vec<&str> = rack.worn.iter().map(|i| i.name.as_str()).collect();
+        let held: Vec<&str> = rack.items.iter().map(|i| i.name.as_str()).collect();
+        assert!(worn.contains(&"wool dress"), "Clothing wears: {worn:?}");
+        assert!(worn.contains(&"linen gloves"), "specific accessories wear");
+        assert!(held.contains(&"hunting bow"), "weapons stay held: {held:?}");
+        assert!(held.contains(&"field rations"), "Stored stays held");
+        // Import-mode collision rejects; idempotent mode re-seeds silently.
+        assert!(register_npc_card_in_schema(&mut s, &card, "", false).is_err());
+        assert!(
+            register_npc_card_in_schema(&mut s, &card, "", true).is_ok(),
+            "the enter path re-seeds an existing entry"
+        );
+        // Player-name collision refuses in both modes.
+        let mut twin = card.clone();
+        twin.id = "someone-else".into();
+        twin.name = "Alex".into();
+        assert!(register_npc_card_in_schema(&mut s, &twin, "alex", false).is_err());
+        assert!(register_npc_card_in_schema(&mut s, &twin, "alex", true).is_err());
     }
 }

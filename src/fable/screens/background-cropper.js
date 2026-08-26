@@ -39,9 +39,11 @@ const TARGET_ASPECT = 16 / 9; // the default frame's aspect (width / height)
 const MIN_CROP = 48;          // stage-px floor on either edge — frame can't vanish
 const MAX_LONG_EDGE = 3840;   // cap output so a huge crop doesn't bloat the library
 
-// Cache the loaded image between the render + the confirm draw. One in-flight
-// modal at a time (the gallery is modal).
-let _loadedImg = null;
+// (2026-08-24, mirrors portrait-cropper's yellow J7) The loaded image is
+// PER-MODAL state (a local in openBackgroundCropper), not a module global:
+// the decode is async, and a module global meant a Confirm that raced the
+// new image's onload drew the PREVIOUS modal's image (cropping stale
+// bytes). One in-flight modal at a time regardless (the gallery is modal).
 
 /**
  * Open the background cropper against `parentEl` with `imageSrc` (a same-origin
@@ -86,6 +88,10 @@ export function openBackgroundCropper(parentEl, imageSrc) {
     const cancelBtn = overlay.querySelector('[data-crop-cancel]');
 
     let settled = false;
+    // (J7 mirror) Per-modal decoded image — null until the probe's onload.
+    // Confirm before the decode lands settles null (below), never a draw of
+    // a previous modal's image.
+    let loadedImg = null;
     // (2026-08-15 audit fix) document-level (capture) key handler — the old
     // overlay-bound listener went deaf once focus left the overlay (dragging
     // the crop rect moves focus to body). Removed on settle; the isConnected
@@ -107,7 +113,7 @@ export function openBackgroundCropper(parentEl, imageSrc) {
     // Load the image. On error, cancel silently.
     const probe = new Image();
     probe.onload = () => {
-      _loadedImg = probe;
+      loadedImg = probe;
       sizeStageToImage(probe.naturalWidth || probe.width, probe.naturalHeight || probe.height);
       img.src = imageSrc;
       // Defer one frame so layout settles, then place the default 16:9 frame.
@@ -255,9 +261,12 @@ export function openBackgroundCropper(parentEl, imageSrc) {
     // SecurityError must surface + cancel, never hang the modal.
     function onConfirm() {
       try {
-        if (!_loadedImg) { done(null); return; }
-        const natural = _loadedImg.naturalWidth || _loadedImg.width;
-        const naturalH = _loadedImg.naturalHeight || _loadedImg.height;
+        // (J7 mirror) No decoded image YET (the async decode hasn't landed) —
+        // settling null cancels cleanly; a previous modal's image can never be
+        // drawn (per-modal state).
+        if (!loadedImg) { done(null); return; }
+        const natural = loadedImg.naturalWidth || loadedImg.width;
+        const naturalH = loadedImg.naturalHeight || loadedImg.height;
         if (!natural || !naturalH) { done(null); return; }
         const { w: sw, h: sh } = stageSize();
         if (!sw || !sh) { done(null); return; }
@@ -287,7 +296,7 @@ export function openBackgroundCropper(parentEl, imageSrc) {
         canvas.height = outH;
         const ctx = canvas.getContext('2d');
         ctx.imageSmoothingQuality = 'high';
-        ctx.drawImage(_loadedImg, sx, sy, srcW, srcH, 0, 0, outW, outH);
+        ctx.drawImage(loadedImg, sx, sy, srcW, srcH, 0, 0, outW, outH);
         // Format-preserving: PNG source → PNG (lossless, good for graphics with
         // text), JPEG source → JPEG @ 0.95 (smaller, good for photos). Detect
         // from the input data URL prefix.

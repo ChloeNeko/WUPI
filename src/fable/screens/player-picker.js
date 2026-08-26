@@ -77,6 +77,9 @@ export async function renderPlayerPicker(root, handlers) {
   const host = root.querySelector('[data-host]');
   host.innerHTML = '';
   closeModal(root);
+  // (2026-08-24) A delete-confirm left open from a prior visit must NOT
+  // survive re-entry: its Yes listener still closed over the DEAD target id.
+  closeConfirm(root);
   let players = [];
   try {
     players = await invoke('fable_players_list');
@@ -140,6 +143,10 @@ async function openModal(root, meta) {
   if (root._modalOpen) return;
   root._modalOpen = true;
   root._actionConsumed = false; // fresh open → fresh action latch
+  // (2026-08-24) Same stale-confirm teardown as re-entry: a confirm left
+  // floating over a closed card modal names a player this new open may not
+  // even show — its Yes must never fire.
+  closeConfirm(root);
   // Invalidate any in-flight close (see closeModal): a re-click inside the
   // 260ms close window must never be hidden by the previous close's stale
   // transitionend/timer — that left the modal invisible with _modalOpen
@@ -364,6 +371,26 @@ function renderModalCard(sp) {
 }
 
 // --- Delete confirmation (the one irreversible action) -------------------
+
+// (2026-08-24) Tear down any open delete-confirm: releases its Yes/No
+// listeners (their closures may name a DEAD target id from a prior visit —
+// a stale Yes firing fable_player_delete against it is exactly the leak
+// this closes) + hides the element outright. Called on every re-entry
+// (renderPlayerPicker) and every fresh modal open (openModal); the gen bump
+// mirrors confirmDelete's own deferred-hide guard so a prior close's
+// transitionend/timer can never fight this hide.
+function closeConfirm(root) {
+  if (root._confirmCleanup) {
+    root._confirmCleanup();
+    root._confirmCleanup = null;
+  }
+  const confirmEl = root.querySelector('[data-confirm]');
+  if (!confirmEl) return;
+  root._confirmGen = (root._confirmGen || 0) + 1;
+  confirmEl.classList.remove('is-open');
+  confirmEl.hidden = true;
+}
+
 function confirmDelete(root, sp) {
   const confirmEl = root.querySelector('[data-confirm]');
   // Already-open guard: a double-click on the modal's delete button re-enters
@@ -412,7 +439,12 @@ function confirmDelete(root, sp) {
   function cleanup() {
     yes.removeEventListener('click', onYes);
     no.removeEventListener('click', onNo);
+    root._confirmCleanup = null;
   }
+  // Register the teardown so closeConfirm (re-entry / a fresh modal open)
+  // can release these listeners — a stale Yes must never outlive the visit
+  // it was armed in.
+  root._confirmCleanup = cleanup;
   yes.addEventListener('click', onYes);
   no.addEventListener('click', onNo);
 }

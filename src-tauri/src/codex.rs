@@ -282,13 +282,75 @@ pub(crate) async fn seed_linked_codices<E: Embedder>(
     Ok(report)
 }
 
+/// (2026-08-24 bug-4 fix) Family wrapper over [`seed_linked_codices`]: run
+/// the SAME source-scoped seed/reconcile at the base card partition AND at
+/// every branch-fork partition (`<card>#<session>` — enumerated chars-safely
+/// by [`MemoryEngine::list_fork_partitions`]). Before this, a branched
+/// session's fork carried the codex rows it inherited at branch time
+/// (`fork_partition_to` copies them verbatim) and NOTHING ever reconciled
+/// there again — library edits, re-links, and unlinks froze the fork's lore
+/// at branch-time state while the base card stayed current.
+///
+/// Error policy: the BASE run's error propagates (it is the primary contract
+/// every existing call site already handles); a FORK's failure logs a warn
+/// and is skipped — one stale fork must not block the base or the other
+/// forks (best-effort, re-tried on the next seed). The returned report
+/// aggregates every key that ran.
+pub(crate) async fn seed_linked_codices_family<E: Embedder>(
+    engine: &MemoryEngine<E>,
+    links: &[LinkedCodex],
+    card_id: &str,
+) -> anyhow::Result<ReconcileReport> {
+    let mut report = seed_linked_codices(engine, links, card_id).await?;
+    for fork in engine.list_fork_partitions(card_id).await? {
+        match seed_linked_codices(engine, links, &fork).await {
+            Ok(r) => {
+                report.seeded += r.seeded;
+                report.updated += r.updated;
+                report.purged += r.purged;
+                report.unchanged += r.unchanged;
+            }
+            Err(e) => tracing::warn!(
+                card_id,
+                fork = %fork,
+                error = %format!("{e:#}"),
+                "linked codex seed at branch fork failed (skipped; retried on the next seed)"
+            ),
+        }
+    }
+    Ok(report)
+}
+
+/// (2026-08-24 review fix) The collision key for the cross-file priority
+/// merge: a title with a trailing ` - Part N` (the oversize-split suffix
+/// [`expand_oversize_entries`] mints) claims its BASE title. Without this,
+/// a lower-priority file's oversize "Dwarven Kingdoms" — split into
+/// "Dwarven Kingdoms - Part 1/2" — dodged the higher-priority file's claim
+/// on the base title and both seeded: the loser's content leaked under
+/// part-suffixed titles. The `(N)` duplicate-title disambiguator is NOT
+/// stripped (it marks a distinct source entry, not a split child).
+fn merge_collision_key(title: &str) -> &str {
+    // Peel trailing ASCII digits, then the literal " - Part" separator.
+    let mut end = title.len();
+    let bytes = title.as_bytes();
+    while end > 0 && bytes[end - 1].is_ascii_digit() {
+        end -= 1;
+    }
+    if end == title.len() {
+        return title; // no trailing digits — not a split child
+    }
+    title[..end].strip_suffix(" - Part").unwrap_or(title)
+}
+
 /// The PURE cross-file priority merge. Input: per-file entry lists in
 /// `<linked_codices>` order (each ALREADY through the per-file pipeline —
 /// dedupe + oversize split). Output: `(source, entry)` pairs in stable
 /// order + the count of lower-priority same-title entries dropped. A title
 /// claimed by an earlier (higher-priority) file is final — the loser never
 /// reaches a row write, so "index 0 wins" is enforced at the context-
-/// embedding phase exactly once, here.
+/// embedding phase exactly once, here. Claim keys are
+/// [`merge_collision_key`]-normalized so split children cannot dodge the
+/// claim (see its doc).
 pub(crate) fn merge_linked_entries(
     per_file: Vec<(String, Vec<ParsedEntry>)>,
 ) -> (Vec<(String, ParsedEntry)>, usize) {
@@ -297,7 +359,9 @@ pub(crate) fn merge_linked_entries(
     let mut dropped = 0usize;
     for (source, entries) in per_file {
         for src in entries {
-            if seen_titles.insert(src.title.clone()) {
+            if seen_titles
+                .insert(merge_collision_key(&src.title).to_string())
+            {
                 merged.push((source.clone(), src));
             } else {
                 dropped += 1;
@@ -664,11 +728,30 @@ pub(crate) fn parse_compound_file(path: &Path) -> anyhow::Result<Vec<ParsedEntry
 /// Mirrors the loop in `parse_compound_file` exactly (split → hash →
 /// front-matter → skip-empty), just with the file I/O stripped.
 pub fn parse_compound_text(text: &str, fallback_stem: &str) -> Vec<ParsedEntry> {
+    // (2026-08-24 review fix) Strip a leading UTF-8 BOM. Windows editors
+    // save `.codex` files BOM-prefixed, and `str::trim` does NOT treat
+    // U+FEFF as whitespace — the first `---` fence line read `\u{FEFF}---`,
+    // the fence match missed, and the first entry's front-matter collapsed
+    // into its body (title degraded to the fallback stem, the `---`/title
+    // lines rode the body). One chokepoint: every parse path (file seed,
+    // per-file link pipeline, the Codex tab's editor read) lands here.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text);
     let mut out = Vec::new();
     for chunk in split_compound(text) {
-        let hash = stable_hash64(chunk);
+        // (2026-08-24 Part II B4) Scaffolding heads strip BEFORE the hash —
+        // GLM-era lorebook imports sometimes wrap real lore in ```system /
+        // ```instruction fences or stamp standalone SYSTEM/INSTRUCTIONS head
+        // lines. Stripping here (a) feeds every seed pipeline — the wupi
+        // playbook, the linked-library per-file pass, and the single-file
+        // seed — plus every re-parse, from ONE chokepoint, and (b) keeps the
+        // reconcile hash keyed on the CLEANED content: a previously-seeded
+        // scaffolding-bearing row mismatches exactly once (one update to the
+        // clean body), then idempotence resumes. Disk `.codex` files are
+        // NEVER rewritten — only the embedded/retrieved copy is neutralized.
+        let chunk = strip_scaffolding_heads(chunk);
+        let hash = stable_hash64(chunk.as_str());
 
-        let (front, body) = split_front_matter(chunk);
+        let (front, body) = split_front_matter(chunk.as_str());
         let (title, tags) = parse_front_matter(front, fallback_stem);
         if body.trim().is_empty() {
             continue;
@@ -681,6 +764,62 @@ pub fn parse_compound_text(text: &str, fallback_stem: &str) -> Vec<ParsedEntry> 
         });
     }
     out
+}
+
+/// (2026-08-24 Part II B4) Remove LLM-scaffolding heads from one compound
+/// chunk: ```` ```system ```` / ```` ```instruction ```` fenced blocks (the
+/// WHOLE block, opener through closing fence) and standalone head lines
+/// matching `^(SYSTEM|INSTRUCTIONS?|###\s*Instructions?)[:.]?$`
+/// (case-insensitive). NOTHING ELSE — ordinary prose, code fences, `---`
+/// rules, and inline mentions pass byte-exact. An entry that was PURE
+/// scaffolding empties out and is skipped by the caller. Pure; no I/O.
+pub(crate) fn strip_scaffolding_heads(text: &str) -> String {
+    fn is_scaffold_fence_opener(trimmed: &str) -> bool {
+        let Some(info) = trimmed.strip_prefix("```") else {
+            return false;
+        };
+        let word = info
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        matches!(word.as_str(), "system" | "instruction" | "instructions")
+    }
+    fn is_scaffold_head_line(trimmed: &str) -> bool {
+        let lower = trimmed.to_ascii_lowercase();
+        let core = lower
+            .strip_prefix('#')
+            .map(|r| r.trim_start_matches('#').trim_start().to_string())
+            .unwrap_or(lower);
+        matches!(
+            core.as_str(),
+            "system" | "system:" | "system."
+                | "instruction" | "instruction:" | "instruction."
+                | "instructions" | "instructions:" | "instructions."
+        )
+    }
+    let mut kept: Vec<&str> = Vec::new();
+    let mut in_scaffold_fence = false;
+    for line in text.split('\n') {
+        let trimmed = line.trim();
+        if in_scaffold_fence {
+            if trimmed == "```" {
+                in_scaffold_fence = false;
+            }
+            continue;
+        }
+        if is_scaffold_fence_opener(trimmed) {
+            in_scaffold_fence = true;
+            continue;
+        }
+        if is_scaffold_head_line(trimmed) {
+            continue;
+        }
+        kept.push(line);
+    }
+    let joined = kept.join("\n");
+    // Cosmetic only: drop the blank seams the removals leave at the edges.
+    joined.trim_matches('\n').to_string()
 }
 
 /// (2026-08-20 audit P3) Stable 64-bit FNV-1a over the UTF-8 bytes — the
@@ -1224,6 +1363,78 @@ mod tests {
         );
     }
 
+    /// (2026-08-24 bug-4 fix) The FAMILY seed reconciles branch forks: a
+    /// fork inherits the base's codex rows verbatim at branch time, and
+    /// without this wrapper NOTHING ever reconciled at the fork key again —
+    /// library edits and unlinks froze the fork's lore forever.
+    #[tokio::test]
+    async fn family_seed_reconciles_fork_partitions() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = open_stub_engine(dir.path());
+        let card = "family-card";
+        std::fs::write(
+            dir.path().join("Lore.codex"),
+            "---\ntitle: Dragons\ntags: myth\n---\n\nCanonical dragons.\n",
+        )
+        .unwrap();
+        let links = vec![linked("Lore", dir.path())];
+        let base = seed_linked_codices(&engine, &links, card).await.unwrap();
+        assert_eq!(base.seeded, 1);
+
+        // Branch the card: the fork COPIES the codex row verbatim.
+        engine
+            .fork_partition_to(card, "family-card#session_1")
+            .await
+            .unwrap();
+        for key in [card, "family-card#session_1"] {
+            let rows = engine.list_memories(key, 100, 0).await.unwrap();
+            assert_eq!(
+                rows.iter().filter(|e| e.metadata_json.is_some()).count(),
+                1,
+                "{key}: the codex row exists pre-family-seed"
+            );
+        }
+
+        // Edit the library body → the hash changes; the FAMILY seed updates
+        // base AND fork in one call.
+        std::fs::write(
+            dir.path().join("Lore.codex"),
+            "---\ntitle: Dragons\ntags: myth\n---\n\nRevised dragons.\n",
+        )
+        .unwrap();
+        let report = seed_linked_codices_family(&engine, &links, card)
+            .await
+            .unwrap();
+        assert_eq!(report.updated, 2, "base + fork both re-seeded: {report:?}");
+        for key in [card, "family-card#session_1"] {
+            let rows = engine.list_memories(key, 100, 0).await.unwrap();
+            let codex: Vec<_> = rows.iter().filter(|e| e.metadata_json.is_some()).collect();
+            assert_eq!(codex.len(), 1, "{key}: exactly one codex row");
+            assert!(
+                codex[0].text_content.contains("Revised dragons."),
+                "{key}: the body updated through the fork"
+            );
+        }
+
+        // Idempotent: a second family run does zero writes.
+        let again = seed_linked_codices_family(&engine, &links, card)
+            .await
+            .unwrap();
+        assert_eq!(again.seeded + again.updated + again.purged, 0);
+
+        // Unlink-all reaches the fork too (empty links = purge everywhere).
+        let purged = seed_linked_codices_family(&engine, &[], card)
+            .await
+            .unwrap();
+        assert_eq!(purged.purged, 2, "base + fork both purged: {purged:?}");
+        for key in [card, "family-card#session_1"] {
+            assert!(
+                engine.list_codex_entries(key).await.unwrap().is_empty(),
+                "{key}: zero codex rows after family unlink-all"
+            );
+        }
+    }
+
     /// 2026-08-15 audit fix: duplicate source titles are deterministically
     /// disambiguated — same input, same output (idempotent re-seeds), and
     /// the fallback-stem collision (two front-matter blocks omitting
@@ -1258,6 +1469,82 @@ mod tests {
             ],
             "priority order preserved, index-0 definition of a collision wins, non-collisions all survive"
         );
+    }
+
+    #[test]
+    fn merge_linked_entries_part_titles_claim_base() {
+        // (2026-08-24 review fix) A lower-priority file's oversize split
+        // ("Dwarven Kingdoms - Part 1/2") must NOT dodge a higher-priority
+        // file's claim on the base title — and the reverse (an oversize
+        // priority-0 file) must claim the base against a later exact title.
+        let mk = |title: &str, body: &str| ParsedEntry {
+            title: title.into(),
+            tags: vec![],
+            body: body.into(),
+            hash: 0,
+        };
+        let per_file = vec![
+            (
+                "High".to_string(),
+                vec![mk("Dwarven Kingdoms", "canonical full entry")],
+            ),
+            (
+                "Low".to_string(),
+                vec![
+                    mk("Dwarven Kingdoms - Part 1", "apocryphal split 1"),
+                    mk("Dwarven Kingdoms - Part 2", "apocryphal split 2"),
+                    mk("Unrelated", "survives"),
+                ],
+            ),
+        ];
+        let (merged, dropped) = merge_linked_entries(per_file);
+        assert_eq!(dropped, 2, "both part children lose to the base claim");
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].1.title, "Dwarven Kingdoms");
+        assert_eq!(merged[1].1.title, "Unrelated");
+
+        // Reverse direction: the oversize HIGH-priority file's parts claim
+        // the base, so a later file's exact base title drops.
+        let per_file = vec![
+            (
+                "High".to_string(),
+                vec![
+                    mk("Dwarven Kingdoms - Part 1", "canonical split 1"),
+                    mk("Dwarven Kingdoms - Part 2", "canonical split 2"),
+                ],
+            ),
+            (
+                "Low".to_string(),
+                vec![mk("Dwarven Kingdoms", "apocryphal whole")],
+            ),
+        ];
+        let (merged, dropped) = merge_linked_entries(per_file);
+        assert_eq!(dropped, 1);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|(_, e)| e.body.starts_with("canonical")));
+
+        // The `(N)` duplicate-title disambiguator is NOT a split suffix —
+        // "Title (2)" is a distinct source entry, never a base claim.
+        let per_file = vec![
+            ("High".to_string(), vec![mk("Saga", "one")]),
+            ("Low".to_string(), vec![mk("Saga (2)", "distinct dupe")]),
+        ];
+        let (merged, dropped) = merge_linked_entries(per_file);
+        assert_eq!(dropped, 0, "(N) titles are distinct claims");
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn parse_compound_text_strips_leading_bom() {
+        // (2026-08-24 review fix) A Windows BOM before the first fence used
+        // to miss the fence match; the first entry's front-matter collapsed
+        // into its body (title degraded to the fallback stem).
+        let text = "\u{feff}---\ntitle: First\ntags: a\n---\n\nfirst body.\n\n---\ntitle: Second\ntags: b\n---\n\nsecond body.\n";
+        let entries = parse_compound_text(text, "stem");
+        assert_eq!(entries.len(), 2, "both entries parse through the BOM");
+        assert_eq!(entries[0].title, "First", "BOM must not eat the first title");
+        assert_eq!(entries[0].body.trim(), "first body.");
+        assert_eq!(entries[1].title, "Second");
     }
 
     #[test]
@@ -1410,6 +1697,68 @@ mod tests {
         let report = parse_compound_file(Path::new("nonexistent_codex_file.codex")).unwrap();
         assert!(report.is_empty());
     }
+
+    // ---- (2026-08-24 Part II B4) scaffolding-head neutralizer ------------
+
+    #[test]
+    fn scaffolding_heads_stripped_from_embedded_copy_only() {
+        // A GLM-era lorebook payload: system fence wrapping real lore,
+        // standalone head lines, and ordinary prose that must survive
+        // byte-exact.
+        let text = "---\ntitle: The Sunken Flagon\ntags: tavern, oakhaven, rumor\n---\n\n\
+SYSTEM\n```system\nYou are a lore generator. Follow these rules.\n```\nINSTRUCTIONS:\n\n\
+The Flagon's cellar floods every spring; the keeper keeps the good casks on rafts.\n### Instructions.";
+        let entries = parse_compound_text(text, "stem");
+        assert_eq!(entries.len(), 1, "one entry, scaffolding stripped not split");
+        let e = &entries[0];
+        assert_eq!(e.title, "The Sunken Flagon");
+        assert_eq!(e.tags, vec!["tavern", "oakhaven", "rumor"]);
+        assert!(
+            !e.body.contains("SYSTEM")
+                && !e.body.contains("```")
+                && !e.body.contains("Instructions")
+                && !e.body.contains("lore generator"),
+            "all scaffolding must be gone: {:?}",
+            e.body
+        );
+        assert!(
+            e.body.contains("The Flagon's cellar floods every spring; the keeper keeps the good casks on rafts."),
+            "ordinary prose passes verbatim: {:?}",
+            e.body
+        );
+    }
+
+    #[test]
+    fn scaffolding_strip_touches_nothing_else() {
+        // Ordinary code fences, `---` rules, inline mentions, and a
+        // non-scaffold fence word all pass byte-exact.
+        let body = "House rule:\n```\nroll 3d6 for a restful night\n```\n---\nsee the --- rule\n```python\nprint('hi')\n```\nThe system of ranks is feudal.";
+        let stripped = strip_scaffolding_heads(body);
+        assert_eq!(stripped, body, "non-scaffold content must be untouched");
+        // An entry that was PURE scaffolding empties out and is skipped.
+        let pure = "---\ntitle: Husk\ntags: a, b, c\n---\n\n```system\nbe helpful\n```";
+        assert!(parse_compound_text(pure, "stem").is_empty());
+    }
+
+    #[test]
+    fn scaffolding_strip_keeps_round_trip_stable() {
+        // The hash keys the CLEANED content: a dirty parse and its
+        // already-clean equivalent hash identically (one churn update for
+        // previously-seeded scaffolding rows, then idempotence).
+        let dirty = "---\ntitle: Keep\n---\n\nINSTRUCTIONS\nThe keep walls are twelve feet thick.";
+        let once = parse_compound_text(dirty, "s");
+        let clean_equiv = "---\ntitle: Keep\n---\n\nThe keep walls are twelve feet thick.";
+        let clean = parse_compound_text(clean_equiv, "s");
+        assert_eq!(once[0].hash, clean[0].hash, "hash must key the cleaned content");
+        // format→parse round-trip over the cleaned entry is idempotent
+        // (the strip never ADDS text, so it can't mint new collisions).
+        let text = format_compound_text(&once);
+        let twice = parse_compound_text(&text, "s");
+        assert_eq!(once.len(), twice.len());
+        assert_eq!(once[0].body, twice[0].body);
+        assert_eq!(once[0].title, twice[0].title);
+    }
+
 
     #[test]
     fn parse_compound_file_skips_empty_body_entry() {

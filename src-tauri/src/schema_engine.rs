@@ -34,14 +34,17 @@
 //!    per-delta count caps). Defense by *structure*: a delta that fails
 //!    validation gets fed its specific error back via the repair prompt so
 //!    the model can correct the *issue*, not just regenerate blindly.
-//! 2. **3-pass repair loop with accumulating context.** Initial generation →
-//!    if parse OR validation fails, repair pass 1 (shows pass 1's raw output
-//!    + the specific error) → repair pass 2 (shows BOTH prior errors + both
-//!    raw outputs). Cap is 3 (empirically the LLM-JSON-repair cliff; passes
-//!    4+ mostly produce different versions of the same failure). Worst case
-//!    ~15-24s vs 35-56s for the rejected 7-pass proposal.
+//! 2. **2-pass delta repair loop + full-emit fallback (2026-08-22 multihog
+//!    WS5).** Initial generation → on failure, one accumulated repair pass
+//!    (shows pass 1's raw output + the specific error). A third delta pass
+//!    rarely recovered what the second missed (the empirical repair cliff),
+//!    so the budget funds a FULL-EMIT fallback instead: one lenient pass
+//!    asks for a flat key → COMPLETE-new-value map, and Rust normalizes +
+//!    diffs it (`full_emit_to_delta` — omission = unchanged, null = delete).
+//!    Entities only; summary/events failures keep the deferred-retry path.
 //! 3. **Failure queue (`failed_delta_queue` on AppState).** A delta that
-//!    still fails all 3 passes is NOT dropped: it's queued. The next turn's
+//!    still fails all passes (incl. the full-emit fallback) is NOT
+//!    dropped: it's queued. The next turn's
 //!    delta prompt folds in the failed attempt as "previously deferred state
 //!    change — re-attempt with new context." The new conversational context
 //!    is a strictly better retry signal than re-running the same failed
@@ -60,10 +63,10 @@ use crate::llm::{shared_backend, shared_model};
 use crate::schema::{SchemaDelta, WorldSchema};
 use crate::schema_validator;
 
-/// The schema context's token budget. Smaller than chat's 4000: the delta
-/// pass only needs: system instruction (~150 tokens) + current schema JSON
-/// (~200-800) + last exchange (~100-400) + generation room. 2048 is generous
-/// headroom; the KV cost at Q8_0 is ~50MB (E4B).
+/// The schema context's token budget. See `settings::CTX_SCHEMA` for the
+/// 2026-08-24 2048 → 8192 raise: the measured world-progression tick
+/// composition (~8.1k chars base, ~16.8k all-caps worst) overflowed the old
+/// 1,792-token prompt ceiling and the middle-drop spliced the schema JSON.
 const SCHEMA_CTX: u32 = crate::settings::CTX_SCHEMA;
 const SCHEMA_BATCH: u32 = 512;
 /// Cap on generated tokens for a delta pass. A compliant micro-delta is
@@ -86,12 +89,17 @@ const SCHEMA_MAX_TOKENS: i32 = 256;
 /// construction in `generate_with_repair`.
 const SCHEMA_TEMP: f32 = crate::settings::TEMP_TRACKER;
 
-/// Maximum number of generation passes per delta attempt (initial + 2
-/// repairs = 3 total). The 4th-and-beyond cliff is empirically steep for
-/// LLM-JSON-repair; the failure queue (fold-into-next-turn) is the strictly
-/// better retry strategy past this cap. See module doc "The fail-proof
-/// contract" layer 2.
-const MAX_DELTA_PASSES: u8 = 3;
+/// (2026-08-22 multihog WS5) Maximum DELTA-shape passes per attempt
+/// (initial + 1 repair = 2 total), down from 3: pass 3 rarely recovered
+/// what pass 2 missed (the empirical LLM-JSON-repair cliff), and the freed
+/// decode budget funds the FULL-EMIT FALLBACK — after the delta passes
+/// fail, one lenient pass asks for a flat key → COMPLETE-new-value map and
+/// Rust-side normalizes + diffs it into a delta (see
+/// [`full_emit_to_delta`]). Summary/events failures keep the
+/// deferred-retry path (the fallback recovers ENTITIES only). A failure
+/// that survives everything enqueues with `passes_used = MAX_DELTA_PASSES
+/// + 1` (2 delta + 1 full-emit).
+const MAX_DELTA_PASSES: u8 = 2;
 
 // ---------------------------------------------------------------------------
 // Control plane: channel types
@@ -102,11 +110,16 @@ const MAX_DELTA_PASSES: u8 = 3;
 struct SchemaRequest {
     /// (user_message, assistant_message) from the turn that just completed.
     last_exchange: (String, String),
+    /// (2026-08-24 fix) Which surface is asking — tags the failure carrier
+    /// so the shared `failed_delta_queue` drain sites never cross-feed a
+    /// chat failure into a fable delta prompt (different schemas), or vice
+    /// versa.
+    surface: DeltaSurface,
     /// The current schema serialized as pretty JSON, so the model knows what
     /// to diff against.
     current_schema_json: String,
     /// Deferred attempts from prior turns that the engine couldn't commit
-    /// (all 3 passes failed). Folded into this turn's prompt as
+    /// (all passes failed). Folded into this turn's prompt as
     /// "previously deferred state changes — re-attempt with the new exchange
     /// as context." Empty in the common case (no prior failures).
     deferred_attempts: Vec<FailedAttempt>,
@@ -129,12 +142,13 @@ struct SchemaRequest {
 /// diagnosing JSON malformedness. On parse failure, `delta` is `None` and
 /// `error` explains why. `raw_output` is always populated on a completed pass.
 ///
-/// `failed_attempt` is `Some` ONLY when all 3 passes failed AND the failure
-/// looks retryable (parse failures, validation failures). Generation errors
-/// (tokenize/prefill/decode infrastructure failures) leave it `None` — those
-/// aren't going to fix themselves on the next turn. The caller (lib.rs's
-/// delta-fire spawn) pushes the `FailedAttempt` onto the failure queue; the
-/// next turn's delta prompt folds it in. See module doc layer 3.
+/// `failed_attempt` is `Some` ONLY when all passes failed (2 delta + the
+/// full-emit fallback) AND the failure looks retryable (parse failures,
+/// validation failures). Generation errors (tokenize/prefill/decode
+/// infrastructure failures) leave it `None` — those aren't going to fix
+/// themselves on the next turn. The caller (lib.rs's delta-fire spawn)
+/// pushes the `FailedAttempt` onto the failure queue; the next turn's
+/// delta prompt folds it in. See module doc layer 3.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SchemaReply {
     /// The verbatim model output (post generation). Empty only if generation
@@ -147,7 +161,8 @@ pub struct SchemaReply {
     /// JSON parse failure after all passes, or validation failure after all
     /// passes). Empty string on success.
     pub error: String,
-    /// Populated when all 3 passes failed AND the failure is retryable
+    /// Populated when all passes (delta + full-emit fallback) failed AND the
+/// failure is retryable
     /// (parse/validation errors). The caller enqueues this; the next turn
     /// re-attempts with fresh conversational context. `None` on success, on
     /// infrastructure errors, or on generation panics (those don't benefit
@@ -168,6 +183,22 @@ pub struct SchemaReply {
 /// giving the model a fresh generation pass with the *exchange* that
 /// produced the broken delta, alongside the new turn's exchange. The model
 /// gets two shots worth of conversational signal.
+/// (2026-08-24 fix) Which surface produced a delta attempt. The two delta
+/// surfaces — Wupi chat (`state.schema`) and Fable turns
+/// (`state.fable_schema`) — run against DIFFERENT schemas, so a failure
+/// from one surface must only ever be re-fed into that surface's next
+/// prompt; the drain sites filter on this tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum DeltaSurface {
+    /// The Wupi chat auto-summarizer (chat_send's post-turn spawn) + the
+    /// manager translation path.
+    #[default]
+    Chat,
+    /// The Fable per-turn delta (fable_send's post-done spawn) + the world
+    /// progression tick.
+    Fable,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct FailedAttempt {
     /// The (user, assistant) exchange that produced the failed delta. Empty
@@ -176,14 +207,21 @@ pub struct FailedAttempt {
     /// The player request that produced the failed translation. `None` for
     /// auto-summarizer attempts (which carry `exchange` instead).
     pub trigger: Option<String>,
-    /// The accumulated errors from all 3 passes, joined. The next attempt's
-    /// prompt can include this so the model knows what went wrong last time.
+    /// The accumulated errors from all passes (2 delta + the full-emit
+    /// fallback), joined. The next attempt's prompt can include this so the
+    /// model knows what went wrong last time.
     pub errors: String,
     /// How many times this attempt has been retried (always 3 on first
-    /// enqueue; the caller bumps it if a deferred re-attempt ALSO fails and
-    /// re-enqueues). The queue caps total retries to avoid pathological
-    /// loops — see lib.rs's `failed_delta_queue` cap.
+    /// enqueue — 2 delta passes + 1 full-emit — the caller bumps it if a
+    /// deferred re-attempt ALSO fails and re-enqueues). The queue caps
+    /// total retries to avoid pathological loops — see lib.rs's
+    /// `failed_delta_queue` cap.
     pub passes_used: u8,
+    /// The surface that produced this attempt (2026-08-24 fix). The queue
+    /// drain sites take only their own surface — a chat failure is never
+    /// folded into a fable delta prompt (different schema), and vice versa.
+    #[serde(default)]
+    pub surface: DeltaSurface,
 }
 
 /// Type alias distinguishing the three kinds of triggering context an attempt
@@ -192,8 +230,13 @@ pub struct FailedAttempt {
 /// boundary.
 #[derive(Clone)]
 enum AttemptSource {
-    /// Auto-summarizer: triggered by a chat exchange.
-    Auto { exchange: (String, String) },
+    /// Auto-summarizer: triggered by a chat or fable exchange. `surface`
+    /// tags the failure carrier so the queue drain sites never cross-feed
+    /// the two schemas.
+    Auto {
+        exchange: (String, String),
+        surface: DeltaSurface,
+    },
     /// Game-manager translation: triggered by an explicit player request.
     Translation { request: String },
     /// World progression tick (Seam #4): triggered by in-world clock advance.
@@ -281,8 +324,46 @@ pub struct DesignatedSite {
     /// In-world days since the node's `last_evolved_minutes` watermark
     /// (0 = never designated).
     pub elapsed_days: i64,
+    /// (2026-08-23 starvation fix) In-world days since the node's
+    /// `last_material_minutes` watermark — the last time a seed ACTUALLY
+    /// planted (the designation watermark above rotates on every offer).
+    /// `None` = never materialized. The prompt renders BOTH so the model
+    /// can distinguish "offered recently" from "unchanged for a month".
+    pub idle_days: Option<i64>,
     /// The node's current un-germinated seed hooks (honor-them context).
     pub seeds: Vec<String>,
+    /// (2026-08-22 multihog WS3) The node's pending pressure lines — the
+    /// accumulated intent the pass is asked to honor or evolve past.
+    pub pressure: Vec<String>,
+}
+
+/// (2026-08-22 living-world) One MAPPED, DEPARTED site designated to the
+/// world-progression pass for SITE EVOLUTION — the model may emit
+/// constrained `site_ops` for it (set/move/remove asset only). Pure prompt
+/// input; the play-canon-locked apply lives in `fire_world_progression_tick`
+/// step 7c. The player's CURRENT node never appears here (the bubble
+/// freeze, enforced at designation AND re-checked at apply).
+#[derive(Debug, Clone)]
+pub struct EvolutionSite {
+    /// The travel-node id (a key into `WorldSchema::site_maps`).
+    pub id: String,
+    /// Diegetic name (prompt flavor).
+    pub name: String,
+    /// In-world days since the player's last visit.
+    pub elapsed_days: i64,
+    /// The compact id-bearing site slice (`site_map::render_tracker_slice`)
+    /// — the asset/area ids the ops must target.
+    pub slice: String,
+    /// (2026-08-22 multihog WS3) The node's pending pressure lines —
+    /// context the evolution ops are asked to honor (an applied op
+    /// CONSUMES the queue; a no-op tick retains it — the anti-starvation
+    /// rule, enforced at the lib.rs apply).
+    pub pressure: Vec<String>,
+    /// (2026-08-23 WS5) The site's OPEN causal threads, pre-rendered
+    /// bounded lines (`site_map::render_thread_lines`) — the live plots
+    /// the evolution pass is asked to advance or resolve. Empty when the
+    /// ledger is empty (zero prompt cost).
+    pub threads: Vec<String>,
 }
 
 /// A request to advance the off-screen world (Fable Seam #4, 2026-07-27).
@@ -306,6 +387,11 @@ struct WorldProgressionRequest {
     /// tick — the prompt's `## DESIGNATED SITES` section; the model may
     /// emit `site_seeds` hooks for them (Rust validates + plants).
     designated: Vec<DesignatedSite>,
+    /// (2026-08-22 living-world) The mapped DEPARTED sites designated this
+    /// tick — the prompt's `## DEPARTED SITES` section; the model may emit
+    /// constrained `site_ops` for them (Rust applies under the play-canon
+    /// locks + bubble freeze).
+    evolution_sites: Vec<EvolutionSite>,
     /// Immutable + existing key sets (same role as in `SchemaRequest`).
     immutable_keys: std::collections::HashSet<String>,
     existing_keys: std::collections::HashSet<String>,
@@ -487,7 +573,7 @@ impl SchemaEngine {
                             error: String::new(),
                             failed_attempt: None,
                         },
-                        // Generation succeeded but all 3 passes failed
+                        // Generation succeeded but all passes failed
                         // (parse/validation). Retryable: surface the carrier
                         // so the caller enqueues for next-turn re-attempt.
                         // The schema is unchanged for THIS turn.
@@ -582,15 +668,21 @@ impl SchemaEngine {
     /// `immutable_keys` + `existing_keys` thread the schema's `[CORE]`-style
     /// immutability set + its current entity keys into the validator. Pass
     /// empty sets in the common case (no keys locked yet). 2026-07-27.
+    ///
+    /// `surface` (2026-08-24 fix) tags the request + any failure carrier
+    /// with the asking surface (chat vs fable) — the failure queues filter
+    /// on it at drain time.
     pub fn request_delta(
         &self,
         last_exchange: (String, String),
         current_schema: &WorldSchema,
         deferred_attempts: Vec<FailedAttempt>,
+        surface: DeltaSurface,
     ) -> anyhow::Result<mpsc::Receiver<SchemaReply>> {
         let (reply_tx, reply_rx) = mpsc::channel::<SchemaReply>();
         let req = SchemaRequest {
             last_exchange,
+            surface,
             current_schema_json: current_schema.to_json_prompt(),
             deferred_attempts,
             immutable_keys: current_schema.immutable_keys.clone(),
@@ -651,6 +743,7 @@ impl SchemaEngine {
         interval_hours: u32,
         deferred_attempts: Vec<FailedAttempt>,
         designated: Vec<DesignatedSite>,
+        evolution_sites: Vec<EvolutionSite>,
     ) -> anyhow::Result<mpsc::Receiver<SchemaReply>> {
         let (reply_tx, reply_rx) = mpsc::channel::<SchemaReply>();
         let req = WorldProgressionRequest {
@@ -658,6 +751,7 @@ impl SchemaEngine {
             interval_hours,
             deferred_attempts,
             designated,
+            evolution_sites,
             immutable_keys: current_schema.immutable_keys.clone(),
             existing_keys: current_schema.entities.keys().cloned().collect(),
             reply: reply_tx,
@@ -736,10 +830,11 @@ impl SchemaEngine {
         })?;
         tracing::info!("schema engine reuses shared chat model (VRAM-efficient, deduped)");
 
-        // SCHEMA_CTX (2048) is fixed for both Local and API modes: under API
-        // the schema engine only runs as a fallback / silent delta agent, and
-        // 2048 is already the right size for delta work (system instruction +
-        // current schema JSON + last exchange + generation room). See §5.
+        // SCHEMA_CTX is fixed for both Local and API modes: under API
+        // the schema engine only runs as a fallback / silent delta agent.
+        // 8192 (2026-08-24 raise, see settings::CTX_SCHEMA) fits the fattest
+        // path — the world-progression tick — whole, so the middle-drop
+        // never splices the schema JSON the model must diff against. See §5.
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(std::num::NonZeroU32::new(SCHEMA_CTX))
             .with_n_batch(SCHEMA_BATCH)
@@ -784,6 +879,7 @@ impl SchemaRuntime {
             &initial_prompt,
             AttemptSource::Auto {
                 exchange: req.last_exchange.clone(),
+                surface: req.surface,
             },
             &req.deferred_attempts,
             &req.immutable_keys,
@@ -856,6 +952,7 @@ impl SchemaRuntime {
             req.interval_hours,
             &req.deferred_attempts,
             &req.designated,
+            &req.evolution_sites,
         );
         self.generate_with_repair(
             &initial_prompt,
@@ -869,12 +966,14 @@ impl SchemaRuntime {
         )
     }
 
-    /// The shared 3-pass repair loop. Runs the model up to `MAX_DELTA_PASSES`
-    /// times. Each pass parses the output via `SchemaDelta::from_model_output`
-    /// AND validates it via `schema_validator::validate`. A pass succeeds only
-    /// if both parse and validation succeed. Repair prompts accumulate prior
-    /// errors + prior raw outputs so the model sees what it got wrong, not
-    /// just a generic "try again."
+    /// The shared repair loop (2026-08-22 multihog WS5: 2 delta passes +
+    /// full-emit fallback). Runs the model up to `MAX_DELTA_PASSES` times
+    /// in the delta grammar; each pass parses the output via
+    /// `SchemaDelta::from_model_output` AND validates it via
+    /// `schema_validator::validate`. A pass succeeds only if both parse and
+    /// validation succeed. The repair prompt shows the prior errors + raw
+    /// outputs so the model sees what it got wrong. When both delta passes
+    /// fail, the FULL-EMIT FALLBACK runs (see [`full_emit_to_delta`]).
     ///
     /// Returns `AttemptOutcome` (success / parse-or-validation failure /
     /// retryable-failure-with-carrier) so the message handler can build the
@@ -910,7 +1009,38 @@ impl SchemaRuntime {
         // all passes fail.
         let mut errors: Vec<String> = Vec::with_capacity(MAX_DELTA_PASSES as usize);
         let mut raw_outputs: Vec<String> = Vec::with_capacity(MAX_DELTA_PASSES as usize);
-        let mut last_raw = String::new();
+        // (2026-08-23 audit fix) The failure-queue carrier, factored so an
+        // INFRA failure (engine decode error) after retryable parse/
+        // validation failures can still carry them — the old `?` returned
+        // Err and silently discarded the accumulated retryable errors,
+        // thinning the "no world-state evolution is ever silently dropped"
+        // contract. passes_used stays MAX_DELTA_PASSES + 1 (the budget the
+        // caller's MAX_TOTAL_PASSES was sized on).
+        let build_failed_carrier = |raw_outputs: &[String], errors: &[String]| -> AttemptOutcome {
+            let (exchange_opt, trigger_opt, surface) = match &source {
+                AttemptSource::Auto { exchange, surface } => (Some(exchange.clone()), None, *surface),
+                AttemptSource::Translation { request } => {
+                    (None, Some(request.clone()), DeltaSurface::Chat)
+                }
+                AttemptSource::WorldProgression { interval_hours } => (
+                    None,
+                    Some(format!("world progression (~{interval_hours}h elapsed)")),
+                    DeltaSurface::Fable,
+                ),
+            };
+            let joined = errors.join(" | ");
+            AttemptOutcome::Failed {
+                last_raw_output: raw_outputs.last().cloned().unwrap_or_default(),
+                errors: joined.clone(),
+                carrier: FailedAttempt {
+                    exchange: exchange_opt,
+                    trigger: trigger_opt,
+                    errors: joined,
+                    passes_used: MAX_DELTA_PASSES + 1,
+                    surface,
+                },
+            }
+        };
 
         for pass in 1..=MAX_DELTA_PASSES {
             let prompt: String = if pass == 1 {
@@ -924,9 +1054,25 @@ impl SchemaRuntime {
                 // and why, so it can correct the specific issue.
                 render_accumulated_repair_prompt(&raw_outputs, &errors)
             };
-            let raw = self.generate_text(&prompt)?;
+            let raw = match self.generate_text(&prompt) {
+                Ok(r) => r,
+                // Pure infrastructure failure with nothing retryable
+                // accumulated — propagate as infra (the caller restores
+                // priors unbumped).
+                Err(e) if errors.is_empty() => return Err(e),
+                Err(e) => {
+                    tracing::warn!(
+                        label,
+                        pass,
+                        error = %format!("{e:#}"),
+                        "{label} pass {pass} infra failure after retryable failures — carrying for re-attempt"
+                    );
+                    errors.push(format!("pass {pass} infra failure: {e}"));
+                    return Ok(build_failed_carrier(&raw_outputs, &errors));
+                }
+            };
             // Reasoning debug: strip the thought channel BEFORE storing the
-            // raw output into raw_outputs / last_raw. extract_reply_channel
+            // raw output into raw_outputs. extract_reply_channel
             // (the same gate from_model_output uses) drops the
             // `<|channel>thought ... <channel|>` body, so (a) the repair
             // prompt's re-quoted prior outputs never show the model its own
@@ -945,7 +1091,6 @@ impl SchemaRuntime {
                     reasoning.chars().take(600).collect::<String>()
                 );
             }
-            last_raw = reply.clone();
             raw_outputs.push(reply.clone());
 
             // Parse the JSON (channel-protocol + fence strip happens inside
@@ -988,38 +1133,69 @@ impl SchemaRuntime {
             return Ok(AttemptOutcome::Committed { raw_output: reply, delta });
         }
 
-        // All passes exhausted. Build the failure-queue carrier so the caller
-        // can enqueue this for re-attempt on the next turn. The carrier
-        // carries the SOURCE (exchange, request, or progression interval) +
-        // the accumulated errors; it does NOT carry the broken raw outputs
-        // (re-running those through the model rarely helps; fresh context
-        // does). For WorldProgression the trigger is a synthetic string
-        // carrying the interval so the next tick's prompt can re-attempt at
-        // the same magnitude.
-        let (exchange_opt, trigger_opt) = match &source {
-            AttemptSource::Auto { exchange } => (Some(exchange.clone()), None),
-            AttemptSource::Translation { request } => (None, Some(request.clone())),
-            AttemptSource::WorldProgression { interval_hours } => (
-                None,
-                Some(format!("world progression (~{interval_hours}h elapsed)")),
-            ),
+        // (2026-08-22 multihog WS5) FULL-EMIT FALLBACK — after the delta
+        // passes fail, ONE lenient pass asks for a flat entity-key →
+        // COMPLETE-new-value map ("any reasonable shape"), parsed with
+        // maximum tolerance + normalized + diffed in Rust (omitted key =
+        // unchanged, explicit null = delete). A truncated or shape-drifted
+        // output can never mass-delete that way — the safe default is
+        // "unchanged". Entities only: summary/events changes lost to the
+        // failed passes ride the deferred-retry queue below when the
+        // fallback also fails.
+        let fallback_prompt = render_full_emit_prompt(&raw_outputs, &errors);
+        let raw = match self.generate_text(&fallback_prompt) {
+            Ok(r) => r,
+            // Pure infra with no accumulated retryable errors → propagate.
+            Err(e) if errors.is_empty() => return Err(e),
+            Err(e) => {
+                // (2026-08-23 audit fix) Same carry as the pass loop: the
+                // two delta passes' retryable errors must reach the failure
+                // queue even when the fallback decode itself dies.
+                tracing::warn!(
+                    label,
+                    error = %format!("{e:#}"),
+                    "{label} full-emit fallback infra failure — carrying for re-attempt"
+                );
+                errors.push(format!("full-emit fallback infra failure: {e}"));
+                return Ok(build_failed_carrier(&raw_outputs, &errors));
+            }
         };
+        let reply = crate::schema::extract_reply_channel(&raw);
+        match full_emit_to_delta(&reply, immutable_keys, existing_keys) {
+            Ok(delta) => {
+                tracing::info!(
+                    label,
+                    keys = delta.entities.as_ref().map(|m| m.len()).unwrap_or(0),
+                    "{label} recovered via full-emit fallback after {MAX_DELTA_PASSES} delta passes"
+                );
+                return Ok(AttemptOutcome::Committed { raw_output: reply, delta });
+            }
+            Err(e) => {
+                tracing::warn!(label, error = %e, "{label} full-emit fallback failed");
+                errors.push(format!("full-emit fallback: {e}"));
+                // The fallback's own output joins the record so the carrier
+                // below reports it as the last raw output (the pre-closure
+                // behavior).
+                raw_outputs.push(reply.clone());
+            }
+        }
+
+        // All passes exhausted (delta passes + the fallback). Build the
+        // failure-queue carrier so the caller can enqueue this for
+        // re-attempt on the next turn. The carrier carries the SOURCE
+        // (exchange, request, or progression interval) + the accumulated
+        // errors; it does NOT carry the broken raw outputs (re-running
+        // those through the model rarely helps; fresh context does). For
+        // WorldProgression the trigger is a synthetic string carrying the
+        // interval so the next tick's prompt can re-attempt at the same
+        // magnitude.
         tracing::warn!(
             label,
-            passes = MAX_DELTA_PASSES,
+            passes = MAX_DELTA_PASSES + 1,
             errors = errors.join(" | "),
-            "{label} failed all {MAX_DELTA_PASSES} passes; carrying for re-attempt"
+            "{label} failed all passes (incl. full-emit); carrying for re-attempt"
         );
-        Ok(AttemptOutcome::Failed {
-            last_raw_output: last_raw,
-            errors: errors.join(" | "),
-            carrier: FailedAttempt {
-                exchange: exchange_opt,
-                trigger: trigger_opt,
-                errors: errors.join(" | "),
-                passes_used: MAX_DELTA_PASSES,
-            },
-        })
+        Ok(build_failed_carrier(&raw_outputs, &errors))
     }
 
     /// Tokenize → prefill → sample-and-decode a single response. One-shot
@@ -1182,6 +1358,25 @@ pub(crate) fn cap_exchange_chars(s: &str) -> String {
     out
 }
 
+/// (2026-08-24 review) Cap the `FailedAttempt::errors` string folded into a
+/// schema prompt. The errors join every prior pass's failure text and were
+/// rendered UNBOUNDED at three sites (delta + world-progression + the
+/// translation prompt) — with the queue cap of 8 deferred attempts, one
+/// verbose failure family could add thousands of chars to a prompt path
+/// already riding its context ceiling, amplifying the middle-drop risk the
+/// piecewise caps exist to kill. 400 chars keeps the actionable signal (the
+/// error class + key names); same `[…]` marker discipline as the exchange
+/// cap. `pub(crate)` so `fable_command`'s translation prompt shares it.
+pub(crate) fn cap_attempt_error_chars(s: &str) -> String {
+    const CAP: usize = 400;
+    if s.chars().count() <= CAP {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(CAP).collect();
+    out.push_str("[…]");
+    out
+}
+
 /// Render the schema-delta generation prompt. Uses the Gemma4 turn markers so
 /// the model sees familiar structure, but the content is schema-specific.
 /// NOT routed through `ChatFormat::render_prompt`: this is a dedicated
@@ -1218,7 +1413,7 @@ fn render_delta_prompt(
     out.push_str("\n[model]: ");
     out.push_str(&cap_exchange_chars(&last_exchange.1));
     // Deferred re-attempt context. When the previous turn's delta failed all
-    // 3 passes, fold its triggering exchange + accumulated errors in here so
+    // passes, fold its triggering exchange + accumulated errors in here so
     // the model gets another shot with the new exchange as anchor.
     if !deferred_attempts.is_empty() {
         out.push_str(
@@ -1234,7 +1429,7 @@ fn render_delta_prompt(
                 i + 1,
                 u.chars().take(200).collect::<String>(),
                 a.chars().take(200).collect::<String>(),
-                attempt.errors
+                cap_attempt_error_chars(&attempt.errors)
             ));
         }
     }
@@ -1260,11 +1455,48 @@ fn render_delta_prompt(
 /// ticks fold in so the model gets a fresh shot at the same interval. The
 /// validator's immutability check protects against the progression pass
 /// trying to retcon canon entities (locked identity keys).
+/// (2026-08-22 living-world) HARD char budget for the `## DEPARTED SITES`
+/// evolution section (site slices + op grammar + laws). The progression
+/// prompt rides CTX_SCHEMA: it already carries the ~4k-char schema
+/// JSON + instruction + deferred attempts; an unbounded site section would
+/// push the total past the prompt ceiling and the middle-drop would splice a
+/// contiguous band out of the schema JSON the model must diff against (the
+/// exact failure the `SCHEMA_JSON_PROMPT_BUDGET_CHARS` pin exists to kill).
+///
+/// (2026-08-22 calibration) The grammar block alone measures ~740 chars and
+/// each designated site line adds ~95 + its ≤300-char slice, so a realistic
+/// two-site section lands at ~1,530 — the original 1,400 cap truncated the
+/// SECOND site's slice mid-line (potentially through an asset id) on every
+/// tick. 1,700 admitted the realistic composition whole.
+///
+/// (2026-08-23 WS5 recalibration) 1,700 → 1,900: the per-site lines now
+/// build into `section` (the out-push bug fix above — the trim is finally
+/// REAL) and each site may carry `Open threads:` ≤2×120 chars (WS5 causal
+/// ledger), so the realistic two-site worst is ~1,530 + ~500 + pressure
+/// ≈ 1,900. Only degenerate compositions hit the trim, and the whole
+/// section still rides CTX_SCHEMA beside the ~4k-char schema JSON.
+/// (2026-08-24 Part II A2) 1,900 → 2,300: the grammar block gained the
+/// fourth op (add_asset) + the restock/carrier laws (~380 chars), so the
+/// realistic two-site worst moves to ~2,280 — still well under the CTX_SCHEMA
+/// headroom beside the schema JSON (the 2026-08-24 raise to 8192 tokens
+/// gives ~28.5k chars of prompt budget; the composed whole-prompt pin below
+/// is the authoritative guard).
+const SITE_EVOLUTION_PROMPT_BUDGET_CHARS: usize = 2_300;
+/// Per-site slice truncation (ids + doors + states, lean-truncated —
+/// enough for the model to target real asset ids).
+const SITE_EVOLUTION_SLICE_CHARS: usize = 300;
+/// (2026-08-22 multihog WS3) Total `site_pressure` entries the tick apply
+/// accepts per round (the "at most 6" in the instruction — the pair moves
+/// together). Bounded so one enthusiastic pass cannot stuff every node's
+/// pressure queue at once.
+pub const SITE_PRESSURE_MAX_PER_TICK: usize = 6;
+
 fn render_world_progression_prompt(
     current_schema_json: &str,
     interval_hours: u32,
     deferred_attempts: &[FailedAttempt],
     designated: &[DesignatedSite],
+    evolution_sites: &[EvolutionSite],
 ) -> String {
     let mut out = String::with_capacity(2048);
     out.push_str("<|turn>system\n");
@@ -1282,7 +1514,11 @@ fn render_world_progression_prompt(
         "\n\nApproximately {interval_hours} hours of in-world time have elapsed off-screen. \
          Advance the simulation: pick a SUBSET of entities that would plausibly have moved \
          in that window (a faction relocates, an NPC's mood shifts, a deadline approaches, \
-         a rumor spreads, a rival makes a move) and emit ONLY their changed keys."
+         a rumor spreads, a rival makes a move) and emit ONLY their changed keys. \
+         Trends are causal state, not escalation commands: a pressure may intensify, \
+         persist, plateau, fragment, transform, backfire, resolve, or reverse when \
+         causally plausible — reversals need an intelligible macro cause. Avoid both \
+         automatic escalation and arbitrary oscillation."
     ));
     // (2026-08-19 Stale Roulette) The designated-site section — ONE decode,
     // folded into the existing tick pass (not three micro-prompts). The
@@ -1304,11 +1540,107 @@ fn render_world_progression_prompt(
                 d.id,
                 d.elapsed_days
             ));
+            // (2026-08-23 starvation fix) The material-change read: how long
+            // since something LAST HAPPENED here, independent of the
+            // designation rotation. A never-materialized site or a long-idle
+            // one is OVERDUE — the model should prefer it over a
+            // recently-touched neighbor.
+            match d.idle_days {
+                None => out.push_str("; NEVER materialized"),
+                Some(days) if days > 0 => {
+                    out.push_str(&format!("; last material change ~{days} day(s) ago"))
+                }
+                Some(_) => {} // changed within the day — nothing to flag
+            }
             if !d.seeds.is_empty() {
                 out.push_str(&format!("; known: {}", d.seeds.join(" / ")));
             }
+            // (2026-08-22 multihog WS3) The pending-pressure read: the
+            // accumulated intent this pass is asked to honor or evolve past.
+            if !d.pressure.is_empty() {
+                out.push_str(&format!(
+                    "; pending pressure: {}",
+                    d.pressure.join(" / ")
+                ));
+            }
             out.push('\n');
         }
+    }
+    // (2026-08-22 living-world) The departed-site EVOLUTION section — the
+    // constrained mutation pass over mapped interiors the player has left.
+    // HARD-capped at SITE_EVOLUTION_PROMPT_BUDGET_CHARS (see the const's
+    // CTX_SCHEMA guard note).
+    if !evolution_sites.is_empty() {
+        let mut section = String::with_capacity(1_024);
+        section.push_str("\n\n## DEPARTED SITES\n");
+        section.push_str(
+            "These mapped interiors kept moving while the player was elsewhere. You may add a \
+             \"site_ops\" object to your JSON keyed by site id, each value a LIST of ops drawn \
+             from exactly these four forms:\n\
+             {\"op\":\"set_asset\",\"asset\":\"<id>\",\"state\":\"active|dead|taken|triggered|deactivated|fleeing\",\"count\":N,\"detail\":\"...\",\"cause\":\"...\",\"actor\":\"...\"}\n\
+             {\"op\":\"move_asset\",\"asset\":\"<id>\",\"to\":\"<area_id>\",\"cause\":\"...\",\"actor\":\"...\"}\n\
+             {\"op\":\"remove_asset\",\"asset\":\"<id>\",\"cause\":\"...\",\"actor\":\"...\"}\n\
+             {\"op\":\"add_asset\",\"id\":\"<new-id>\",\"name\":\"<name>\",\"kind\":\"creature|group|object|trap|hazard|loot\",\"area\":\"<existing-area-id>\",\"count\":N,\"cause\":\"<why they came>\"}\n\
+             Laws: terminal states are locked (dead stays dead, looted stays looted, disarmed \
+             stays disarmed — carry the aftermath in cause/detail, or remove the remnant); \
+             never invent areas; a new arrival enters only through add_asset. A quiet site \
+             simply gets no entry. \
+             add_asset restocks a vacated site with original dwellers, scavengers, wildlife, \
+             rival delvers, or a cult moving in — whatever the site could plausibly attract \
+             (a sealed tomb does not host a market; arrivals need a way in). \
+             Living occupants act: a group fortifies, forages, buries its dead, \
+             squabbles — carry it in set_asset detail/count or a move; a long \
+             window with several living groups justifies several ops. An asset \
+             moves only along open ways — never across locked or blocked routes. \
+             Moving or removing a carrier moves or drops what it carries.\n",
+        );
+        for site in evolution_sites {
+            let slice: String = site
+                .slice
+                .chars()
+                .take(SITE_EVOLUTION_SLICE_CHARS)
+                .collect();
+            // (2026-08-23 WS5 FIX) Per-site lines build into `section`, NOT
+            // `out` — the original code pushed them to `out`, so the bullets
+            // rendered BEFORE the `## DEPARTED SITES` header and the
+            // whole-section budget trim below could never fire (it only
+            // bounded header+grammar). The trim is now real: the CTX_SCHEMA
+            // middle-drop guard holds by construction.
+            section.push_str(&format!(
+                "- {} (id: {}) — ~{} day(s) since the player's last visit. Current truth: \
+                 {slice}",
+                site.name, site.id, site.elapsed_days
+            ));
+            // (2026-08-22 multihog WS3) Same pending-pressure read: the ops
+            // for this site are asked to honor it (an applied op consumes
+            // the queue at the lib.rs apply).
+            if !site.pressure.is_empty() {
+                section.push_str(&format!(
+                    ". Pending pressure: {}",
+                    site.pressure.join(" / ")
+                ));
+            }
+            // (2026-08-23 WS5) The open causal threads — live plots the pass
+            // is asked to advance or resolve (bounded ≤2×120 chars/site,
+            // pre-rendered by `site_map::render_thread_lines`).
+            if !site.threads.is_empty() {
+                section.push_str(&format!(
+                    ". Open threads: {}",
+                    site.threads.join(" / ")
+                ));
+            }
+            section.push('\n');
+        }
+        // Budget trim: the section is bounded whole (the grammar block is
+        // irreducible; trailing SITES fall off first, oldest-last order
+        // means the stalest — most evolved-worthy — site leads).
+        if section.chars().count() > SITE_EVOLUTION_PROMPT_BUDGET_CHARS {
+            section = section
+                .chars()
+                .take(SITE_EVOLUTION_PROMPT_BUDGET_CHARS)
+                .collect();
+        }
+        out.push_str(&section);
     }
     if !deferred_attempts.is_empty() {
         out.push_str(
@@ -1324,7 +1656,7 @@ fn render_world_progression_prompt(
                 "  {}. prior: {:?}\n      prior errors: {}\n",
                 i + 1,
                 trigger.chars().take(200).collect::<String>(),
-                attempt.errors
+                cap_attempt_error_chars(&attempt.errors)
             ));
         }
     }
@@ -1367,6 +1699,178 @@ fn render_accumulated_repair_prompt(prior_raw: &[String], prior_errors: &[String
     out.push_str("\n---\nNow emit the corrected JSON delta:\n<turn|>\n");
     out.push_str("<|turn>model\n");
     out
+}
+
+/// (2026-08-22 multihog WS5) The full-emit fallback's prompt: after the
+/// delta passes fail, ask for ONE flat JSON object mapping each entity key
+/// the model intends to change → the COMPLETE new value in any reasonable
+/// shape. Deliberately NOT the delta grammar (that just failed twice) — the
+/// simpler emit shape is the point, and Rust-side
+/// [`full_emit_to_delta`] owns the diff semantics. Pure.
+fn render_full_emit_prompt(prior_raw: &[String], prior_errors: &[String]) -> String {
+    let mut out = String::with_capacity(1024 + prior_raw.len() * 256);
+    out.push_str("<|turn>system\n");
+    out.push_str(
+        "Your delta attempts were invalid. Switch format: emit ONLY one flat JSON object \
+         whose keys are the entity keys you intend to CHANGE and whose values are the \
+         COMPLETE new value for each (a string, number, or small object — any reasonable \
+         shape). To delete a key, make its value null. OMIT every unchanged key entirely. \
+         If nothing actually changed, emit {}.",
+    );
+    if crate::settings::THINKING_ENABLED {
+        out.push_str("<|think|>");
+    }
+    out.push_str("<turn|>\n");
+    out.push_str("<|turn>user\n");
+    out.push_str("Prior attempts (for reference only):\n");
+    for (i, raw) in prior_raw.iter().enumerate() {
+        let err = prior_errors.get(i).map(|s| s.as_str()).unwrap_or("(no error recorded)");
+        out.push_str(&format!(
+            "\n--- Attempt {} ({}): {}\n",
+            i + 1,
+            err,
+            raw.chars().take(400).collect::<String>(),
+        ));
+    }
+    out.push_str("\n---\nNow emit the flat key → new-value object:\n<turn|>\n");
+    out.push_str("<|turn>model\n");
+    out
+}
+
+/// (2026-08-22 multihog WS5) Parse + normalize + diff one full-emit output
+/// into a valid [`SchemaDelta`]. Maximum tolerance on the parse (reply
+/// channel → fenced-JSON extraction → `json_repair` → serde, the
+/// `SiteMap::from_model_output` pipeline); STRICT Rust-side semantics on
+/// the diff:
+///
+/// - **Omitted key = unchanged** (the safe default — a truncated output
+///   can never mass-delete).
+/// - **Explicit `null` = delete.**
+/// - String values are control-char-stripped + clamped to the validator's
+///   `MAX_VALUE_LEN` (chars, never bytes); keys clamp at `MAX_KEY_LEN`.
+/// - The constructed delta runs through `schema_validator::validate` —
+///   the immutability lock + count caps are enforced NATURALLY on this
+///   path too, so a fallback can never do what the delta passes couldn't.
+///
+/// Returns `Err(reason)` when the lenient parse yields nothing usable;
+/// the caller carries that into the deferred-retry queue with full-emit
+/// provenance. Pure + unit-tested.
+pub(crate) fn full_emit_to_delta(
+    raw: &str,
+    immutable_keys: &std::collections::HashSet<String>,
+    existing_keys: &std::collections::HashSet<String>,
+) -> Result<SchemaDelta, String> {
+    let reply = crate::schema::extract_reply_channel(raw);
+    let (_prose, bodies) = crate::bracket_parser::extract_fenced_json(&reply);
+    let candidates: Vec<String> = if bodies.is_empty() {
+        vec![reply.trim().to_string()]
+    } else {
+        bodies
+    };
+    let mut parsed: Option<serde_json::Map<String, serde_json::Value>> = None;
+    let mut last_err = "no JSON object found in the full-emit output".to_string();
+    for body in &candidates {
+        let repaired = crate::json_repair::repair(body);
+        match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&repaired) {
+            Ok(map) => {
+                parsed = Some(map);
+                break;
+            }
+            Err(e) => last_err = format!("JSON parse: {e}"),
+        }
+    }
+    let Some(map) = parsed else {
+        return Err(last_err);
+    };
+    let flatten = |v: &str| -> String {
+        v.chars()
+            .map(|c| match c {
+                '\n' | '\r' | '\t' => ' ',
+                _ => c,
+            })
+            .collect()
+    };
+    // (2026-08-23 audit fix) The fallback fires only after the model failed
+    // the delta grammar twice, and the fallback prompt re-quotes those
+    // delta-shaped outputs "for reference" — a model that answers with the
+    // ENVELOPE shape (`{"summary":…, "recent_events":[…], "entities":{…}}`)
+    // used to mint grime entities literally named `summary`/`entities`.
+    // An `entities` value holding an OBJECT is UNWRAPPED (its inner keys
+    // are the flat map we asked for — works for the lone and the mixed
+    // envelope shape); every other reserved envelope key is skipped (their
+    // payloads have no slot in the fallback contract).
+    const RESERVED_ENVELOPE_KEYS: &[&str] = &[
+        "summary",
+        "recent_events",
+        "site_seeds",
+        "site_ops",
+        "site_pressure",
+    ];
+    let mut flat: Vec<(String, serde_json::Value)> = Vec::with_capacity(map.len());
+    for (k, v) in map {
+        if k == "entities" {
+            if let serde_json::Value::Object(inner) = v {
+                for (ik, iv) in inner {
+                    flat.push((ik, iv));
+                }
+            }
+            continue;
+        }
+        flat.push((k, v));
+    }
+    let mut entities: std::collections::HashMap<String, Option<serde_json::Value>> =
+        std::collections::HashMap::new();
+    for (k, v) in flat {
+        let key: String = flatten(k.trim()).chars().take(schema_validator::MAX_KEY_LEN).collect();
+        if key.is_empty() {
+            continue;
+        }
+        if RESERVED_ENVELOPE_KEYS.contains(&key.as_str()) {
+            // Envelope keys are never entities; their payloads (summary
+            // prose, event arrays) have no slot in the fallback contract.
+            continue;
+        }
+        let value = match v {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(s) => {
+                let cleaned = flatten(&s);
+                let cleaned = cleaned.trim();
+                Some(serde_json::Value::String(
+                    cleaned.chars().take(schema_validator::MAX_VALUE_LEN).collect(),
+                ))
+            }
+            other => {
+                // Structured values pass through; `validate` remains the
+                // authority on oversize serializations (an oversize object
+                // fails validation → the deferred-retry path, never a
+                // silent truncation that corrupts structure).
+                let compact = serde_json::to_string(&other).unwrap_or_default();
+                if compact.chars().count() > schema_validator::MAX_VALUE_LEN {
+                    return Err(format!(
+                        "entity {key:?} serializes to {} chars (max {})",
+                        compact.chars().count(),
+                        schema_validator::MAX_VALUE_LEN
+                    ));
+                }
+                Some(other)
+            }
+        };
+        entities.insert(key, value);
+    }
+    if entities.is_empty() {
+        return Err("the full-emit object carried no entity keys".to_string());
+    }
+    let delta = SchemaDelta {
+        entities: Some(entities),
+        ..Default::default()
+    };
+    let ctx = schema_validator::ValidationContext {
+        known_nodes: None,
+        immutable_keys: Some(immutable_keys),
+        existing_keys: Some(existing_keys),
+    };
+    schema_validator::validate(&delta, &ctx).map_err(|f| f.to_string())?;
+    Ok(delta)
 }
 
 /// Cheap content gate for whether the schema delta pass should fire this turn.
@@ -1441,6 +1945,24 @@ pub fn should_fire_delta(user_text: &str, assistant_text: &str) -> bool {
     true
 }
 
+/// The FABLE-side delta gate (2026-08-24 fix — the fable path never fired a
+/// schema delta at all; only the `[TIME]`-gated tick called `apply_delta`,
+/// so `summary`/`recent_events` stayed empty forever on normal turns).
+///
+/// Thin wrapper over [`should_fire_delta`] with the two turn-shape facts the
+/// fable tail knows and the chat gate doesn't:
+/// - a CANCELLED turn never landed — no beat, nothing to record;
+/// - the beat (`parsed.prose`) substitutes for the chat assistant reply.
+///
+/// The wrapper exists so the spawn site stays a one-line read + the gate is
+/// unit-testable without a `fable_send` harness. Pure.
+pub fn fable_delta_should_fire(cancelled: bool, user_action: &str, beat: &str) -> bool {
+    if cancelled {
+        return false;
+    }
+    should_fire_delta(user_action, beat)
+}
+
 const DELTA_SYSTEM_INSTRUCTION: &str = "\
 You are a world-state tracker. Given the current schema and the last exchange, emit ONLY the keys that changed as a JSON delta. Do NOT rewrite unchanged keys.
 
@@ -1476,7 +1998,10 @@ Output format (raw JSON only: no markdown fences, no prose):
   \"summary\": \"<one-line updated arc summary, or omit if unchanged>\",
   \"recent_events\": [\"<new off-screen event>\", ...],
   \"entities\": {\"<key>\": \"<new value>\", \"<key_to_delete>\": null},
-  \"site_seeds\": {\"<designated site id>\": \"<one short line of what changed there>\"}
+  \"site_seeds\": {\"<designated site id>\": \"<one short line of what changed there>\"},
+  \"site_ops\": {\"<departed site id>\": [{\"op\": \"set_asset|move_asset|remove_asset|add_asset\", ...}]},
+  \"site_pressure\": {\"<any known site id>\": \"<one short line of where the site is headed>\"},
+  \"wider_currents\": \"<=160 chars, one regional pattern beyond per-entity deltas\"
 }
 
 Rules:
@@ -1484,15 +2009,37 @@ Rules:
 plausibly moved, emit {}.
 - site_seeds: ONLY for site ids listed under ## DESIGNATED SITES (if any), \
 one short line each; omit the whole object when none moved or none were \
-designated.
+designated. \"Since last touched\" is the designation rotation (every offer \
+resets it); \"last material change\" / \"NEVER materialized\" is how long since \
+something actually happened there. A never-materialized or long-idle site is \
+OVERDUE — prefer planting for it over a recently-changed neighbor.
+- site_ops: ONLY for site ids listed under ## DEPARTED SITES (if any), each \
+value a list of set_asset/move_asset/remove_asset/add_asset ops targeting the asset \
+ids the section shows (add_asset mints a new id); terminal states are locked (dead stays dead, looted \
+stays looted, disarmed stays disarmed); omit the whole object when none \
+moved or none were listed.
+- site_pressure: for any KNOWN site whose situation now points somewhere — \
+designated, departed, or merely mentioned in the world state — one ≤140-char \
+directional line of where it is heading next (a debt comes due, a camp \
+swells, a feud cools). At most 6 entries total; omit the whole object when \
+no site has real momentum. A line already carried as pending pressure is \
+either fulfilled (site_seeds / site_ops answered it) or superseded (emit \
+the newer line instead).
 - entities: a null value means DELETE the key. A non-null string means SET.
 - Pick 1-4 entities to advance per tick — the world moves in small ripples, \
 not wholesale rewrites. Avoid touching the player's direct possessions \
 or immediate scene state (those are the player's bubble).
+- Advance trends causally, not linearly: an established shift may intensify, \
+persist, plateau, fragment, transform, backfire, resolve, or reverse. A \
+reversal needs an intelligible cause visible in the world state; escalation \
+is never the default trajectory.
 - Some entity keys may be flagged immutable (the canonical identity of an NPC, \
 the foundational facts of a location). NEVER overwrite or delete those — \
 record changes under NEW keys instead (e.g. append to a chronicle field).
 - summary: only update when the macro state of the world meaningfully shifts.
+- wider_currents: omit unless a regional pattern BEYOND any single entity's \
+delta genuinely moved (a war's front shifts, a trade route collapses, a \
+season turns); one line of at most 160 chars.
 - recent_events: append a brief note about each off-screen development.\n";
 
 #[cfg(test)]
@@ -1522,6 +2069,7 @@ mod tests {
             trigger: None,
             errors: "pass 1 JSON parse: ... | pass 2 validation: ...".to_string(),
             passes_used: MAX_DELTA_PASSES,
+            surface: DeltaSurface::Chat,
         }];
         let prompt = render_delta_prompt(
             "{\"summary\":\"\"}",
@@ -1547,11 +2095,15 @@ mod tests {
             24,
             &[],
             &[],
+            &[],
         );
         assert!(prompt.contains("world simulation engine"));
         assert!(prompt.contains("24 hours"));
         assert!(prompt.contains("faction.cult.position"));
         assert!(prompt.contains("east_ridge"));
+        // (2026-08-23) The trend-continuity law rides the always-on tick
+        // instruction (escalation is never the default trajectory).
+        assert!(prompt.contains("intensify"));
         assert!(prompt.starts_with("<|turn>system\n"));
         assert!(prompt.ends_with("<|turn>model\n"));
     }
@@ -1565,26 +2117,329 @@ mod tests {
             id: "old-watchtower".into(),
             name: "The Old Watchtower".into(),
             elapsed_days: 30,
+            idle_days: None,
             seeds: vec!["smoke seen on the horizon".into()],
+            pressure: vec![],
         }];
-        let prompt = render_world_progression_prompt("{}", 24, &[], &designated);
+        let prompt = render_world_progression_prompt("{}", 24, &[], &designated, &[]);
         assert!(prompt.contains("## DESIGNATED SITES"), "section missing");
         assert!(prompt.contains("old-watchtower"), "site id missing");
         assert!(prompt.contains("smoke seen on the horizon"), "seed context missing");
         assert!(prompt.contains("site_seeds"), "output contract missing");
         // Without designated sites the section is absent (zero tokens).
-        let bare = render_world_progression_prompt("{}", 24, &[], &[]);
+        let bare = render_world_progression_prompt("{}", 24, &[], &[], &[]);
         assert!(!bare.contains("## DESIGNATED SITES"), "section must be conditional");
+    }
+
+    /// (2026-08-23 starvation fix) The material-change read disambiguates the
+    /// designation rotation from real change: a never-materialized site says
+    /// so, a long-idle one carries its true idle age, and a recently-changed
+    /// one stays quiet. The system instruction teaches the preference.
+    #[test]
+    fn world_progression_prompt_carries_material_idle() {
+        let designated = vec![
+            DesignatedSite {
+                id: "old-watchtower".into(),
+                name: "The Old Watchtower".into(),
+                elapsed_days: 1,
+                idle_days: None,
+                seeds: vec![],
+                pressure: vec![],
+            },
+            DesignatedSite {
+                id: "fen-hollow".into(),
+                name: "Fen Hollow".into(),
+                elapsed_days: 1,
+                idle_days: Some(30),
+                seeds: vec![],
+                pressure: vec![],
+            },
+            DesignatedSite {
+                id: "mill-cross".into(),
+                name: "Mill Cross".into(),
+                elapsed_days: 1,
+                idle_days: Some(0),
+                seeds: vec![],
+                pressure: vec![],
+            },
+        ];
+        let prompt = render_world_progression_prompt("{}", 24, &[], &designated, &[]);
+        assert!(
+            prompt.contains("NEVER materialized"),
+            "the never-materialized flag is the overdue signal: {prompt}"
+        );
+        assert!(
+            prompt.contains("last material change ~30 day(s) ago"),
+            "the idle age must survive the rotation reset: {prompt}"
+        );
+        assert_eq!(
+            prompt.matches("last material change").count(),
+            1,
+            "only the 30-day-idle site carries the idle flag (changed-today stays quiet)"
+        );
+        assert!(
+            prompt.contains("OVERDUE"),
+            "the instruction teaches the preference: {prompt}"
+        );
+        assert!(
+            prompt.contains("every offer resets it"),
+            "the rotation-vs-material distinction is taught"
+        );
+    }
+
+    /// (2026-08-22 multihog WS3) The pending-pressure read rides BOTH site
+    /// sections (designated + departed), and the output contract teaches
+    /// `site_pressure` for any known site.
+    #[test]
+    fn world_progression_prompt_carries_site_pressure() {
+        let designated = vec![DesignatedSite {
+            id: "old-watchtower".into(),
+            name: "The Old Watchtower".into(),
+            elapsed_days: 30,
+            idle_days: None,
+            seeds: vec![],
+            pressure: vec!["the garrison's debt comes due".into()],
+        }];
+        let prompt = render_world_progression_prompt("{}", 24, &[], &designated, &[]);
+        assert!(
+            prompt.contains("pending pressure: the garrison's debt comes due"),
+            "designated pressure missing: {prompt}"
+        );
+        let sites = vec![EvolutionSite {
+            id: "goblin-camp".into(),
+            name: "The Goblin Camp".into(),
+            elapsed_days: 12,
+            slice: "areas=gate:v".into(),
+            pressure: vec!["the warband swells toward thirty".into()],
+            threads: vec![],
+        }];
+        let prompt = render_world_progression_prompt("{}", 24, &[], &[], &sites);
+        assert!(
+            prompt.contains("Pending pressure: the warband swells toward thirty"),
+            "evolution pressure missing: {prompt}"
+        );
+        // The output contract teaches the field (any site, bounded count).
+        assert!(prompt.contains("site_pressure"));
+        assert!(prompt.contains("at most 6 entries"), "the cap is taught");
+        assert_eq!(SITE_PRESSURE_MAX_PER_TICK, 6, "the const matches the taught cap");
+    }
+
+    /// (2026-08-22 living-world) The departed-site EVOLUTION section: renders
+    /// only when mapped departed sites were designated, carries the slice +
+    /// the three-op grammar + the play-canon law, teaches `site_ops`, and
+    /// stays inside the CTX_SCHEMA guard budget.
+    #[test]
+    fn world_progression_prompt_carries_departed_sites() {
+        let sites = vec![EvolutionSite {
+            id: "goblin-camp".into(),
+            name: "The Goblin Camp".into(),
+            elapsed_days: 12,
+            slice: "areas=gate:v doors=pit:open,pit:v assets=shaman:active,warband:deadx4"
+                .into(),
+            pressure: vec![],
+            threads: vec!["Bandit Chief (the player) — killed in the raid [day 2]".into()],
+        }];
+        let prompt = render_world_progression_prompt("{}", 24, &[], &[], &sites);
+        assert!(prompt.contains("## DEPARTED SITES"), "section missing");
+        assert!(prompt.contains("goblin-camp"), "site id missing");
+        assert!(prompt.contains("shaman:active"), "slice (asset ids) missing");
+        assert!(prompt.contains("set_asset"), "op grammar missing");
+        assert!(prompt.contains("move_asset"));
+        assert!(prompt.contains("remove_asset"));
+        // (2026-08-24 Part II A2) The fourth op + its restock law.
+        assert!(prompt.contains("add_asset"), "add_asset op grammar missing");
+        assert!(prompt.contains("vacated site"), "restock law missing");
+        assert!(
+            prompt.contains("Moving or removing a carrier"),
+            "carrier law missing"
+        );
+        assert!(prompt.contains("dead stays dead"), "play-canon law missing");
+        assert!(prompt.contains("site_ops"), "output contract missing");
+        // (2026-08-23) Civilizational activity + open-ways movement laws.
+        assert!(prompt.contains("Living occupants act"), "activity law missing");
+        assert!(prompt.contains("open ways"), "open-ways law missing");
+        // (2026-08-23 WS5) The open causal threads render as live plots…
+        assert!(
+            prompt.contains("Open threads: Bandit Chief"),
+            "thread ledger missing: {prompt}"
+        );
+        // …AFTER the section header (the 2026-08-23 out→section fix).
+        let header_pos = prompt.find("## DEPARTED SITES").expect("header");
+        let thread_pos = prompt.find("Open threads:").expect("threads");
+        assert!(
+            header_pos < thread_pos,
+            "site bullets must follow the section header"
+        );
+        // Conditional: absent without evolution sites (zero tokens).
+        let bare = render_world_progression_prompt("{}", 24, &[], &[], &[]);
+        assert!(!bare.contains("## DEPARTED SITES"), "section must be conditional");
+        // The budget guard: the whole section stays bounded even with
+        // max-length slices + threads (the trim is real — every part of the
+        // section, header, grammar, and site bullets, is inside it).
+        let fat = vec![
+            EvolutionSite {
+                id: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+                name: "N".repeat(60),
+                elapsed_days: 99,
+                slice: "s".repeat(2_000),
+                pressure: vec!["p".repeat(140)],
+                threads: vec!["t".repeat(120), "u".repeat(120)],
+            },
+            EvolutionSite {
+                id: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                name: "M".repeat(60),
+                elapsed_days: 99,
+                slice: "t".repeat(2_000),
+                pressure: vec![],
+                threads: vec![],
+            },
+        ];
+        let prompt = render_world_progression_prompt("{}", 24, &[], &[], &fat);
+        let section = prompt
+            .split("## DEPARTED SITES")
+            .nth(1)
+            .expect("section present");
+        assert!(
+            section.chars().count() <= SITE_EVOLUTION_PROMPT_BUDGET_CHARS + 4,
+            "section must stay inside the CTX_SCHEMA guard budget ({} chars)",
+            section.chars().count()
+        );
+    }
+
+    /// (2026-08-24 review P1) The COMPOSED whole-prompt guard — the missing
+    /// pin the section-level budget above couldn't provide. Every piece of
+    /// the world-progression tick prompt is individually capped (schema JSON
+    /// ≤ `SCHEMA_JSON_PROMPT_BUDGET_CHARS`, evolution section ≤ its own
+    /// budget, deferred errors ≤ 400, triggers ≤ 200), but the 2026-08-24
+    /// measurement showed the TOTAL (instruction 3,557 + JSON 4,000 + framing
+    /// + interval ~500 ≈ 8.1k chars base) overflowed the OLD 2048-token
+    /// context's 1,792-token prompt ceiling even with no optional sections —
+    /// the middle-drop fired on healthy long campaigns. This pin composes
+    /// the worst legal prompt AT the caps and asserts it fits the CURRENT
+    /// context's prompt ceiling on the conservative 3.6 chars/token density
+    /// (the engine's own middle-drop math is token-exact at decode time;
+    /// this is the shipping gate that trips when any piece grows). If this
+    /// fails: shrink a piece or raise CTX_SCHEMA (Chloe's call) — never let
+    /// it ship red.
+    #[test]
+    fn world_progression_prompt_worst_case_fits_schema_context() {
+        // Max-length schema JSON (at the renderer's own budget).
+        let schema_json = "e".repeat(crate::settings::SCHEMA_JSON_PROMPT_BUDGET_CHARS);
+        // Deferred attempts at the lib.rs queue cap, each with a
+        // max-capped error string + max trigger.
+        let deferred: Vec<FailedAttempt> = (0..crate::MAX_FAILED_DELTA_ATTEMPTS)
+            .map(|i| FailedAttempt {
+                exchange: Some((format!("u{i}"), format!("m{i}"))),
+                trigger: Some("t".repeat(200)),
+                errors: "e".repeat(400),
+                passes_used: MAX_DELTA_PASSES,
+                surface: DeltaSurface::Fable,
+            })
+            .collect();
+        // Designated sites with seeds + pressure (the fat shapes).
+        let designated = vec![
+            DesignatedSite {
+                id: "d".repeat(32),
+                name: "N".repeat(60),
+                elapsed_days: 99,
+                idle_days: Some(99),
+                seeds: vec!["s".repeat(140)],
+                pressure: vec!["p".repeat(140)],
+            },
+            DesignatedSite {
+                id: "x".repeat(32),
+                name: "M".repeat(60),
+                elapsed_days: 99,
+                idle_days: None,
+                seeds: vec!["s".repeat(140), "s2".repeat(70)],
+                pressure: vec!["p".repeat(140)],
+            },
+        ];
+        // Evolution sites sized to saturate the section budget (same fat
+        // shape the section-level pin uses).
+        let evolution = vec![
+            EvolutionSite {
+                id: "a".repeat(32),
+                name: "N".repeat(60),
+                elapsed_days: 99,
+                slice: "s".repeat(2_000),
+                pressure: vec!["p".repeat(140)],
+                threads: vec!["t".repeat(120), "u".repeat(120)],
+            },
+            EvolutionSite {
+                id: "b".repeat(32),
+                name: "M".repeat(60),
+                elapsed_days: 99,
+                slice: "t".repeat(2_000),
+                pressure: vec![],
+                threads: vec![],
+            },
+        ];
+        let prompt = render_world_progression_prompt(
+            &schema_json,
+            24,
+            &deferred,
+            &designated,
+            &evolution,
+        );
+        let chars = prompt.chars().count();
+        let max_prompt_tokens = (SCHEMA_CTX as usize).saturating_sub(SCHEMA_MAX_TOKENS as usize);
+        let char_budget = (max_prompt_tokens as f32
+            * crate::settings::TRACKER_PROMPT_CHARS_PER_TOKEN) as usize;
+        assert!(
+            chars <= char_budget,
+            "composed world-progression prompt ({} chars) exceeds the {}-char \
+             budget for CTX_SCHEMA={} − SCHEMA_MAX_TOKENS={} at {} chars/token — \
+             shrink a capped piece or raise CTX_SCHEMA",
+            chars,
+            char_budget,
+            SCHEMA_CTX,
+            SCHEMA_MAX_TOKENS,
+            crate::settings::TRACKER_PROMPT_CHARS_PER_TOKEN
+        );
+    }
+
+    /// (2026-08-24 review) The deferred-error cap: a fat `errors` string must
+    /// render capped with the visible truncation marker in BOTH prompt paths
+    /// (delta + world-progression).
+    #[test]
+    fn deferred_attempt_errors_render_capped() {
+        // 'û' appears nowhere in the prompt prose, so counting it isolates
+        // the rendered error body exactly.
+        let deferred = vec![FailedAttempt {
+            exchange: None,
+            trigger: Some("trigger".into()),
+            errors: "û".repeat(2_000),
+            passes_used: MAX_DELTA_PASSES,
+            surface: DeltaSurface::Chat,
+        }];
+        let tick = render_world_progression_prompt("{}", 24, &deferred, &[], &[]);
+        assert!(
+            tick.matches('û').count() <= 400,
+            "errors must be capped in the tick prompt (got {} chars)",
+            tick.matches('û').count()
+        );
+        assert!(tick.contains("prior errors: ûûûû"), "error head renders");
+        assert!(tick.contains("[…]"), "truncation marker present: {tick:?}");
+        assert!(tick.contains("trigger"), "trigger renders");
     }
 
     #[test]
     fn world_progression_prompt_instructs_off_screen_subset() {
         // Critical framing: the model must advance a SUBSET, not rewrite the
         // world wholesale, and must NOT touch the player's bubble.
-        let prompt = render_world_progression_prompt("{}", 12, &[], &[]);
+        let prompt = render_world_progression_prompt("{}", 12, &[], &[], &[]);
         assert!(prompt.contains("SUBSET"));
         assert!(prompt.contains("off-screen"));
         assert!(prompt.contains("the player's direct possessions"));
+        // (2026-08-24 Part II A1) Trend discipline in the USER prompt — a
+        // pressure may resolve or reverse, escalation is never automatic,
+        // and oscillation is barred.
+        assert!(prompt.contains("escalation"), "trend law missing");
+        assert!(prompt.contains("reverse"), "trend law missing");
+        assert!(prompt.contains("oscillation"), "trend law missing");
+        // (2026-08-24 Part II A6) The wider-currents output contract.
+        assert!(prompt.contains("wider_currents"), "output contract missing");
     }
 
     #[test]
@@ -1592,7 +2447,7 @@ mod tests {
         // The system instruction must warn about immutable keys so the model
         // doesn't try to overwrite canon (the validator catches it, but the
         // instruction prevents wasted passes).
-        let prompt = render_world_progression_prompt("{}", 24, &[], &[]);
+        let prompt = render_world_progression_prompt("{}", 24, &[], &[], &[]);
         assert!(prompt.contains("immutable"));
         assert!(prompt.contains("NEW keys"));
     }
@@ -1606,8 +2461,9 @@ mod tests {
             trigger: Some("world progression (~24h elapsed)".to_string()),
             errors: "pass 1 JSON parse: ... | pass 2 validation: ImmutableKeyOverwrite ...".to_string(),
             passes_used: MAX_DELTA_PASSES,
+            surface: DeltaSurface::Fable,
         }];
-        let prompt = render_world_progression_prompt("{}", 24, &deferred, &[]);
+        let prompt = render_world_progression_prompt("{}", 24, &deferred, &[], &[]);
         assert!(prompt.contains("Previously deferred"));
         assert!(prompt.contains("world progression"));
         assert!(prompt.contains("ImmutableKeyOverwrite"));
@@ -1642,6 +2498,139 @@ mod tests {
         // The full 10KB should not appear; only a 500-char preview.
         assert!(!prompt.contains(&huge));
         assert!(prompt.contains(&"x".repeat(500)));
+    }
+
+    // ---- (2026-08-22 multihog WS5) full-emit fallback ---------------------
+
+    /// The pass contract: exactly 2 delta passes before the fallback, and
+    /// the failure carrier reports 3 (2 delta + 1 full-emit) — the number
+    /// `bump_retry_budget`'s MAX_TOTAL_PASSES = 5 arithmetic was built on.
+    #[test]
+    fn full_emit_pass_contract_is_two_delta_plus_one_fallback() {
+        assert_eq!(MAX_DELTA_PASSES, 2, "2 delta passes, then the fallback");
+        assert_eq!(MAX_DELTA_PASSES + 1, 3, "the carrier's first-enqueue passes_used");
+    }
+
+    /// The fallback prompt asks for the flat key → COMPLETE-new-value shape
+    /// and carries the prior attempts' outputs + errors for reference.
+    #[test]
+    fn full_emit_prompt_render() {
+        let prompt = render_full_emit_prompt(
+            &["{\"entities\": [broken".to_string()],
+            &["pass 1 JSON parse: eof".to_string()],
+        );
+        assert!(prompt.contains("COMPLETE new value"));
+        assert!(prompt.contains("null"));
+        assert!(prompt.contains("OMIT every unchanged key"));
+        assert!(prompt.contains("broken"));
+        assert!(prompt.contains("pass 1 JSON parse"));
+        assert!(prompt.starts_with("<|turn>system\n"));
+        assert!(prompt.ends_with("<|turn>model\n"));
+    }
+
+    /// Diff semantics: omission = unchanged (only emitted keys reach the
+    /// delta), explicit null = delete, string values are control-char
+    /// stripped + clamped, structured values pass through whole.
+    #[test]
+    fn full_emit_diff_semantics() {
+        let immutable = std::collections::HashSet::new();
+        let existing: std::collections::HashSet<String> =
+            ["known.key".to_string()].into_iter().collect();
+        let raw = r#"```json
+{"known.key": "the new truth",
+ "gone.key": null,
+ "structured.key": {"progress": 3, "target": 5},
+ "dirty.key": "line one\nline two\ttabbed",
+ "long.key": "y"}
+```"#;
+        let delta = full_emit_to_delta(raw, &immutable, &existing).expect("parses + validates");
+        let ents = delta.entities.expect("entities present");
+        assert_eq!(ents.len(), 5, "only emitted keys (omission = unchanged)");
+        assert_eq!(
+            ents.get("known.key").and_then(|o| o.as_ref().and_then(|v| v.as_str())),
+            Some("the new truth")
+        );
+        assert_eq!(ents.get("gone.key"), Some(&None), "explicit null = delete");
+        assert_eq!(
+            ents.get("structured.key")
+                .and_then(|o| o.as_ref())
+                .and_then(|v| v.get("progress"))
+                .and_then(|v| v.as_u64()),
+            Some(3),
+            "structured values pass through whole"
+        );
+        assert_eq!(
+            ents.get("dirty.key").and_then(|o| o.as_ref().and_then(|v| v.as_str())),
+            Some("line one line two tabbed"),
+            "control chars flatten inside string values"
+        );
+        // No summary/events on the fallback path (entities only).
+        assert!(delta.summary.is_none());
+        assert!(delta.recent_events.is_none());
+
+        // An oversize STRING clamps to the validator cap (normalization,
+        // not rejection); an oversize STRUCTURED serialization errs so the
+        // deferred-retry path takes it (never a silent structure corrupt).
+        let huge_string = format!("\"{}\"", "v".repeat(schema_validator::MAX_VALUE_LEN + 500));
+        let raw2 = format!("{{\"big.key\": {huge_string}}}");
+        let delta2 = full_emit_to_delta(&raw2, &immutable, &existing).expect("string clamps");
+        let clamped = delta2
+            .entities
+            .unwrap()
+            .get("big.key")
+            .and_then(|o| o.as_ref().and_then(|v| v.as_str()))
+            .unwrap()
+            .to_string();
+        assert_eq!(clamped.chars().count(), schema_validator::MAX_VALUE_LEN);
+    }
+
+    /// The immutability lock is enforced NATURALLY on the fallback path: an
+    /// overwrite of a locked existing key errs with the validator's
+    /// wording, so the fallback can never do what the delta passes couldn't.
+    #[test]
+    fn full_emit_respects_immutability() {
+        let immutable: std::collections::HashSet<String> =
+            ["npc.marcus.core".to_string()].into_iter().collect();
+        let existing: std::collections::HashSet<String> =
+            ["npc.marcus.core".to_string()].into_iter().collect();
+        let raw = r#"{"npc.marcus.core": "retconned"}"#;
+        let err = full_emit_to_delta(raw, &immutable, &existing).expect_err("must refuse");
+        assert!(err.to_lowercase().contains("immutable"), "error explains: {err}");
+        // Unparseable output errs with full-emit provenance for the queue.
+        let err2 = full_emit_to_delta("total garbage [ [ [", &immutable, &existing)
+            .expect_err("must refuse");
+        assert!(err2.contains("JSON parse") || err2.contains("no JSON object"), "{err2}");
+        // An empty object carries nothing → err (the deferred path takes it).
+        let err3 = full_emit_to_delta("{}", &immutable, &existing).expect_err("must refuse");
+        assert!(err3.contains("no entity keys"), "{err3}");
+    }
+
+    /// (2026-08-23 audit fix) The reserved envelope keys are never minted as
+    /// entities: a model answering the fallback in the delta-ENVELOPE shape
+    /// (`{"summary":…, "entities":{…}}`) used to create grime keys literally
+    /// named `summary`/`entities` that ride every later prompt. A lone
+    /// `entities` object unwraps into the flat map we asked for.
+    #[test]
+    fn full_emit_skips_envelope_keys_and_unwraps_entities() {
+        let immutable = std::collections::HashSet::new();
+        let existing: std::collections::HashSet<String> =
+            ["known.key".to_string()].into_iter().collect();
+        // Envelope shape: inner entities survive, envelope keys don't.
+        let raw = r#"{"summary": "the party rested", "recent_events": ["a"], "entities": {"known.key": "v2"}, "site_ops": {}}"#;
+        let delta = full_emit_to_delta(raw, &immutable, &existing).expect("parses");
+        let ents = delta.entities.expect("entities present");
+        assert_eq!(ents.len(), 1, "only the inner entity key survives: {ents:?}");
+        assert!(ents.contains_key("known.key"));
+        // A lone `entities` envelope unwraps.
+        let raw2 = r#"{"entities": {"known.key": "v3"}}"#;
+        let delta2 = full_emit_to_delta(raw2, &immutable, &existing).expect("unwraps");
+        let ents2 = delta2.entities.expect("entities present");
+        assert_eq!(ents2.len(), 1, "{ents2:?}");
+        assert!(ents2.contains_key("known.key"));
+        // Envelope-only output carries NO entities → the deferred path.
+        let raw3 = r#"{"summary": "nothing but prose"}"#;
+        let err = full_emit_to_delta(raw3, &immutable, &existing).expect_err("must refuse");
+        assert!(err.contains("no entity keys"), "{err}");
     }
 
     // The gate is the M2 overhead fix: skip the full local-model forward pass on
@@ -1709,5 +2698,40 @@ mod tests {
     fn gate_skips_short_message_without_pronoun_or_verb_shape() {
         // 3 words, no pronoun, not action-shaped: filler, skip.
         assert!(!should_fire_delta("lol that's funny", "Glad you enjoyed it."));
+    }
+
+    // ---------- fable_delta_should_fire (2026-08-24 fix) ----------
+
+    #[test]
+    fn fable_gate_never_fires_on_cancelled_turn() {
+        // A cancelled turn never landed — no beat exists, no matter what the
+        // half-built prose strings say.
+        assert!(!fable_delta_should_fire(
+            true,
+            "I walk to the harbor district",
+            "The docks creak underfoot as gulls wheel overhead."
+        ));
+    }
+
+    #[test]
+    fn fable_gate_skips_empty_beat() {
+        assert!(!fable_delta_should_fire(false, "I enter the tavern", ""));
+        assert!(!fable_delta_should_fire(false, "I enter the tavern", "   "));
+    }
+
+    #[test]
+    fn fable_gate_fires_on_substantive_turn() {
+        assert!(fable_delta_should_fire(
+            false,
+            "I ask the barkeep about the missing courier",
+            "He lowers his voice and glances at the door before answering."
+        ));
+    }
+
+    #[test]
+    fn fable_gate_inherits_filler_skip() {
+        // The wrapper delegates to the chat gate verbatim: short filler
+        // player actions with no beat substance skip exactly as chat does.
+        assert!(!fable_delta_should_fire(false, "ok", "She waits, patient."));
     }
 }

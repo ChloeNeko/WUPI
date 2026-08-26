@@ -11,6 +11,9 @@
 //              the saves list is newest-first). A saveless session
 //              resumes its live state (sessionId + null saveId).
 //   SAVES    — the existing saves popup, scoped to the session.
+//   BRANCH   — (2026-08-24 Part II D1) fork the playthrough: session
+//              folder + episodic memory partition copy into a fresh
+//              session (non-destructive — no confirm; toast on success).
 //   DELETE   — armed two-click confirm; removes the whole session
 //              folder (the backend refuses the active session).
 // Plus a NEW SESSION button → the new-game flow preset to this card
@@ -21,7 +24,7 @@
 // modal). Esc / backdrop click / ✕ all close.
 // =============================================================
 
-import { listSessions, deleteSession } from '../engine/saves-io.js';
+import { listSessions, deleteSession, branchSession } from '../engine/saves-io.js';
 
 function esc(s) {
   return String(s || '')
@@ -44,9 +47,18 @@ function fmtTime(ms) {
 //   onContinue  — receives the chosen SessionMeta
 //   onOpenSaves — receives the chosen SessionMeta (opens the saves popup)
 //   onNewSession — invoked for the NEW SESSION button
+
+// (2026-08-24 review fix) The ONE sanctioned closer — the npc-dossier
+// pattern. Both the one-at-a-time sweep in open and closeSessionsModal run
+// the live popup's FULL teardown; the old bare `el.remove()` sweeps
+// orphaned the document-capture Esc handler, which later stole an Escape
+// from whatever modal was open next.
+let activeSessionsClose = null;
+
 export function openSessionsModal(host, opts) {
   if (!host) return;
-  // One popup at a time (the raw-editor pattern).
+  // One popup at a time: run the live popup's full teardown first.
+  closeSessionsModal();
   host.querySelectorAll('.fable-sessions-popup-overlay').forEach((el) => el.remove());
 
   const overlay = document.createElement('div');
@@ -78,10 +90,12 @@ export function openSessionsModal(host, opts) {
     if (e.key === 'Escape') { e.stopPropagation(); close(); }
   };
   function close() {
+    if (activeSessionsClose === close) activeSessionsClose = null;
     overlay.removeEventListener('click', onBackdrop);
     document.removeEventListener('keydown', onEsc, { capture: true });
     overlay.remove();
   }
+  activeSessionsClose = close;
   overlay.addEventListener('click', onBackdrop);
   document.addEventListener('keydown', onEsc, { capture: true });
   overlay.querySelector('.fable-sessions-popup-close').addEventListener('click', close);
@@ -95,9 +109,14 @@ export function openSessionsModal(host, opts) {
 
 // Remove any popup living on `host` (renderWorlds calls this on every screen
 // entry — a popup left behind must not cover the grid).
-export function closeSessionsModal(host) {
-  if (!host) return;
-  host.querySelectorAll('.fable-sessions-popup-overlay').forEach((el) => el.remove());
+// (2026-08-24 review fix) Runs the live popup's FULL teardown — the old bare
+// element sweep orphaned the document-capture Esc handler.
+export function closeSessionsModal() {
+  if (activeSessionsClose) {
+    const close = activeSessionsClose;
+    activeSessionsClose = null;
+    close();
+  }
 }
 
 // Render the session rows: name + last-played + save count, with CONTINUE /
@@ -161,6 +180,7 @@ async function renderSessionsList(overlay, opts, close) {
       <div class="fable-session-actions">
         <button class="fable-save-btn" data-act="continue">Continue</button>
         <button class="fable-save-btn" data-act="saves">Saves</button>
+        <button class="fable-save-btn ghost" data-act="branch">Branch</button>
         <button class="fable-save-btn danger" data-act="del">Delete</button>
       </div>
     `;
@@ -171,6 +191,24 @@ async function renderSessionsList(overlay, opts, close) {
     row.querySelector('[data-act="saves"]').addEventListener('click', () => {
       close();
       if (opts.onOpenSaves) opts.onOpenSaves(session);
+    });
+    // (2026-08-24 Part II D1) BRANCH — non-destructive by design (copy,
+    // never move): no confirm, the row disables while it runs, the status
+    // line toasts the new session's name on success.
+    row.querySelector('[data-act="branch"]').addEventListener('click', async (e) => {
+      const btn = e.currentTarget;
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.textContent = 'Branching…';
+      try {
+        const meta = await branchSession(opts.cardId, session.session_id);
+        showStatus(`Branched → ${meta && meta.name ? meta.name : 'new session'}`);
+        renderSessionsList(overlay, opts, close);
+      } catch (err) {
+        showStatus(`Branch failed: ${err}`);
+        btn.disabled = false;
+        btn.textContent = 'Branch';
+      }
     });
     row.querySelector('[data-act="del"]').addEventListener('click', async (e) => {
       const btn = e.currentTarget;

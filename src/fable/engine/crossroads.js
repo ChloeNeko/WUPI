@@ -61,12 +61,16 @@ let deckEscCloser = null;  // transient document listener while deck is open
 
 export function wireCrossroads(next) {
   deps = next;
+  pendingPin = null;        // a fresh wiring starts with no staged DC pin
+  pendingPinText = '';
   closeCrossroadsMenu();
   closeCrossroadsDeck();
 }
 
 export function teardownCrossroads() {
   deps = null;
+  pendingPin = null;        // the stash dies with the stage (the backend
+  pendingPinText = '';      // clears its slot at session boundaries too)
   closeCrossroadsMenu();
   closeCrossroadsDeck();
 }
@@ -235,9 +239,77 @@ function renderDeckCards(el, categoryId, options) {
   body.replaceChildren(grid);
 }
 
+// (2026-08-24 Part II B3) Parse "— [Skill DC N]" out of an option summary.
+// PURE parse (exported for tests); the commit is staged by expandChoice and
+// fired by consumePendingDcPin when the fork is actually SENT.
+export function parseDeclaredDc(summary) {
+  const m = /[—–-]\s*\[\s*([A-Za-z][A-Za-z '-]{1,40}?)\s+DC\s+(\d{1,2})\s*\]/.exec(
+    String(summary || '')
+  );
+  if (!m) return null;
+  const dc = Number(m[2]);
+  if (!Number.isInteger(dc) || dc < 1 || dc > 30) return null;
+  return { skill: m[1].trim(), dc };
+}
+
+// The staged one-shot DC pin (2026-08-24 timing fix). The OLD behavior
+// committed the declared DC to the backend at OPTION CLICK — an abandoned
+// expand (deck closed mid-write, a failed expand) left the pin armed, and
+// the NEXT unrelated matching skill roll inherited the stale DC. Now the
+// pin is only STASHED when a picked option's expand actually LANDS in the
+// composer, and the COMMIT fires from the composer's submit funnel
+// (consumePendingDcPin) at the moment the fork is truly sent — awaited so
+// the pin is armed server-side before the turn's fable_send consumes it.
+let pendingPin = null;       // { skill, dc } | null — stashed at expand landing
+let pendingPinText = '';     // the expanded fork text the stash belongs to
+
+// PURE (exported for tests): should the stashed DC pin ride THIS send? The
+// sent text must still carry the expanded fork's opening line — a player
+// who discarded the fork and typed their own action must not inherit its
+// declared DC.
+export function pinMatchesSentText(sentText, expandedText) {
+  const sent = String(sentText || '').trim();
+  if (!sent) return false;
+  const firstLine = String(expandedText || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .find((l) => l);
+  if (!firstLine) return false;
+  // Case-insensitive: a lightly edited send (retyped casing) keeps lineage.
+  return sent.toLowerCase().includes(firstLine.toLowerCase());
+}
+
+// Called by the composer's submit funnel with the text being sent. Commits
+// the stashed one-shot pin (awaited — the backend must be armed before the
+// same send's fable_send consumes it) only when the sent text still carries
+// the fork; either way the stash is consumed. Best-effort: a rejected arm
+// falls back to the computed DC.
+export async function consumePendingDcPin(sentText) {
+  const pin = pendingPin;
+  const forkText = pendingPinText;
+  pendingPin = null;
+  pendingPinText = '';
+  if (!pin) return;
+  if (!pinMatchesSentText(sentText, forkText)) return;
+  try {
+    await invoke('crossroads_commit_dc', { skill: pin.skill, dc: pin.dc });
+  } catch (err) {
+    // The referee falls back to the computed DC — surface nothing; the
+    // option text still reads exactly as offered.
+    console.warn('[crossroads] DC commit rejected (computed DC applies):', err);
+  }
+}
+
 async function expandChoice(categoryId, opt) {
   if (!deps || !deckEl) return;
   const myEpoch = deckEpoch;
+  // (2026-08-24 Part II B3, timing fix) The declared DC is PARSED at offer
+  // time but committed only when the fork is SENT: the stash below arms
+  // AFTER the expanded text lands in the composer, and the composer's
+  // submit funnel fires consumePendingDcPin. An abandoned expand (deck
+  // closed mid-write / a failed call) never arms — a stale pin can never
+  // poison the next unrelated skill roll.
+  const pin = parseDeclaredDc(opt.summary);
   // The expand veil: the SAME wizard ring, now raised over the filled deck.
   const veil = document.createElement('div');
   veil.className = 'fable-creator-genring';
@@ -258,13 +330,19 @@ async function expandChoice(categoryId, opt) {
       title: opt.title,
       summary: opt.summary,
     });
-    if (myEpoch !== deckEpoch) return; // deck closed mid-expand
+    if (myEpoch !== deckEpoch) return; // deck closed mid-expand — never arm
     closeCrossroadsDeck();
     const input = deps.getInput();
     if (input && typeof text === 'string' && text.trim()) {
       input.value = text.trim();
       deps.onInputChanged();
       input.focus();
+      // Arm the stash ONLY now that the fork actually landed (a later expand
+      // that replaces the composer text re-arms with its own pin).
+      if (pin) {
+        pendingPin = pin;
+        pendingPinText = text.trim();
+      }
     }
   } catch (err) {
     if (myEpoch !== deckEpoch) return;

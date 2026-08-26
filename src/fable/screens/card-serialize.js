@@ -219,7 +219,7 @@ export function serializePlayer(draft) {
   if (equipped) inv.equipped = equipped;
   const accessories = chipList(srcInv.accessories != null ? srcInv.accessories : d.accessories);
   if (accessories) inv.accessories = accessories;
-  const stored = chipList(srcInv.stored != null ? srcInv.stored : d.stored != null ? d.stored : d.gear);
+  const stored = chipList(srcInv.stored != null ? srcInv.stored : d.stored);
   if (stored) inv.stored = stored;
   if (Object.keys(inv).length) player.inventory = inv;
   // Custom extensions: flat string→string map (drop blank keys/values).
@@ -236,8 +236,7 @@ export function serializePlayer(draft) {
 }
 
 // --- Sim Card (the GLM sim wizard's polymorphic Type-Router card) ---------
-// The v2 emitter. `<type>` is ALWAYS "simulation" (the 2026-08-19 rename —
-// the Rust parser normalizes legacy "roleplay" onto it); the discriminator
+// The v2 emitter. `<type>` is ALWAYS "simulation"; the discriminator
 // rides in `<subtype>`. UNVERAL anchors (date/time/weather/tone) + location
 // serialize to the `<world>`/`<location>` SIBLINGS; npc inventory rides the
 // `<inventory>` sibling; everything static (identity traits, persona,
@@ -391,8 +390,7 @@ export function serializeSimCard(f, opts = {}) {
   }
 
   // The npc `<inventory>` sibling: Clothing mandatory, the other lines
-  // omitted when empty (the format rule). Equipped spelled correctly; the
-  // Rust parser also tolerates the example.sim "Equppied" typo.
+  // omitted when empty (the format rule).
   if (subtype === 'npc') {
     const itemList = (v) => {
       const arr = typeof v === 'string' ? v.split(',') : v;
@@ -402,7 +400,7 @@ export function serializeSimCard(f, opts = {}) {
     const clothing = itemList(d.clothing);
     const equipped = itemList(d.equipped);
     const accessories = itemList(d.accessories);
-    const stored = itemList(d.stored != null ? d.stored : d.gear);
+    const stored = itemList(d.stored);
     const invLines = [];
     if (clothing.length) invLines.push(`Clothing: ${clothing.join(', ')}`);
     if (equipped.length) invLines.push(`Equipped: ${equipped.join(', ')}`);

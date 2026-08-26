@@ -4,10 +4,12 @@
 // When a Soul Gem is selected (.is-active), the #inventory-panel-slot reveals
 // above the backpack (the scaffold + positioning are owned by left-drawer.js /
 // soul-gem.js). THIS module owns the CONTENT: it reads the live
-// `player_state.{equipment, belt, pack}` from `fable_schema_get`, aggregates the
-// items for the selected gem's physical category, and renders them as a
-// paginated list of fixed horizontal buttons. Clicking a button opens a sleek
-// contextual action popup (CONSUME / EQUIP / POCKET / STORE / DISCARD).
+// `player_state.{equipment, belt, pouch, pack}` from `fable_schema_get`,
+// aggregates the items for the selected gem's physical category, and renders
+// them as a paginated list of fixed horizontal buttons. Clicking a button
+// opens a sleek contextual action popup (CONSUME / EQUIP / POUCH / STORE /
+// DISCARD). The POUCH dock icon renders this panel with the 'pouch' category
+// (2026-08-23 pouch ruling) — the same UI, the wallet's contents.
 //
 // ── The 6-zone data mapping (Appearance = Inventory) ──────────────
 // Each Soul Gem maps to a physical category. When a gem is active we aggregate
@@ -18,20 +20,23 @@
 //   Head  → hair, face modifiers, neck accessories, helmets, masks, eyewear
 //   Top   → torso gear, shirts, vests, jackets, chest armor
 //   Hand  → held equippables (Main/Off-hand), gauntlets, gloves, rings
-//   Bottom→ pants, leggings, toolbelts, + ALL pocketed items
+//   Bottom→ pants, leggings, toolbelts (the belt quick rack)
 //   Feet  → footwear, boots, foot-jewelry
 //   Inventory → dedicated bagged storage (backpacks, luggage) on the person
 //
 // The Rust model has no explicit "category" tag on items — it has typed SLOTS
-// (Head/Chest/MainHand/OffHand/Legs/Feet) + the two stacks (belt/pack). We map
-// each slot/stack to the gem category it physically belongs to:
+// (Head/Chest/MainHand/OffHand/Legs/Feet) + the three stacks (belt/pouch/pack).
+// We map each slot/stack to the gem category it physically belongs to:
 //
 //   Head gem     ← equipment.head
 //   Top gem      ← equipment.chest
 //   Hand gem     ← equipment.main_hand + equipment.off_hand
-//   Bottom gem   ← equipment.legs + belt (the 4-slot quick rack = pockets/toolbelt)
+//   Bottom gem   ← equipment.legs + belt (the 4-slot quick rack = toolbelt)
 //   Feet gem     ← equipment.feet
 //   Inventory gem← pack (the deep storage = bagged inventory)
+//   POUCH icon   ← pouch (the wallet: coin, keys, ID, small valuables —
+//                  auto-routed at acquisition by the Rust pouch router;
+//                  "pocketing" is retired, 2026-08-23)
 //
 // ── Encumbrance & limits (PERMANENTLY REMOVED 2026-08-09) ──────────
 // The weight/encumbrance system was deleted entirely — no capacity headers, no
@@ -48,23 +53,29 @@
 //             action — the Rust [EQUIP] applier never gate-checked tags, and
 //             tag-gating stranded untagged clothes in the pack with no way
 //             to put them on). Opens the destination sub-menu.
-//   POCKET  — only if the item is pocketable (→ moves to belt)
+//   POUCH   — only if the item is wallet cargo (the Rust `pouch_fit` twin in
+//             engine/pouch.js OR the backend 'pouchable' tag) AND it isn't
+//             already in the pouch (→ moves to the pouch stack)
 //   STORE   — moves the item back to bagged inventory (pack)
 //   DISCARD — always available
-// CONSUME/POCKET stay tag-gated (consumption + pocket-size are intrinsic
-// properties). Tags are read DIRECTLY from the item's backend `tags` array
-// (assigned by the local tracker model via the [EQUIP]/[BELT]/[PACK] tags=
-// field — no client-side name heuristics anywhere; WHERE a garment belongs
-// is decided by the BACKEND router automatically at acquisition, never by
-// this panel). The actions mutate the live WorldSchema via
-// `fable_schema_set` (the user-edit trust path, undoable via
-// fable_rollback), passing an `eventNote` trace that the next narrator turn
-// sees in `<world_state>`'s recent_events. See `readTags` below.
+// CONSUME stays tag-gated (consumption is an intrinsic property); POUCH gates
+// on the shared classifier (same vocabulary the backend routes acquisitions
+// with — never a name heuristic that lives ONLY here). Tags are read DIRECTLY
+// from the item's backend `tags` array (assigned by the local tracker model
+// via the [EQUIP]/[BELT]/[PACK] tags= field); WHERE a garment belongs is
+// decided by the BACKEND router automatically at acquisition, never by this
+// panel. The actions mutate the live WorldSchema via `fable_schema_set` (the
+// user-edit trust path, undoable via fable_rollback), passing an `eventNote`
+// trace that the next narrator turn sees in `<world_state>`'s recent_events.
+// See `readTags` below.
 // =============================================================
 
 import { invoke } from '@tauri-apps/api/core';
 // (2026-08-16 audit M5) isGenerating gate — see the handlers below.
 import * as narrator from './narrator.js';
+// The pouch classifier — the JS twin of Rust equipment::pouch_fit. Gates the
+// manual POUCH action (2026-08-23 pouch ruling).
+import { pouchFits } from './pouch.js';
 // DEV PREVIEW mock: serves a frozen test schema (full inventory) so the Soul
 // Gem inspection panel renders in the no-backend preview. The mock is
 // deep-cloned per read so in-memory edits (handleAction mutates the schema
@@ -72,10 +83,11 @@ import * as narrator from './narrator.js';
 import { isDevPreview, getDevSchema } from './dev-preview-schema.js';
 
 // The gem id → physical category key (mirrors soul-gem.js GEMS ids).
-// `slot` = the typed equipment slot(s); `stack` = 'belt' | 'pack' | null.
+// `slot` = the typed equipment slot(s); `stack` = 'belt' | 'pouch' | 'pack' | null.
 // (2026-08-19 zone sweep) The three new zones live on the nearest existing
 // gem: Neck jewelry shares the head gem, Arms + Hands share the hand gem —
-// no new gems, no HUD change.
+// no new gems, no HUD change. (2026-08-23) The 'pouch' key is the POUCH dock
+// icon's wallet view — not a gem, but the same render path.
 const CATEGORY_MAP = Object.freeze({
   head:      { slots: ['head', 'neck'],               stack: null },
   chest:     { slots: ['chest'],                      stack: null },
@@ -83,18 +95,26 @@ const CATEGORY_MAP = Object.freeze({
   leg:       { slots: ['legs'],                       stack: 'belt' },
   foot:      { slots: ['feet'],                       stack: null },
   pack:      { slots: [],                             stack: 'pack' },
+  pouch:     { slots: [],                             stack: 'pouch' },
 });
 
 // Pagination: exactly 6 buttons visible at once. The viewport is sized to
-// exactly 6 button-heights; a wheel/trackpad scroll is intercepted + advanced
-// by EXACTLY one button height (with scroll-snap as the visual backstop), so
-// the view never shows a partial button + always jumps smoothly by 1.
+// exactly 6 button-heights (+ the track's vertical padding, so the 6th
+// button is FULLY framed — the old height omitted the padding and clipped
+// the 6th button's bottom 8px); a wheel/trackpad scroll is intercepted +
+// advanced by EXACTLY one button height (with scroll-snap as the visual
+// backstop), so the view never shows a partial button + always jumps
+// smoothly by 1.
 const VISIBLE_BUTTONS = 6;
 // The fixed per-button height (px). Must match the CSS .inv-item-btn height +
 // the .inv-track gap. Single source of truth for the scroll-step math.
 const BUTTON_HEIGHT_PX = 46;   // button height
 const BUTTON_GAP_PX = 8;       // vertical gap between buttons
 const BUTTON_SCROLL_STEP = BUTTON_HEIGHT_PX + BUTTON_GAP_PX;
+// The .inv-track's vertical padding (px) — keep in sync with fable.css. The
+// scroll wrapper's fixed height includes BOTH vertical paddings so the
+// framing 8px rides above button 1 + below button 6.
+const TRACK_PAD_PX = 8;
 
 // Module state for the currently-rendered panel. Reset on hide.
 let activeSlotEl = null;       // the .inventory-slot-body we paint into
@@ -106,15 +126,16 @@ let renderSeq = 0;             // render-ownership token (see renderInventoryPan
 
 // ── Normalization: turn the raw schema payload into flat item records ──────
 // A normalized item is { id, name, qty, source, slot, layer, tags } where:
-//   source  — 'equipment' | 'belt' | 'pack' (where it lives)
+//   source  — 'equipment' | 'belt' | 'pouch' | 'pack' (where it lives)
 //   slot    — the EquipSlot id (for equipment items) or null
 //   layer   — 'outer' | 'inner' (for equipment items) or null
-//   tags    — Set of backend-assigned tags: 'consumable' | 'equippable' | 'pocketable'
+//   tags    — Set of backend-assigned tags: 'consumable' | 'equippable' | 'pouchable'
 //             (read DIRECTLY from the item's `tags` array — no name heuristics).
 //             The local tracker model assigns these via the [EQUIP]/[BELT]/
 //             [PACK] tags= field (defined in fable.prompt's AGENT section); the
 //             frontend trusts them verbatim. An item with no tags renders no
-//             CONSUME/EQUIP/POCKET actions (only STORE/DISCARD).
+//             CONSUME actions (only EQUIP/STORE/DISCARD — POUCH additionally
+//             consults the shared name classifier).
 function normalizeItems(gemId, schema) {
   const out = [];
   const cat = CATEGORY_MAP[gemId];
@@ -182,19 +203,23 @@ function normalizeItems(gemId, schema) {
 // it verbatim into a Set of lowercase tag ids. No name-based inference — the
 // tracker is the single classification authority (its rules live in
 // fable.prompt's AGENT section <item_tags>). Items without a tags array get an
-// empty Set (they render no CONSUME/EQUIP/POCKET actions, only STORE/DISCARD).
+// empty Set (they render no CONSUME action, only EQUIP/STORE/DISCARD).
 //
 // The backend enum serializes snake_case: 'consumable' | 'equippable' |
-// 'pocketable'. We normalize defensively (trim + lowercase) so a stray
-// 'Equippable' from a hand-edited save still matches.
+// 'pouchable'. We normalize defensively (trim + lowercase) so a stray
+// 'Equippable' from a hand-edited save still matches. The pre-2026-08-23
+// 'pocketable' spelling maps onto 'pouchable' — old saves keep their meaning
+// (the Rust serde alias does the same server-side).
 function readTags(rawTags) {
   const out = new Set();
   if (!Array.isArray(rawTags)) return out;
   for (const t of rawTags) {
     if (typeof t === 'string') {
       const id = t.trim().toLowerCase();
-      if (id === 'consumable' || id === 'equippable' || id === 'pocketable') {
+      if (id === 'consumable' || id === 'equippable') {
         out.add(id);
+      } else if (id === 'pouchable' || id === 'pouch' || id === 'pocketable' || id === 'pocket') {
+        out.add('pouchable');
       }
     }
   }
@@ -218,8 +243,16 @@ export async function renderInventoryPanel(slotBodyEl, gemId) {
   wheelAccumulator = 0;
   if (!slotBodyEl) return;
 
-  // Loading placeholder (brief — the schema read is fast).
-  slotBodyEl.innerHTML = '<div class="inv-loading">…</div>';
+  // (2026-08-24 flicker fix) DON'T blank an already-painted body to the '…'
+  // placeholder: on a gem switch the fetch is async, and the interim frame
+  // (no .inv-viewport → the panel's black item-box background vanishes, then
+  // returns with the new list) read as a transparency flicker. Keep the
+  // previous list painted until the new one replaces it in one atomic
+  // innerHTML swap. The placeholder only shows on a genuinely empty body
+  // (first reveal), where there's nothing to keep.
+  if (!slotBodyEl.querySelector('.inv-viewport')) {
+    slotBodyEl.innerHTML = '<div class="inv-loading">…</div>';
+  }
 
   let schema = null;
   try {
@@ -252,12 +285,10 @@ export function clearInventoryPanel() {
 // ── Public: is the action popup currently open? ────────────────────────────
 // The popup is appended to document.body (so it can overlay the drawer edge +
 // position freely against the viewport). Moving the mouse from a drawer item
-// button onto the popup crosses the drawer's boundary → the drawer's mouseleave
-// auto-close fires → the unlocked drawer yanks in mid-click (the user was
-// reaching for CONSUME/EQUIP/etc.). stage.js wires this as a probe into
-// left-drawer's onDrawerMouseLeave (mirroring the edgeLockVisible pattern) so
-// the drawer holds while the popup is open + closes on the next genuine
-// mouseleave after the popup dismisses.
+// button onto the popup travels past the left drawer's close distance —
+// stage.js's distance auto-close + window-exit sweep consult this probe so
+// the drawer holds while the popup is open, then closes on the next genuine
+// move clear of the drawer after the popup dismisses.
 export function isActionPopupOpen() {
   return popupEl !== null;
 }
@@ -275,17 +306,32 @@ function paintPage(bodyEl) {
 
   const total = currentItems.length;
   if (total === 0) {
-    paintEmpty(bodyEl, 'Nothing here.');
+    // (2026-08-25 Chloe) The no-items state is the single dull-bronze word
+    // "EMPTY" (see .inv-empty in fable.css) — not a sentence.
+    paintEmpty(bodyEl, 'EMPTY');
     return;
   }
 
   bodyEl.innerHTML = '';
 
+  // The scroll scaffolding: a fixed-size WRAPPER (its height set inline; it
+  // is the flex child that shrinks when the slot is max-height-capped by the
+  // astrolabe clamp) containing the scroll VIEWPORT (absolute inset 0 — it
+  // tracks the wrapper's box exactly) + the two more-content hints. The
+  // hints live in the WRAPPER, never the viewport: absolutely-positioned
+  // children of a scroll container scroll WITH the content, so a hint inside
+  // the viewport would ride away on the very first step. In the wrapper they
+  // stay pinned to the list's visible top/bottom edges.
+  const wrap = document.createElement('div');
+  wrap.className = 'inv-scroll-wrap';
+  // Fixed height = exactly 6 buttons + the track's vertical framing padding.
+  // Overflow clips at the wrapper so a partial extra button never peeks; the
+  // JS step-scroll owns all motion.
+  wrap.style.height = (2 * TRACK_PAD_PX + VISIBLE_BUTTONS * BUTTON_HEIGHT_PX
+    + (VISIBLE_BUTTONS - 1) * BUTTON_GAP_PX) + 'px';
+
   const viewport = document.createElement('div');
   viewport.className = 'inv-viewport';
-  // Fixed viewport height = exactly 6 buttons. Overflow hidden so a partial
-  // 7th button never peeks; the JS step-scroll owns all motion.
-  viewport.style.height = (VISIBLE_BUTTONS * BUTTON_HEIGHT_PX + (VISIBLE_BUTTONS - 1) * BUTTON_GAP_PX) + 'px';
 
   const track = document.createElement('div');
   track.className = 'inv-track';
@@ -294,13 +340,48 @@ function paintPage(bodyEl) {
     track.appendChild(buildItemButton(item));
   }
   viewport.appendChild(track);
-  bodyEl.appendChild(viewport);
+
+  // ── More-content hints (2026-08-25 Chloe) ──────────────────────────────
+  // >6 items (or a clamped viewport): a small brass chevron + fade band at
+  // the very BOTTOM signals more below; once you scroll down, a matching
+  // chevron appears at the very TOP — in the middle, both show (more up AND
+  // down). Pure feedback: pointer-events none, visibility driven by the
+  // viewport's own scroll events (programmatic step-scroll fires them).
+  const hintTop = document.createElement('div');
+  hintTop.className = 'inv-scroll-hint inv-scroll-hint--top';
+  hintTop.setAttribute('aria-hidden', 'true');
+  const hintBottom = document.createElement('div');
+  hintBottom.className = 'inv-scroll-hint inv-scroll-hint--bottom';
+  hintBottom.setAttribute('aria-hidden', 'true');
+  wrap.appendChild(viewport);
+  wrap.appendChild(hintTop);
+  wrap.appendChild(hintBottom);
+  bodyEl.appendChild(wrap);
+
+  const updateHints = () => {
+    const max = viewport.scrollHeight - viewport.clientHeight;
+    if (max <= 1) {
+      hintTop.classList.remove('is-on');
+      hintBottom.classList.remove('is-on');
+      return;
+    }
+    hintTop.classList.toggle('is-on', viewport.scrollTop > 1);
+    hintBottom.classList.toggle('is-on', viewport.scrollTop < max - 1);
+  };
+  viewport.addEventListener('scroll', updateHints, { passive: true });
+  updateHints();
 
   // ── One-button-per-scroll wheel handling ────────────────────────────────
   // Native wheel scrolling is suppressed; we accumulate deltaY until it crosses
   // one step threshold, then advance the scrollTop by exactly one button+gap in
   // the sign direction. This guarantees "scrolling jumps smoothly by exactly 1
   // button per scroll gap" regardless of trackpad inertia / mouse notch size.
+  // (2026-08-24 scroll fix) The VIEWPORT is the scroll container — it is the
+  // element with a bounded height + overflow:hidden (the track is neither).
+  // The old code called track.scrollTo(), a no-op on a non-scroll-container,
+  // so lists longer than 6 items simply never scrolled. All scroll math
+  // (scrollTop / scrollTo / scrollHeight clamp) reads the viewport; the snap
+  // CSS moved onto the viewport to match (see fable.css .inv-viewport).
   wheelAccumulator = 0;
   const WHEEL_STEP_THRESHOLD = 40; // px of accumulated delta → 1 button step
   let smoothScrolling = false;
@@ -308,10 +389,10 @@ function paintPage(bodyEl) {
     if (smoothScrolling) return false;
     smoothScrolling = true;
     const target = Math.max(0, Math.min(
-      track.scrollHeight - viewport.clientHeight,
-      track.scrollTop + dir * BUTTON_SCROLL_STEP
+      viewport.scrollHeight - viewport.clientHeight,
+      viewport.scrollTop + dir * BUTTON_SCROLL_STEP
     ));
-    track.scrollTo({ top: target, behavior: 'smooth' });
+    viewport.scrollTo({ top: target, behavior: 'smooth' });
     // Re-enable once the smooth scroll settles (~250ms). The transitionend of
     // the scroll isn't reliably fired; a timeout matching the smooth duration
     // is the robust gate.
@@ -481,11 +562,13 @@ function paintEmpty(bodyEl, msg) {
 // outside or pressing Esc closes it. The popup has TWO views that swap in
 // place (reusing the same element so the open-animation + position persist):
 //
-//   MAIN view — the contextual actions, gated on the item's backend tags:
+//   MAIN view — the contextual actions, gated on the item's backend tags +
+//   the shared pouch classifier:
 //     CONSUME — tags has 'consumable'
-//     EQUIP   — tags has 'equippable' (opens the SUB view, doesn't mutate)
-//     POCKET  — tags has 'pocketable' AND item isn't already in belt
-//     STORE   — item isn't already in pack
+//     EQUIP   — ALWAYS offered (opens the SUB view, doesn't mutate)
+//     POUCH   — wallet cargo (tags has 'pouchable' OR pouchFits(name)) AND
+//               the item isn't already in the pouch stack
+//     STORE   — item isn't already in pack (moves to bagged inventory)
 //     DISCARD — always
 //
 //   SUB view (EQUIP destinations) — opens when the player clicks EQUIP. Shows
@@ -588,7 +671,18 @@ function renderPopupActions(popup, item, bodyEl) {
   // action (see the header note). The tag gate stranded untagged clothes in
   // the pack with no UI path onto the body.
   actions.push({ key: 'equip', label: 'EQUIP' });
-  if (item.tags.has('pocketable') && item.source !== 'belt') actions.push({ key: 'pocket', label: 'POCKET' });
+  // (2026-08-23 pouch ruling) POUCH replaces POCKET: wallet cargo moves into
+  // the pouch stack. (2026-08-24 review P2) The gate is the classifier ALONE —
+  // the exact `pouchFits` vocabulary the backend routes every acquisition
+  // through (`stash_target`/the PACK applier). The old `tags.has('pouchable')
+  // ||` OR-gate diverged from the backend (which never consults the tag): a
+  // tagged-but-guarded name ("Healing Potion" — 'potion' vetoes) could be
+  // manually pouched while every later acquisition of the same name kept
+  // routing to the pack, stacking twins across the two containers. Never
+  // offered on an item already living in the pouch.
+  if (pouchFits(item.name) && item.source !== 'pouch') {
+    actions.push({ key: 'pouch', label: 'POUCH' });
+  }
   if (item.source !== 'pack') actions.push({ key: 'store', label: 'STORE' });
   actions.push({ key: 'discard', label: 'DISCARD' });
 
@@ -817,9 +911,11 @@ async function performAction(action, item, bodyEl) {
       // just removes + the narrator learns the item was consumed.
       mutated = removeItem(ps, item);
       verb = 'consumed ' + item.name;
-    } else if (action === 'pocket') {
-      mutated = moveToStack(ps, item, 'belt');
-      verb = 'pocketed ' + item.name;
+    } else if (action === 'pouch') {
+      // (2026-08-23 pouch ruling) POUCH replaces POCKET — wallet cargo moves
+      // into the pouch stack (the wallet), not the belt.
+      mutated = moveToStack(ps, item, 'pouch');
+      verb = 'pouched ' + item.name;
     } else if (action === 'store') {
       mutated = moveToStack(ps, item, 'pack');
       verb = 'stored ' + item.name;
@@ -932,10 +1028,11 @@ function mergeOrPushStack(list, entry) {
 // the handler just fetched (null for equipment origins / missing stacks).
 // (2026-08-16 bug 7) The render-time `item` can be stale — the panel doesn't
 // re-render while open, so a tracker turn that consumed copies mid-panel
-// used to be reverted on the next POCKET/STORE/EQUIP (the render-time
-// qty/stats/tags rode back in).
+// used to be reverted on the next POUCH/STORE/EQUIP (the render-time
+// qty/stats/tags rode back in). (2026-08-23) The pouch is a stack source
+// like belt/pack.
 function findFreshStack(ps, item) {
-  if (item.source !== 'belt' && item.source !== 'pack') return null;
+  if (item.source !== 'belt' && item.source !== 'pouch' && item.source !== 'pack') return null;
   const arr = ps[item.source];
   if (!Array.isArray(arr)) return null;
   return arr.find((s) => s && s.name === item.name) || null;
@@ -968,7 +1065,7 @@ function removeItem(ps, item, count = 1) {
       }
       return true;
     }
-  } else if (item.source === 'belt' || item.source === 'pack') {
+  } else if (item.source === 'belt' || item.source === 'pouch' || item.source === 'pack') {
     const arr = ps[item.source];
     if (Array.isArray(arr)) {
       // (P2 fix) NEVER splice by the render-time index (`pack:2`): handlers
@@ -1174,21 +1271,22 @@ function moveToEquipmentSlot(ps, item, dest) {
   return true;
 }
 
-// Move an item to belt or pack. Mutates `ps`; returns true if moved. Tags ride
-// forward so the item keeps its classification at the new location. (#68)
-// `stats` + the real `weight` ride forward too — the old rebuild dropped
-// both, so an equipped item STOREd/POCKETed lost its stats until re-authored.
+// Move an item to a stack (belt, pouch, or pack). Mutates `ps`; returns true
+// if moved. Tags ride forward so the item keeps its classification at the new
+// location. (#68) `stats` + the real `weight` ride forward too — the old
+// rebuild dropped both, so an equipped item STOREd/POUCHed lost its stats
+// until re-authored.
 // (2026-08-16 bug 7) The re-inserted entry's shape resolves from the FRESH
 // source stack, never the render-time item — the panel doesn't re-render
 // while open, so a tracker turn that consumed copies mid-panel used to be
-// reverted on POCKET/STORE (the stale render-time qty rode back in).
+// reverted on POUCH/STORE (the stale render-time qty rode back in).
 function moveToStack(ps, item, target) {
   if (!Array.isArray(ps[target])) ps[target] = [];
   let qty = 1;
   let weight = typeof item.weight === 'number' ? item.weight : 1.0;
   let stats = item.stats || undefined;
   let tags = tagsArray(item);
-  if (item.source === 'belt' || item.source === 'pack') {
+  if (item.source === 'belt' || item.source === 'pouch' || item.source === 'pack') {
     // Stack origin: move the WHOLE live stack (all copies) — resolve its
     // current shape from the fresh schema, then remove the entry outright.
     const arr = ps[item.source];

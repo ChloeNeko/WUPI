@@ -10,7 +10,7 @@
 // On `ready`, the draft loads into an in-screen review card (with a
 // portrait slot → cropper + a corner pencil → edit popup). CREATE
 // serializes via card-serialize.js + writes through the existing IPCs
-// (fable_player_write / fable_write_card / fable_card_sibling_write /
+// (fable_player_write / fable_write_card /
 // fable_card_portrait_write). Mechanical integrity stays in JS/Rust —
 // Prime-Mandate compliant.
 //
@@ -33,7 +33,7 @@
 // the ring (a whole book overflows the API payload budget).
 // =============================================================
 
-import { invoke, Channel, convertFileSrc } from '@tauri-apps/api/core';
+import { invoke, Channel } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { openPortraitCropper } from './portrait-cropper.js';
 import { bytesToBase64, ARROW_SVG_LEFT } from './wizard-engine.js';
@@ -67,6 +67,19 @@ const GREETINGS = {
   sim: "Start by telling me whether your SIM Card is a character, a scenario, or perhaps a whole new world? Describe your SIM Card in detail, you may be as descriptive or vague as you'd like and I'll help guide you.",
   codex: "The CODEX is the facts of the simulation which is unique to your SIM Card only. This information can be accessed at any time by your narrator. You may start by giving me a detailed list or vague ideas and I'll help you craft the lore.",
 };
+
+// (2026-08-24 fix) GLM's ask `message` is schema-typed string, but the model
+// occasionally emits a number/array — the old `(env.message || '').trim()`
+// THREW on those inside the turn handler, `setBusy(false)` never ran, and
+// the wizard wedged behind the typing veil / bronze ring. Same coercion
+// discipline as creator-engine's local `toText` (that one is deliberately
+// unexported; this mirrors it).
+function envMessageText(v) {
+  if (v == null || typeof v === 'boolean') return '';
+  if (Array.isArray(v)) return v.map(envMessageText).filter(Boolean).join(', ');
+  if (typeof v === 'object') return '';
+  return String(v).trim();
+}
 
 // (2026-08-18 Chloe) Imports are ONE-SHOT conversions, not interviews. The
 // single user turn below replaces the gathering conversation: GLM must map
@@ -192,7 +205,7 @@ export function renderCreatorChat(root, config) {
   // review card lands — the corner pencil is the change path. The chat
   // surface survives only as the fallback (GLM asks anyway / a failure / the
   // review ‹ back).
-  const importOrigin = !!config.presetImportData && !config.seedDraft;
+  const importOrigin = !!config.presetImportData;
   // `importConvert` is the one-shot conversion PHASE flag — cleared the
   // moment the conversion's review card lands (showReview). After that, a
   // pencil-edit cancel/ask/unparseable/api_lost must flow the NORMAL review
@@ -212,7 +225,7 @@ export function renderCreatorChat(root, config) {
   // pencil-edit `done` must route through the NORMAL ready path, never back
   // into the batch handler. loreImported records the run's ORIGIN for the
   // edit-snapshot rule after the run object is gone.
-  let loreRun = (config.presetLorebook && creatorKind === 'codex' && !config.seedDraft
+  let loreRun = (config.presetLorebook && creatorKind === 'codex'
     && Array.isArray(config.presetLorebook.entries) && config.presetLorebook.entries.length)
     ? {
       name: config.presetLorebook.name || 'Imported lorebook',
@@ -308,33 +321,11 @@ export function renderCreatorChat(root, config) {
   reviewEl.innerHTML = '';
   inputEl.value = '';
   inputEl.disabled = false;
-  // The greeting opens the conversation unless an initial message is supplied,
-  // a seed draft is provided (edit mode skips straight to the review card), or
-  // this is an import run (no chat at all — the one-shot/batched conversion
+  // The greeting opens the conversation unless an initial message is supplied
+  // or this is an import run (no chat at all — the one-shot/batched conversion
   // fires at the render tail below).
-  if (!loreRun && !importConvert && !config.initialMessage && !config.seedDraft) {
+  if (!loreRun && !importConvert && !config.initialMessage) {
     appendBubble(messagesEl, 'assistant', GREETINGS[creatorKind] || GREETINGS.player);
-  }
-  // Edit mode: a pre-seeded draft (e.g. editing a saved player) loads straight
-  // into the review card — CREATE to save the edits, Edit to modify via chat.
-  if (config.seedDraft) {
-    Object.assign(state.draft, config.seedDraft);
-    showReview();
-    // (2026-08-15 audit fix) Edit-run portrait preview: flowEditPlayer passes
-    // no presetPortraitDataUrl, so the review card opened with an empty
-    // portrait slot even when the saved player HAS one. Load it via the same
-    // fable_player_get the picker uses (its `portrait` is a raw absolute path
-    // — must go through convertFileSrc) + re-render the still-open review.
-    // fable.js is deliberately untouched (another agent's file).
-    if (creatorKind === 'player' && !state.portraitPreview && config.seedDraft.id) {
-      invoke('fable_player_get', { id: config.seedDraft.id })
-        .then((full) => {
-          if (root._creatorEpoch !== epoch || !full || !full.portrait) return;
-          state.portraitPreview = convertFileSrc(full.portrait);
-          if (!reviewEl.hidden) showReview();
-        })
-        .catch(() => { /* no portrait / IPC failure — empty slot is fine */ });
-    }
   }
 
   const setBusy = (b) => {
@@ -620,12 +611,7 @@ export function renderCreatorChat(root, config) {
     if (env.action === 'ready') {
       // The gate: no incomplete draft ever shows the review card. Runs on the
       // merged draft (accumulated across turns + seed/import presets).
-      // (P2 parity fix) Edit runs (seedDraft) are EXEMPT — a legacy player
-      // saved before `body_type` was promoted could never re-save: every
-      // pencil-edit `ready` was rejected → two corrective retries
-      // re-interviewing for fields the user never touched. doCreate's
-      // backstop carries the same exemption.
-      const missing = config.seedDraft ? [] : missingMandatoryFields(creatorKind, state.draft);
+      const missing = missingMandatoryFields(creatorKind, state.draft);
       if (missing.length) {
         rejectReady(missing, bubble, editMode);
         return;
@@ -636,7 +622,7 @@ export function renderCreatorChat(root, config) {
         setBusy(false);
       } else {
         bubble.setTyping(false);
-        bubble.update(env.message || 'Here is what I have — review it below.');
+        bubble.update(envMessageText(env.message) || 'Here is what I have — review it below.');
         showReview();
         setBusy(false);
       }
@@ -645,7 +631,7 @@ export function renderCreatorChat(root, config) {
       const qText = Array.isArray(env.questions) && env.questions.length
         ? '\n\n' + env.questions.map((q) => `• ${q}`).join('\n')
         : '';
-      const askText = (env.message || '').trim() + qText;
+      const askText = envMessageText(env.message) + qText;
       if (editMode) {
         endEditGen();
         if (importConvert) {
@@ -894,7 +880,7 @@ export function renderCreatorChat(root, config) {
     // conversion phase flag / lore run object clear at completion. Codex
     // drafts get a larger cap (an imported lorebook's entries are the
     // substance being edited).
-    if (config.seedDraft || importOrigin || loreImported) {
+    if (importOrigin || loreImported) {
       try {
         let snapshot = JSON.stringify(state.draft, null, 2) || '';
         const cap = creatorKind === 'codex' ? 20000 : 6000;
@@ -1039,24 +1025,17 @@ export function renderCreatorChat(root, config) {
       // Final backstop: the ready gate should make this unreachable, but a
       // seeded/edited draft could still sneak a gap through — never WRITE an
       // incomplete card. Surfaces on the review card via the catch below.
-      // (P2 fix) SKIPPED for edit runs (seedDraft): a legitimately-saved
-      // legacy player missing optional fields could otherwise never re-save
-      // ("Create failed … fix the concept" with no field editor).
-      const missing = config.seedDraft ? [] : missingMandatoryFields(creatorKind, state.draft);
+      const missing = missingMandatoryFields(creatorKind, state.draft);
       if (missing.length) {
         const labels = missing.map((k) => MANDATORY_LABELS[k] || k).join(', ');
         throw new Error(`the draft is missing mandatory fields: ${labels}`);
       }
       // (P1 fix) Duplicate-name guard: both write IPCs are silent atomic
       // OVERWRITES — a CREATE reusing an existing slug replaced the prior
-      // card/player (authored content lost, its saves orphaned). Edit runs
-      // (seedDraft present) re-save the same entity and are exempt — but
-      // ONLY while the write target is still the seeded entity's own id:
-      // the target is re-derived from the possibly-RENAMED draft, and a
-      // pencil-edit that renames "Kael" onto an existing "Nyx" would
-      // silently destroy that player (the exact loss this guard prevents).
-      // The decision lives in creator-engine (shouldRejectDuplicateName)
-      // so it's unit-testable.
+      // card/player (authored content lost, its saves orphaned). (The old
+      // seedDraft edit-run exemption is gone with the edit runs themselves —
+      // every write from this screen is a fresh CREATE.) The decision lives
+      // in creator-engine (shouldRejectDuplicateName) so it's unit-testable.
       if (creatorKind === 'player' || creatorKind === 'sim') {
         const target = creatorKind === 'player'
           ? serializePlayer(state.draft).id
@@ -1065,7 +1044,6 @@ export function renderCreatorChat(root, config) {
           // The folder fallback MUST match or state splits into a phantom
           // folder the id can never load (2026-08-16 audit low).
           : (slugify(state.draft.name || '') || 'unknown');
-        const seededId = config.seedDraft ? config.seedDraft.id : undefined;
         let existingIds = [];
         try {
           const existing = creatorKind === 'player'
@@ -1073,37 +1051,14 @@ export function renderCreatorChat(root, config) {
             : (await invoke('fable_cards_list'));
           existingIds = (existing || []).map((m) => m.id);
         } catch (_) { /* list IPC failure → skip the guard (the write may still fail server-side) */ }
-        if (shouldRejectDuplicateName(target, seededId, existingIds) && !mintedIds.has(target)) {
+        if (shouldRejectDuplicateName(target, undefined, existingIds) && !mintedIds.has(target)) {
           throw new Error(`a ${creatorKind === 'player' ? 'player' : 'world'} named "${state.draft.name || target}" already exists — choose a different name`);
         }
       }
       if (creatorKind === 'player') {
         const { id, player } = serializePlayer(state.draft);
-        // (2026-08-15 audit fix) Edit-run identity preservation:
-        // serializePlayer builds a fresh object modeling only the wizard's
-        // fields — re-saving an EDIT silently dropped identity-file keys it
-        // doesn't model (notably `portrait`, killing load_player_portrait).
-        // Merge forward every key the serializer didn't set from the stored
-        // player JSON (fetch via fable_player_get, same source the picker
-        // lazy-loads portraits from); serializer-set keys always win.
-        if (config.seedDraft && config.seedDraft.id) {
-          try {
-            const existing = await invoke('fable_player_get', { id: config.seedDraft.id });
-            if (existing && typeof existing === 'object') {
-              for (const [k, v] of Object.entries(existing)) {
-                if (!(k in player) && k !== 'id') player[k] = v;
-              }
-            }
-          } catch (_) { /* unreadable prior entity — write the fresh form */ }
-        }
         trace(`serializePlayer → id=${id} fields=[${Object.keys(player).join(',')}]`);
-        // (2026-08-15 audit fix) Rename-on-edit cleanup: pass the SEEDED id
-        // (the entity's old id) as the write's `id` param so the backend's
-        // rename branch fires (old folder → new slug, portrait rides along).
-        // The fresh-derived id made `slug == id` always true, so the old
-        // folder was silently orphaned on every rename edit.
-        const writeId = (config.seedDraft && config.seedDraft.id) ? config.seedDraft.id : id;
-        const meta = await invoke('fable_player_write', { id: writeId, player });
+        const meta = await invoke('fable_player_write', { id, player });
         mintedIds.add(meta.id);
         if (state.portraitBytes) {
           await invoke('fable_player_portrait_upload_bytes', {
@@ -1114,27 +1069,14 @@ export function renderCreatorChat(root, config) {
         trace(`saved player id=${meta.id}`);
         if (onCreated) onCreated({ playerId: meta.id, draft: state.draft });
       } else if (creatorKind === 'sim') {
-        // (2026-08-20 rename ruling) Edit runs PIN the loaded card's id: a
-        // rename is a display-name-only change. The id — and everything
-        // keyed off it (folder, saves/, .codex, memory partition, .lnk
-        // target) — survives; the backend keeps the existing folder for a
-        // known id (renamingId contract). The old flow re-minted the id
-        // from the new name and DELETED the old card afterward, destroying
-        // the campaign's saves + codex + memories on every rename.
-        const pinnedId = (config.seedDraft && config.seedDraft.id) ? config.seedDraft.id : null;
-        const { xml, intro } = serializeSimCard(state.draft, { pinnedId });
+        const { xml, intro } = serializeSimCard(state.draft);
         const stem = slugify(state.draft.name || '') || 'unknown';
-        trace(`serializeSimCard → stem=${stem} id=${pinnedId || '(fresh)'} xml=${xml.length}b intro=${intro ? intro.length + 'b' : 'none'}`);
+        trace(`serializeSimCard → stem=${stem} xml=${xml.length}b intro=${intro ? intro.length + 'b' : 'none'}`);
         // `<intro>` is embedded AFTER </sim_card> in the XML itself
         // (2026-08-13), so fable_write_card carries it — no separate .intro
         // sibling-file write.
-        const meta = await invoke('fable_write_card', { stem, xml, renamingId: pinnedId });
+        const meta = await invoke('fable_write_card', { stem, xml });
         mintedIds.add(meta.id);
-        if (pinnedId && meta.id !== pinnedId) {
-          // Defensive trace only — with the pinned id + the backend contract
-          // this indicates a parse drift, NEVER a reason to delete anything.
-          trace(`note: written id=${meta.id} differs from pinned=${pinnedId}`);
-        }
         if (state.portraitBytes) {
           await invoke('fable_card_portrait_write', {
             cardId: meta.id,
@@ -1186,9 +1128,9 @@ export function renderCreatorChat(root, config) {
   } else if (config.initialMessage) {
     inputEl.value = config.initialMessage;
     send();
-  } else if (!config.seedDraft) {
-    // No edit-mode review + no auto-send: focus the textarea so the user can
-    // start typing immediately (zero manual click on entry).
+  } else {
+    // No auto-send: focus the textarea so the user can start typing
+    // immediately (zero manual click on entry).
     inputEl.focus();
   }
 }

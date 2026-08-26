@@ -43,7 +43,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BracketCommand {
-    /// An NPC spoke. `npc_id` matches a card's `start_npc_ids`. `line` is
+    /// An NPC spoke. `npc_id` names a registered NPC. `line` is
     /// the prose between the open and close tags.
     CharacterTurn { npc_id: String, line: String },
     /// An object's state changed.
@@ -298,6 +298,11 @@ pub enum BracketCommand {
         npc_id: String,
         item_name: String,
         qty: u32,
+        /// See `Pack::qty_given` — (2026-08-22 second playtest pass) an
+        /// explicit qty token asserts "the stack is now N" on a name the
+        /// NPC already holds (the applier restates instead of stacking);
+        /// the parser-defaulted 1 without a token is "no count given".
+        qty_given: bool,
         remove: bool,
         item_tags: Vec<equipment::ItemTag>,
     },
@@ -342,11 +347,15 @@ pub enum BracketCommand {
     /// `[PROMISE <npc_id> -<description>]` (fulfilled/reneged — v1 removes
     /// with no history). The applier resolves the npc_id through the
     /// registry (the PRESENCE gate) + Rust tracks the frustration curve.
+    /// (2026-08-25 quest anchors) `area=<area_id>` may ride the body — the
+    /// site-map room the obligation targets (the map's scroll marker);
+    /// excluded from the description text.
     Promise {
         npc_id: String,
         description: String,
         deadline_minutes: i64,
         remove: bool,
+        area: String,
     },
 
     /// (2026-08-20 Economy) `[LEDGER <op> …]` — the money & management
@@ -402,6 +411,81 @@ pub enum BracketCommand {
         /// the applier owns the insufficient-funds reject.
         wealth_delta: i32,
     },
+
+    /// (2026-08-22 living-world) `[REST]` — a genuine sleep or long
+    /// recuperation ended this turn. BARE form only (no payload). Consumed
+    /// by `apply_time_command_and_maybe_tick` (NOT the bracket applier) so
+    /// the anchor stamps on the POST-`[TIME]` clock — the morning after
+    /// the sleep, not the evening before. Prefix-safe vs ROOM/RUMOR
+    /// (diverges at char 2).
+    Rest,
+
+    /// (2026-08-22 living-world) `[ARCANA <label>]` — narration first
+    /// named the world's arcane resource ("mana", "biotics", "rage"):
+    /// activates the dormant pool. Afterwards `[ARCANA +1]` / `[ARCANA -1]`
+    /// steps the grade (recover/drain). No JSON dual-parse (the ROOM/
+    /// ASSET/PROMISE precedent).
+    Arcana {
+        /// The diegetic resource label (activation form; empty on step
+        /// forms). ≤24 chars.
+        label: String,
+        /// Signed step count (±1 clamped to ±4 — the grade ladder's span).
+        /// 0 = a pure activation/re-assertion.
+        delta: i32,
+    },
+
+    /// (2026-08-22 living-world) `[QUEST new|update|done|fail …]` — the
+    /// quest & objective verb (the LEDGER flat-payload pattern). See
+    /// [`QuestOp`]. No JSON dual-parse. (2026-08-25 quest anchors) The
+    /// new/update forms carry an OPTIONAL `area=<area_id>` — the site-map
+    /// room the objective targets (the map's scroll marker); update with
+    /// `area=` alone is a pure re-anchor.
+    Quest {
+        op: QuestOp,
+        quest_id: String,
+        giver: String,
+        title: String,
+        objective: String,
+        objective_done: bool,
+        cur: u32,
+        total: u32,
+        deadline_minutes: i64,
+        reward: String,
+        area: String,
+    },
+
+    /// (2026-08-22 multihog WS1) `[EXPIRY <target> | <time-body>]` — arm a
+    /// timed lapse on an entity key or a site asset. `target` is an entity
+    /// key (no `@`) or `<asset-id>@<node-id>` (empty node half → the
+    /// current node's map, resolved at apply). `minutes` carries the
+    /// absolute epoch-minute for absolute bodies; `relative` marks a `+N`
+    /// body the APPLY resolves against the live clock (the parser is
+    /// clock-blind by design, the `[TIME]` separation). No JSON dual-parse
+    /// (the ROOM/ASSET/PROMISE precedent).
+    Expiry { target: String, minutes: i64, relative: bool },
+
+    /// (2026-08-22 multihog WS2) `[UNLOCK <area_id>]` — the narrated
+    /// opening of a barred way: flips `Locked → Open` on the reciprocal
+    /// connection pair from the player's current area. An already-Open
+    /// connection is a no-op at the apply; `Blocked` refuses (an
+    /// obstruction needs physical change, never a key). V1 philosophy: the
+    /// LOCK is the anti-hallucination gate, UNLOCK trusts narrated
+    /// fiction (referee-gated lockpicking is a deferred follow-up).
+    Unlock { area_id: String },
+}
+
+/// (2026-08-22 living-world) The `[QUEST]` sub-verbs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum QuestOp {
+    /// `[QUEST new <id> giver=<g> <title> | <minutes>] (reward=<text>)`.
+    New,
+    /// `[QUEST update <id> <objective> (cur=N total=M)]` /
+    /// `[QUEST update <id> done <objective>]`.
+    Update,
+    /// `[QUEST done <id>]` — completed (removed; v1 keeps no history).
+    Done,
+    /// `[QUEST fail <id>]` — failed/abandoned (removed).
+    Fail,
 }
 
 /// (2026-08-20 Economy) The `[LEDGER]` sub-operation discriminator.
@@ -442,6 +526,11 @@ pub enum AssetMutation {
     Active,
     Known,
     Suspected,
+    /// (2026-08-22 living-world) A trap/mechanism disarmed — terminal
+    /// under the play-canon locks (`site_map::canon_transition`).
+    Deactivated,
+    /// (2026-08-22 living-world) A creature/group broke off (transient).
+    Fleeing,
     /// Set a Group's member count (1–99; the applier rejects non-Groups).
     Count(u32),
     /// The add-form: mint a new asset. `kind` is the raw word
@@ -470,6 +559,42 @@ pub struct ParsedNarration {
 
 /// Parse a narrator's complete raw output into commands + cleaned prose.
 ///
+/// The B8 same-turn dedup's equality: exact `PartialEq`, except BELT/PACK
+/// compare with the `asserted` provenance marker normalized away. The
+/// 2026-08-22 playtest marker differs BY SYNTAX for the same intent — a
+/// bare text body (`[PACK name=Gold qty=5]`) is `asserted: true` (the
+/// full-list restatement form) while the fenced-JSON dual is always
+/// `asserted: false` (an explicit structured add) — so exact equality
+/// stopped collapsing a bracket + its JSON dual and the pair double-
+/// applied (the exact bug B8 exists to kill). `asserted` says HOW the
+/// command was spelled, not WHAT it means; the FIRST occurrence stands,
+/// and the text bracket sorts first in emission order, so the collapsed
+/// survivor keeps the idempotent restatement semantics.
+fn dedup_equivalent(seen: &BracketCommand, cmd: &BracketCommand) -> bool {
+    match (seen, cmd) {
+        (BracketCommand::Belt { .. }, BracketCommand::Belt { .. })
+        | (BracketCommand::Pack { .. }, BracketCommand::Pack { .. }) => {
+            let mut normalized = cmd.clone();
+            match (&mut normalized, seen) {
+                (
+                    BracketCommand::Belt { asserted, .. },
+                    BracketCommand::Belt { asserted: seen_asserted, .. },
+                )
+                | (
+                    BracketCommand::Pack { asserted, .. },
+                    BracketCommand::Pack { asserted: seen_asserted, .. },
+                ) => {
+                    *asserted = *seen_asserted;
+                }
+                // Guarded by the outer match arm — same variant on both sides.
+                _ => unreachable!("dedup_equivalent matched Belt/Pack pair"),
+            }
+            normalized == *seen
+        }
+        _ => seen == cmd,
+    }
+}
+
 /// The output is the verbatim text the model emitted (Gemma4 channel
 /// protocol is stripped upstream by `chat_format::extract_reply_channel` or
 /// equivalent; this function sees pure narrator text).
@@ -482,6 +607,10 @@ pub struct ParsedNarration {
 /// `CHARACTER_TURN` is the only multi-region command (open + body + close).
 /// `OBJECT` and `FX` are single-region. This keeps the parser linear and
 /// the brackets-plus-prose invariant simple.
+///
+/// The B8 same-turn dedup below compares through [`dedup_equivalent`] —
+/// exact `PartialEq` except that BELT/PACK ignore the `asserted`
+/// provenance marker.
 pub fn parse(raw: &str) -> ParsedNarration {
     // Bug A fix (2026-07-28): pre-extract fenced JSON blocks BEFORE the
     // bracket scan. Modern instruct-tuned models reach for JSON when they
@@ -599,11 +728,11 @@ pub fn parse(raw: &str) -> ParsedNarration {
     // identical duplicate commands in a single turn are loop residue with
     // near-certainty, so the FIRST occurrence stands and the rest drop
     // (position-independent: the loop's repeats can interleave with other
-    // commands; n is tiny per turn, the contains() scan is free).
+    // commands; n is tiny per turn, the scan is free).
     // Near-duplicates (different qty/stance/id) pass through untouched.
     let mut deduped: Vec<BracketCommand> = Vec::with_capacity(commands.len());
     for cmd in commands {
-        if !deduped.contains(&cmd) {
+        if !deduped.iter().any(|seen| dedup_equivalent(seen, &cmd)) {
             deduped.push(cmd);
         }
     }
@@ -919,6 +1048,74 @@ const PROMISE_DEADLINE_MAX: i64 = 100_000;
 /// (2026-08-19 Hidden site maps) The `[ROOM]`/`[ASSET]` id caps (kebab ids
 /// are short by construction; `clean_free_text` enforces).
 pub const SITE_AREA_ID_MAX: usize = 64;
+/// (2026-08-22 living-world) The `[QUEST]` text caps — a title names the
+/// thread, an objective is one countable act, a reward is a phrase.
+const QUEST_TITLE_MAX: usize = 120;
+const QUEST_OBJ_MAX: usize = 160;
+const QUEST_REWARD_MAX: usize = 160;
+/// (2026-08-22 living-world) The `[QUEST]` deadline-window clamp (the
+/// `PROMISE_DEADLINE_MAX` discipline — the applier adds it to `now`).
+const QUEST_DEADLINE_MAX: i64 = 100_000;
+/// (2026-08-22 living-world) The `[ARCANA]` label cap ("biotics" fits;
+/// a sentence does not). `pub(crate)`: `PlayerState`'s prompt render runs
+/// the SAME gate on labels loaded from hand-edited saves.
+pub(crate) const ARCANA_LABEL_MAX: usize = 24;
+/// (2026-08-22 multihog WS1) The `[EXPIRY]` target cap — an entity key or
+/// an `<asset-id>@<node-id>` pair (two kebab ids + the separator; 160
+/// admits both at their 64-char ceilings with room).
+const EXPIRY_TARGET_MAX: usize = 160;
+/// (2026-08-22 multihog WS1) The `[EXPIRY]` relative-window clamp (the
+/// `PROMISE_DEADLINE_MAX` discipline — the applier adds it to `now`, so an
+/// unclamped hallucinated astronomically-large `+N` would overflow i64
+/// there).
+const EXPIRY_RELATIVE_MAX: i64 = 100_000;
+/// (2026-08-24 fix) The `[EFFECT]` duration clamp (the `PROMISE_DEADLINE_MAX`
+/// discipline — the applier computes `now + duration`, so a hallucinated
+/// astronomically-large number must not overflow / effectively-mint a
+/// permanent condition). ~69 in-world days, same ceiling as the promise/
+/// quest/expiry windows.
+const EFFECT_DURATION_MINUTES_MAX: i64 = 100_000;
+
+/// (2026-08-24 fix) One `[EFFECT]` duration token, TEXT path: tolerant of
+/// float numbers (the model emits `60.5`), floored to whole minutes,
+/// clamped to [`EFFECT_DURATION_MINUTES_MAX`]. A POSITIVE fraction
+/// (`0.5`) floors UP to 1 — flooring it to 0 would mint the PERMANENT
+/// sentinel off a positive value, and only explicit 0 / null / absence
+/// means permanent. Negative / non-finite / non-numeric → `None` (reject
+/// the bracket — the malformed-value style — NEVER a silent `0`).
+fn parse_effect_duration(raw: &str) -> Option<i64> {
+    let minutes = raw.parse::<f64>().ok()?;
+    if !minutes.is_finite() || minutes < 0.0 {
+        return None;
+    }
+    let floored = minutes.floor();
+    if floored == 0.0 && minutes > 0.0 {
+        return Some(1);
+    }
+    Some(floored.min(EFFECT_DURATION_MINUTES_MAX as f64) as i64)
+}
+
+/// (2026-08-24 fix) One `[EFFECT]` duration value, JSON path: explicit
+/// `null` → `Some(0)` (the permanent sentinel — null IS the explicit
+/// permanent choice); any number (int or float) floors + clamps like the
+/// text path (a positive fraction floors UP to 1); anything else → `None`
+/// (reject). The old `.and_then(as_i64).unwrap_or(0)` turned EVERY
+/// unparseable value — `60.5` floats included — into a permanent
+/// condition.
+fn json_effect_duration(v: &serde_json::Value) -> Option<i64> {
+    if v.is_null() {
+        return Some(0);
+    }
+    let minutes = v.as_f64()?;
+    if !minutes.is_finite() || minutes < 0.0 {
+        return None;
+    }
+    let floored = minutes.floor();
+    if floored == 0.0 && minutes > 0.0 {
+        return Some(1);
+    }
+    Some(floored.min(EFFECT_DURATION_MINUTES_MAX as f64) as i64)
+}
 
 /// Parse the optional `key=value` tail of a `[DISCOVER node_id ...]` bracket.
 /// Recognized keys: `name` (diegetic label — may contain spaces when quoted),
@@ -1106,6 +1303,19 @@ fn remove_form_name(body: &str) -> String {
         .to_string()
 }
 
+/// (2026-08-24 review fix) Strip mangled EDGE quotes from an `[APPEARANCE]`
+/// value. The E4B's quoting slips (`[APPEARANCE hair_color="raven black"]`)
+/// stored the literal quote chars verbatim into `current_appearance_deltas`,
+/// where every `<world_state>` render re-quotes them forever. Mirrors
+/// `clean_item_name`'s edge set (ASCII + typographic) with appearance-value
+/// semantics: prose is otherwise untouched (no whitespace collapse, no
+/// fragment floor); an all-quotes value cleans to empty = the clear
+/// sentinel.
+fn strip_appearance_edge_quotes(value: &str) -> &str {
+    const EDGE_QUOTES: &[char] = &['"', '\'', '“', '”', '‘', '’'];
+    value.trim_matches(|c| EDGE_QUOTES.contains(&c))
+}
+
 /// Parse the `key=value` (or bare `key`) tail of an `[APPEARANCE ...]`
 /// bracket. Returns `None` for unknown keys, empty keys, or contaminated /
 /// oversize values (dropped silently — same leniency as every other parser).
@@ -1119,7 +1329,7 @@ fn parse_appearance_kv(rest: &str) -> Option<BracketCommand> {
     // Split on the FIRST `=` so values may themselves contain `=` (rare but
     // cheap to handle correctly). No-`=` → bare clear form.
     let (key_raw, value) = match rest.split_once('=') {
-        Some((k, v)) => (k.trim(), v.trim().to_string()),
+        Some((k, v)) => (k.trim(), strip_appearance_edge_quotes(v.trim()).to_string()),
         None => (rest.trim(), String::new()),
     };
     if key_raw.is_empty() {
@@ -1308,6 +1518,36 @@ fn parse_equip(rest: &str) -> Option<BracketCommand> {
     })
 }
 
+/// (2026-08-24 fix) Normalize full-width digits ０-９ (U+FF10..=U+FF19) to
+/// ASCII — the model occasionally emits them in qty tokens, where a strict
+/// u64 parse then failed. Pure.
+fn normalize_fullwidth_digits(s: &str) -> String {
+    if !s.chars().any(|c| ('０'..='９').contains(&c)) {
+        return s.to_string();
+    }
+    s.chars()
+        .map(|c| match c {
+            '０'..='９' => char::from(b'0' + (c as u32 - '０' as u32) as u8),
+            _ => c,
+        })
+        .collect()
+}
+
+/// (2026-08-24 fix) One qty token for the BELT/PACK/NPC_ITEM add forms:
+/// full-width digits normalize FIRST, then the strict integer parse
+/// (u64 + saturate at `u32::MAX` — the 2026-08-16 overflow rule). A token
+/// that STILL fails (`1.5`, `１．５`, `1O`) returns `None` and the caller
+/// DROPS the qty clause (qty keeps its additive default, `qty_given` stays
+/// false): the old `.unwrap_or(1)` + `qty_given = true` pairing restated a
+/// ×50 stack to ×1 — REPLACE semantics off a malformed number. A malformed
+/// number must never clobber an existing stack.
+fn parse_qty_token(v: &str) -> Option<u32> {
+    normalize_fullwidth_digits(v.trim())
+        .parse::<u64>()
+        .ok()
+        .map(|n| n.min(u32::MAX as u64) as u32)
+}
+
 /// `[BELT name=<item> (qty=N) (stats=<...>)]` (add) or `[BELT -name]` (remove).
 /// The remove form is a leading `-` on the name token. qty defaults to 1; an
 /// explicit 0 is treated as remove (the applier routes it through the remove
@@ -1364,14 +1604,16 @@ fn parse_belt(rest: &str) -> Option<BracketCommand> {
                 // (2026-08-16 audit LOW) Parse u64 + saturate — the JSON
                 // dual's rule: "4294967297" used to fail u32 parsing and
                 // silently land on qty=1.
-                qty = v
-                    .parse::<u64>()
-                    .map(|n| n.min(u32::MAX as u64) as u32)
-                    .unwrap_or(1);
-                qty_given = true;
-                if qty == 0 {
-                    qty_zero_remove = true;
-                    qty = 1;
+                // (2026-08-24 fix) A token that still fails strict parse
+                // (floats, full-width garbage) DROPS the qty clause —
+                // additive semantics — instead of asserting qty=1.
+                if let Some(n) = parse_qty_token(&v) {
+                    qty = n;
+                    qty_given = true;
+                    if qty == 0 {
+                        qty_zero_remove = true;
+                        qty = 1;
+                    }
                 }
             }
             "stats" | "stat" => stats = v,
@@ -1467,14 +1709,15 @@ fn parse_pack(rest: &str) -> Option<BracketCommand> {
                 // dead branch that added 1 instead).
                 // (2026-08-16 audit LOW) u64 parse + saturate, the JSON
                 // dual's rule (an overflowing count used to land on qty=1).
-                qty = v
-                    .parse::<u64>()
-                    .map(|n| n.min(u32::MAX as u64) as u32)
-                    .unwrap_or(1);
-                qty_given = true;
-                if qty == 0 {
-                    qty_zero_remove = true;
-                    qty = 1;
+                // (2026-08-24 fix) Malformed tokens drop the clause (the
+                // parse_qty_token contract) — additive, never replace-with-1.
+                if let Some(n) = parse_qty_token(&v) {
+                    qty = n;
+                    qty_given = true;
+                    if qty == 0 {
+                        qty_zero_remove = true;
+                        qty = 1;
+                    }
                 }
             }
             "weight" | "lbs" | "w" => {
@@ -1563,6 +1806,7 @@ fn parse_npc_item(rest: &str) -> Option<BracketCommand> {
             npc_id,
             item_name: n,
             qty: 0,
+            qty_given: false,
             remove: true,
             item_tags: Vec::new(),
         });
@@ -1572,19 +1816,22 @@ fn parse_npc_item(rest: &str) -> Option<BracketCommand> {
     let kvs = tokenize_kv(body);
     let mut name = String::new();
     let mut qty: u32 = 1;
+    let mut qty_given = false;
     let mut qty_zero_remove = false;
     let mut tags_str = String::new();
     for (k, v) in kvs {
         match k.as_str() {
             "name" | "item" => name = v,
             "qty" | "count" | "n" => {
-                qty = v
-                    .parse::<u64>()
-                    .map(|n| n.min(u32::MAX as u64) as u32)
-                    .unwrap_or(1);
-                if qty == 0 {
-                    qty_zero_remove = true;
-                    qty = 1;
+                // (2026-08-24 fix) The shared tolerant qty token — malformed
+                // numbers drop the clause (additive), never replace-with-1.
+                if let Some(n) = parse_qty_token(&v) {
+                    qty = n;
+                    qty_given = true;
+                    if qty == 0 {
+                        qty_zero_remove = true;
+                        qty = 1;
+                    }
                 }
             }
             "tags" | "tag" => tags_str = v,
@@ -1604,6 +1851,7 @@ fn parse_npc_item(rest: &str) -> Option<BracketCommand> {
         npc_id,
         item_name: n,
         qty,
+        qty_given,
         remove: qty_zero_remove,
         item_tags: equipment::parse_tag_list(&tags_str),
     })
@@ -1976,15 +2224,18 @@ fn json_to_effect(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Br
         return None;
     }
 
-    let duration_minutes = obj
+    // (2026-08-24 fix) Tolerant duration: explicit null/absence → 0 (the
+    // PERMANENT sentinel — an authored choice, never a parse fallback); a
+    // number (int OR float) floors + clamps via `json_effect_duration`;
+    // any other shape rejects the bracket.
+    let duration_minutes = match obj
         .get("duration_minutes")
         .or_else(|| obj.get("duration"))
         .or_else(|| obj.get("effect_duration_minutes"))
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
-    if duration_minutes < 0 {
-        return None;
-    }
+    {
+        None => 0,
+        Some(v) => json_effect_duration(v)?,
+    };
 
     let polarity = obj
         .get("polarity")
@@ -2043,16 +2294,20 @@ fn json_to_time(obj: &serde_json::Map<String, serde_json::Value>) -> Option<Brac
 }
 
 fn json_to_milestone(obj: &serde_json::Map<String, serde_json::Value>) -> Option<BracketCommand> {
-    let npc_id = obj
-        .get("npc_id")
-        .or_else(|| obj.get("npc"))
-        .and_then(|v| v.as_str())?
-        .to_string();
-    let event_id = obj
-        .get("event_id")
-        .or_else(|| obj.get("event"))
-        .and_then(|v| v.as_str())?
-        .to_string();
+    // (2026-08-24) Same single-line gate as the TASK dual — the id renders
+    // into narrator-facing [DIRECTIVE] lines; a newline could forge one.
+    let npc_id = clean_free_text(
+        obj.get("npc_id")
+            .or_else(|| obj.get("npc"))
+            .and_then(|v| v.as_str())?,
+        NODE_ID_MAX,
+    );
+    let event_id = clean_free_text(
+        obj.get("event_id")
+            .or_else(|| obj.get("event"))
+            .and_then(|v| v.as_str())?,
+        NODE_ID_MAX,
+    );
     if npc_id.trim().is_empty() || event_id.trim().is_empty() {
         return None;
     }
@@ -2277,6 +2532,9 @@ fn json_to_appearance(obj: &serde_json::Map<String, serde_json::Value>) -> Optio
         .unwrap_or("")
         .trim()
         .to_string();
+    // (2026-08-24 review fix) Same mangled-quote strip as the text form —
+    // the JSON duals carry the E4B's quoting slips too.
+    let value = strip_appearance_edge_quotes(&value).to_string();
     if !value.is_empty() {
         if value.chars().count() > APPEARANCE_VALUE_MAX {
             return None;
@@ -2634,12 +2892,13 @@ fn json_to_npc_item(obj: &serde_json::Map<String, serde_json::Value>) -> Option<
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let item_name = clean_item_name(name_raw)?;
-    let mut qty = obj
+    let qty_opt = obj
         .get("qty")
         .or_else(|| obj.get("count"))
         .and_then(|v| v.as_u64())
-        .map(|n| n.min(u32::MAX as u64) as u32)
-        .unwrap_or(1);
+        .map(|n| n.min(u32::MAX as u64) as u32);
+    let qty_given = qty_opt.is_some();
+    let mut qty = qty_opt.unwrap_or(1);
     let mut remove = obj
         .get("remove")
         .and_then(|v| v.as_bool())
@@ -2652,6 +2911,7 @@ fn json_to_npc_item(obj: &serde_json::Map<String, serde_json::Value>) -> Option<
         npc_id,
         item_name,
         qty,
+        qty_given,
         remove,
         item_tags: parse_json_tags(obj),
     })
@@ -2876,16 +3136,262 @@ fn parse_site_asset(rest: &str) -> Option<BracketCommand> {
         AssetMutation::Count(n)
     } else {
         match flag.as_str() {
-            "dead" => AssetMutation::Dead,
-            "taken" => AssetMutation::Taken,
-            "triggered" => AssetMutation::Triggered,
+            "dead" | "slain" => AssetMutation::Dead,
+            "taken" | "looted" => AssetMutation::Taken,
+            "triggered" | "sprung" => AssetMutation::Triggered,
             "active" => AssetMutation::Active,
             "known" => AssetMutation::Known,
             "suspected" => AssetMutation::Suspected,
+            "deactivated" | "disarmed" => AssetMutation::Deactivated,
+            "fleeing" | "fled" => AssetMutation::Fleeing,
             _ => return None,
         }
     };
     Some(BracketCommand::SiteAsset { asset_id, mutation })
+}
+
+/// (2026-08-22 living-world) `[QUEST …]` — the quest & objective verb.
+/// Four sub-forms (the `[LEDGER]` flat-payload pattern):
+///   `[QUEST new <quest_id> giver=<npc_id|player> <title> | <minutes>] (reward=<text>)`
+///   `[QUEST update <quest_id> <objective text> (cur=N total=M)]`
+///   `[QUEST update <quest_id> done <objective text>]`
+///   `[QUEST done <quest_id>]` / `[QUEST fail <quest_id>]`
+/// The LAST pipe splits `new`'s deadline window (the PROMISE precedent):
+/// the first post-pipe token is the integer deadline (strict — anything
+/// else kills the bracket), any remainder kv-scans for `reward=`. Pre-pipe,
+/// `giver=`/`from=`/`reward=` ride the quote-aware `extract_kv_value`
+/// (quoted values span spaces; the tokens never join the title).
+/// `cur=`/`total=` clamp to ≤99 with cur ≤ total, tolerating the paren
+/// group's trailing `)` (only the group's FIRST key carries the opener).
+/// Malformed counters skip (the bracket still parses — the objective text
+/// is the load-bearing part).
+fn parse_quest(rest: &str) -> Option<BracketCommand> {
+    let rest = rest.trim();
+    let mut iter = rest.splitn(3, char::is_whitespace);
+    let verb = iter.next().unwrap_or("").to_lowercase();
+    let quest_id = clean_free_text(iter.next().unwrap_or(""), SITE_AREA_ID_MAX);
+    let tail = iter.next().unwrap_or("").trim();
+    match verb.as_str() {
+        "done" | "complete" => {
+            if quest_id.is_empty() {
+                return None;
+            }
+            Some(BracketCommand::Quest {
+                op: QuestOp::Done,
+                quest_id,
+                giver: String::new(),
+                title: String::new(),
+                objective: String::new(),
+                objective_done: false,
+                cur: 0,
+                total: 0,
+                deadline_minutes: 0,
+                reward: String::new(),
+                area: String::new(),
+            })
+        }
+        "fail" | "abandon" => {
+            if quest_id.is_empty() {
+                return None;
+            }
+            Some(BracketCommand::Quest {
+                op: QuestOp::Fail,
+                quest_id,
+                giver: String::new(),
+                title: String::new(),
+                objective: String::new(),
+                objective_done: false,
+                cur: 0,
+                total: 0,
+                deadline_minutes: 0,
+                reward: String::new(),
+                area: String::new(),
+            })
+        }
+        "new" => {
+            if quest_id.is_empty() {
+                return None;
+            }
+            // The LAST pipe splits `new`'s deadline window (the PROMISE
+            // precedent): `<minutes>` alone, or `<minutes> reward=<text>`
+            // (the reward may ride AFTER the deadline — the token scan and
+            // the unit tests both exercise it). The minutes themselves stay
+            // STRICT (a non-integer first post-pipe token kills the
+            // bracket — same discipline as PROMISE's window).
+            let (body, minutes, mut reward) = match tail.rfind('|') {
+                Some(p) => {
+                    let post = tail[p + 1..].trim();
+                    let (min_tok, rest) = match post.split_once(char::is_whitespace) {
+                        Some((a, b)) => (a.trim(), Some(b.trim())),
+                        None => (post, None),
+                    };
+                    let minutes = min_tok.parse::<i64>().ok()?.clamp(0, QUEST_DEADLINE_MAX);
+                    let mut reward = String::new();
+                    if let Some(v) = rest
+                        .filter(|r| !r.is_empty())
+                        .and_then(|r| extract_kv_value(r, "reward"))
+                    {
+                        reward = clean_free_text(&v, QUEST_REWARD_MAX);
+                    }
+                    (tail[..p].trim(), minutes, reward)
+                }
+                None => (tail, 0, String::new()),
+            };
+            let mut giver = String::new();
+            // Quoted multi-word values FIRST (they span spaces); the bare
+            // single-token forms ride the same helper. tokenize_kv is NOT
+            // used here: its auto-quoter would absorb the free-prose TITLE
+            // into an unquoted value (`giver=mara "Cull the Warband"` →
+            // giver="mara Cull the Warband").
+            if let Some(v) = extract_kv_value(body, "giver")
+                .or_else(|| extract_kv_value(body, "from"))
+            {
+                giver = clean_free_text(&v, SITE_AREA_ID_MAX);
+            }
+            // (2026-08-25 quest anchors) `area=<area_id>` — the site-map
+            // room the objective targets. Same extraction + the same
+            // id budget as the giver.
+            let mut area = String::new();
+            if let Some(v) = extract_kv_value(body, "area") {
+                area = clean_free_text(&v, SITE_AREA_ID_MAX);
+            }
+            if reward.is_empty() {
+                if let Some(v) = extract_kv_value(body, "reward") {
+                    reward = clean_free_text(&v, QUEST_REWARD_MAX);
+                }
+            }
+            // Title = the body's non-kv tokens. A quoted kv value's tail
+            // tokens (`reward="30` + `silver"`) are consumed as a span so
+            // they never leak into the title.
+            let mut words: Vec<&str> = Vec::new();
+            let mut in_quoted_kv = false;
+            for tok in body.split_whitespace() {
+                if in_quoted_kv {
+                    if tok.ends_with('"') {
+                        in_quoted_kv = false;
+                    }
+                    continue;
+                }
+                if tok.starts_with("giver=")
+                    || tok.starts_with("from=")
+                    || tok.starts_with("reward=")
+                    || tok.starts_with("area=")
+                {
+                    // An opener that quotes but doesn't close within the
+                    // token starts a quoted span.
+                    if tok.contains('"') && !tok.ends_with('"') {
+                        in_quoted_kv = true;
+                    }
+                    continue;
+                }
+                words.push(tok);
+            }
+            let title = clean_free_text(&strip_one_quote_pair(&words.join(" ")), QUEST_TITLE_MAX);
+            if title.is_empty() {
+                return None;
+            }
+            Some(BracketCommand::Quest {
+                op: QuestOp::New,
+                quest_id,
+                giver,
+                title,
+                deadline_minutes: minutes,
+                reward,
+                objective: String::new(),
+                objective_done: false,
+                cur: 0,
+                total: 0,
+                area,
+            })
+        }
+        "update" => {
+            if quest_id.is_empty() {
+                return None;
+            }
+            let mut cur = 0u32;
+            let mut total = 0u32;
+            // (2026-08-25 quest anchors) `area=<area_id>` — a re-anchor
+            // (the objective moved). An update carrying area= but NO
+            // objective text is the pure re-anchor form.
+            let mut area = String::new();
+            for (k, v) in tokenize_kv(tail) {
+                match k.as_str() {
+                    "cur" | "progress" => {
+                        // Paren-lenient: the group form `(cur=3 total=6)`
+                        // parenthesizes only the FIRST key, so total's value
+                        // arrives as `6)` — trim group punctuation on both
+                        // sides before the numeric parse (the qty/tags
+                        // convention).
+                        if let Ok(n) = v
+                            .trim()
+                            .trim_matches(|c| c == '(' || c == ')')
+                            .parse::<u32>()
+                        {
+                            cur = n.min(99);
+                        }
+                    }
+                    "total" | "of" => {
+                        if let Ok(n) = v
+                            .trim()
+                            .trim_matches(|c| c == '(' || c == ')')
+                            .parse::<u32>()
+                        {
+                            total = n.min(99);
+                        }
+                    }
+                    "area" => {
+                        area = clean_free_text(&v, SITE_AREA_ID_MAX);
+                    }
+                    _ => {}
+                }
+            }
+            // The objective text: non-kv tokens only (kv words never join
+            // the objective), with a leading `done` marker flagging
+            // completion.
+            let mut words: Vec<&str> = Vec::new();
+            for tok in tail.split_whitespace() {
+                let is_kv = tok.contains('=')
+                    && tok
+                        .split_once('=')
+                        .map(|(k, _)| {
+                            let k = k.trim_matches(|c| c == '(' || c == ')');
+                            matches!(k, "cur" | "total" | "progress" | "of" | "area")
+                        })
+                        .unwrap_or(false);
+                if !is_kv {
+                    words.push(tok);
+                }
+            }
+            let mut objective_done = false;
+            if words.first().map(|w| w.eq_ignore_ascii_case("done")).unwrap_or(false) {
+                objective_done = true;
+                words.remove(0);
+            }
+            let objective = clean_free_text(&strip_one_quote_pair(&words.join(" ")), QUEST_OBJ_MAX);
+            // Objective-less is legal ONLY as the pure re-anchor form —
+            // neither field means the bracket malformed.
+            if objective.is_empty() && area.is_empty() {
+                return None;
+            }
+            if cur > total {
+                cur = total;
+            }
+            Some(BracketCommand::Quest {
+                op: QuestOp::Update,
+                quest_id,
+                objective,
+                objective_done,
+                cur,
+                total,
+                giver: String::new(),
+                title: String::new(),
+                deadline_minutes: 0,
+                reward: String::new(),
+                area,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)> {
@@ -3277,6 +3783,17 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         return Some((BracketCommand::Intent { npc_id, intent }, 0));
     }
 
+    // [REST] — (2026-08-22 living-world) a genuine sleep or long
+    // recuperation ended. BARE form only; any payload is literal prose
+    // (never misparse "[restore the door]" — "REST" with a non-empty rest
+    // declines). Prefix-safe vs ROOM/RUMOR (diverges at char 2).
+    if let Some(rest) = strip_prefix_ci(bracket, "REST") {
+        if rest.trim().is_empty() {
+            return Some((BracketCommand::Rest, 0));
+        }
+        return None;
+    }
+
     // [ROOM <area_id> visited|discovered] — (2026-08-19 Hidden site maps) the
     // player entered or learned of an area of the current site. BARE form (no
     // flag) = visited. Ids come from the tracker's `site:` slice; the applier
@@ -3325,19 +3842,80 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         }
         let body = iter.next().unwrap_or("").trim();
         if let Some(desc_raw) = body.strip_prefix('-') {
+            // (2026-08-25 fix) A removal often re-carries the add's `area=`
+            // anchor; unstripped it rode into the description and the exact
+            // equality match against the stored promise silently never hit.
+            // Same token-strip as the add arm (a quoted value spans tokens);
+            // the remove form carries no area — the anchor is noise here.
+            let mut kept: Vec<&str> = Vec::new();
+            let mut in_quoted_kv = false;
+            for tok in desc_raw.trim().split_whitespace() {
+                if in_quoted_kv {
+                    if tok.ends_with('"') {
+                        in_quoted_kv = false;
+                    }
+                    continue;
+                }
+                if tok.starts_with("area=") {
+                    if tok.contains('"') && !tok.ends_with('"') {
+                        in_quoted_kv = true;
+                    }
+                    continue;
+                }
+                kept.push(tok);
+            }
+            let stripped = kept.join(" ");
             let description =
-                clean_free_text(&strip_one_quote_pair(desc_raw.trim()), PROMISE_DESC_MAX);
+                clean_free_text(&strip_one_quote_pair(stripped.trim()), PROMISE_DESC_MAX);
             if description.is_empty() {
                 return None;
             }
             return Some((
-                BracketCommand::Promise { npc_id, description, deadline_minutes: 0, remove: true },
+                BracketCommand::Promise {
+                    npc_id,
+                    description,
+                    deadline_minutes: 0,
+                    remove: true,
+                    area: String::new(),
+                },
                 0,
             ));
         }
         if let Some(pipe) = body.rfind('|') {
+            // (2026-08-25 quest anchors) `area=<area_id>` rides the
+            // description head only — extract + strip it there (a quoted
+            // value spans tokens; the QUEST-title scan pattern) so it never
+            // leaks into the prose, and a post-pipe stray can never masque-
+            // rade as one.
+            let head_raw = body[..pipe].trim();
+            let mut area = String::new();
+            if let Some(v) = extract_kv_value(head_raw, "area") {
+                area = clean_free_text(&v, SITE_AREA_ID_MAX);
+            }
+            let head = if area.is_empty() {
+                head_raw.to_string()
+            } else {
+                let mut kept: Vec<&str> = Vec::new();
+                let mut in_quoted_kv = false;
+                for tok in head_raw.split_whitespace() {
+                    if in_quoted_kv {
+                        if tok.ends_with('"') {
+                            in_quoted_kv = false;
+                        }
+                        continue;
+                    }
+                    if tok.starts_with("area=") {
+                        if tok.contains('"') && !tok.ends_with('"') {
+                            in_quoted_kv = true;
+                        }
+                        continue;
+                    }
+                    kept.push(tok);
+                }
+                kept.join(" ")
+            };
             let description =
-                clean_free_text(&strip_one_quote_pair(body[..pipe].trim()), PROMISE_DESC_MAX);
+                clean_free_text(&strip_one_quote_pair(head.trim()), PROMISE_DESC_MAX);
             let minutes = body[pipe + 1..]
                 .trim()
                 .parse::<i64>()
@@ -3347,7 +3925,13 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
                 return None;
             }
             return Some((
-                BracketCommand::Promise { npc_id, description, deadline_minutes: minutes, remove: false },
+                BracketCommand::Promise {
+                    npc_id,
+                    description,
+                    deadline_minutes: minutes,
+                    remove: false,
+                    area,
+                },
                 0,
             ));
         }
@@ -3365,6 +3949,91 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
             return Some((cmd, 0));
         }
         return None;
+    }
+
+    // [ARCANA <label>] / [ARCANA +1] / [ARCANA -1] — (2026-08-22
+    // living-world) the dormant arcane pool's activation + step verb. A
+    // leading +/<digits> or -/<digits> body is a STEP (±1, clamped to the
+    // ladder's ±4 span); anything else is an activation LABEL (≤24 chars).
+    // Prefix-unique (no other A-verb shares the ARC stem).
+    if let Some(rest) = strip_prefix_ci(bracket, "ARCANA") {
+        let rest = rest.trim();
+        let looks_like_step = rest.starts_with('+')
+            || (rest.starts_with('-') && rest.len() > 1 && rest[1..].chars().next().is_some_and(|c| c.is_ascii_digit()));
+        if looks_like_step {
+            let delta: i32 = rest.parse::<i32>().ok()?.clamp(-4, 4);
+            if delta == 0 {
+                return None;
+            }
+            return Some((
+                BracketCommand::Arcana { label: String::new(), delta },
+                0,
+            ));
+        }
+        let label = clean_free_text(&strip_one_quote_pair(rest), ARCANA_LABEL_MAX);
+        // (2026-08-23 audit) A leading +/- without a digit is a mangled step
+        // (`[ARCANA -biotics]`), not a resource name — reject instead of
+        // minting a junk `-biotics` label that renders into <world_state>.
+        if label.is_empty() || label.starts_with('-') || label.starts_with('+') {
+            return None;
+        }
+        return Some((BracketCommand::Arcana { label, delta: 0 }, 0));
+    }
+
+    // [QUEST new|update|done|fail …] — (2026-08-22 living-world) the quest
+    // & objective verb. See `parse_quest`. Prefix-unique (no other verb
+    // starts with Q).
+    if let Some(rest) = strip_prefix_ci(bracket, "QUEST") {
+        if let Some(cmd) = parse_quest(rest) {
+            return Some((cmd, 0));
+        }
+        return None;
+    }
+
+    // [EXPIRY <target> | +<minutes> or <absolute time>] — (2026-08-22
+    // multihog WS1) arm a timed lapse on an entity key or a site asset.
+    // The LAST pipe separates the target from the time body (the PROMISE
+    // convention); a leading `+` is a relative minute count the apply
+    // resolves against the live clock, anything else parses as an absolute
+    // in-world timestamp (`parse_in_world_time`). Prefix-safe vs
+    // EQUIP/EFFECT (diverge at char 2). No JSON dual-parse (the
+    // ROOM/ASSET/PROMISE precedent).
+    if let Some(rest) = strip_prefix_ci(bracket, "EXPIRY") {
+        let rest = rest.trim();
+        let Some(pipe) = rest.rfind('|') else {
+            return None;
+        };
+        let target = clean_free_text(rest[..pipe].trim(), EXPIRY_TARGET_MAX);
+        if target.is_empty() {
+            return None;
+        }
+        let body = rest[pipe + 1..].trim();
+        let (minutes, relative) = if let Some(n) = body.strip_prefix('+') {
+            let n: i64 = n.trim().parse().ok()?;
+            if n <= 0 || n > EXPIRY_RELATIVE_MAX {
+                return None;
+            }
+            (n, true)
+        } else {
+            match parse_in_world_time(body) {
+                Some(m) => (m, false),
+                None => return None,
+            }
+        };
+        return Some((BracketCommand::Expiry { target, minutes, relative }, 0));
+    }
+
+    // [UNLOCK <area_id>] — (2026-08-22 multihog WS2) the narrated opening
+    // of a barred way on the current site. Bare single-token form (the
+    // ROOM convention). Prefix-unique (no other verb starts with UN).
+    if let Some(rest) = strip_prefix_ci(bracket, "UNLOCK") {
+        let rest = rest.trim();
+        let mut iter = rest.splitn(2, char::is_whitespace);
+        let area_id = clean_free_text(iter.next().unwrap_or(""), SITE_AREA_ID_MAX);
+        if area_id.is_empty() {
+            return None;
+        }
+        return Some((BracketCommand::Unlock { area_id }, 0));
     }
 
     // [TIME <in-world timestamp>] — Seam #4 clock advance. Single-region like
@@ -3418,11 +4087,14 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         // Try key=value extraction first.
         if !kv.is_empty() {
             let label = kv.get("label").copied().or_else(|| kv.get("name").copied());
+            // (2026-08-24 fix) Tolerant duration parse — floats floor +
+            // clamp (`parse_effect_duration`); a malformed number rejects
+            // the bracket, never a silent 0 (permanent).
             let duration = kv
                 .get("duration_minutes")
                 .or_else(|| kv.get("duration"))
                 .copied()
-                .and_then(|s| s.parse::<i64>().ok());
+                .and_then(parse_effect_duration);
             let polarity = kv.get("polarity").copied().and_then(|s| match s.to_lowercase().as_str() {
                 "buff" => Some(Polarity::Buff),
                 "debuff" => Some(Polarity::Debuff),
@@ -3451,7 +4123,8 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         // Fall back to positional.
         if positional.len() >= 2 {
             let duration_idx = positional.len() - 1;
-            let duration_minutes = positional[duration_idx].parse::<i64>().ok();
+            // (2026-08-24 fix) Same tolerant duration parse as the kv arm.
+            let duration_minutes = parse_effect_duration(positional[duration_idx]);
             if let Some(duration_minutes) = duration_minutes {
                 if duration_minutes >= 0 {
                     // Check if the second-to-last token is a polarity.
@@ -3514,10 +4187,10 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
             .collect();
         let npc_id = kv_npc
             .or_else(|| real_positional.first().copied())
-            .map(|s| s.to_string());
+            .map(|s| clean_free_text(s, NODE_ID_MAX));
         let event_id = kv_event
             .or_else(|| real_positional.get(1).copied())
-            .map(|s| s.to_string());
+            .map(|s| clean_free_text(s, NODE_ID_MAX));
         if let (Some(npc_id), Some(event_id)) = (npc_id, event_id) {
             if !npc_id.is_empty() && !event_id.is_empty() {
                 return Some((BracketCommand::Milestone { npc_id, event_id }, 0));
@@ -3550,13 +4223,19 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
 
         // Parse head: extract key=value pairs, collect positional tokens.
         let (kv_head, pos_head) = split_kv_positional(head);
+        // (2026-08-24 fix) The npc_id runs through the SAME single-line gate
+        // as the JSON dual (`clean_free_text` — flatten newlines, strip
+        // control chars, cap at NODE_ID_MAX): a quoted kv value may legally
+        // span a newline, and the id renders verbatim into narrator-facing
+        // `[DIRECTIVE]` lines (`resolve_task`) — an ungated id could forge
+        // prompt lines.
         let npc_id = kv_head
             .get("npc_id")
             .or_else(|| kv_head.get("npc"))
             .or_else(|| kv_head.get("id"))
             .copied()
-            .map(|s| s.to_string())
-            .or_else(|| pos_head.first().copied().map(|s| s.to_string()));
+            .or_else(|| pos_head.first().copied())
+            .map(|s| clean_free_text(s, NODE_ID_MAX));
         let description = kv_head
             .get("description")
             .or_else(|| kv_head.get("desc"))
@@ -3675,6 +4354,37 @@ fn find_ci(text: &str, needle: &str) -> Option<usize> {
             if text.is_char_boundary(i) {
                 return Some(i);
             }
+        }
+    }
+    None
+}
+
+/// (2026-08-23 quest-grammar fix) Quote-aware single-field kv extraction for
+/// the flat bracket grammars: finds `key="quoted value"` (spans spaces —
+/// `tokenize_kv` can't be used where free prose follows, its auto-quoter
+/// absorbs the prose into the value) or a bare `key=value` token. The
+/// `key="` form requires a word boundary (preceded by whitespace or start).
+/// An unterminated quote takes the rest of the text. Returns the value with
+/// one outer quote pair already handled (the quoted form by construction,
+/// the bare form via `strip_one_quote_pair`). Pure.
+fn extract_kv_value(text: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=\"");
+    if let Some(at) = text.find(&needle) {
+        if at == 0 || text[..at].ends_with(char::is_whitespace) {
+            let rest = &text[at + needle.len()..];
+            let value = match rest.find('"') {
+                Some(end) => &rest[..end],
+                None => rest.trim_end(),
+            };
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    let bare = format!("{key}=");
+    for tok in text.split_whitespace() {
+        if let Some(v) = tok.strip_prefix(&bare) {
+            return Some(strip_one_quote_pair(v).to_string());
         }
     }
     None
@@ -4081,11 +4791,15 @@ fn parse_task_no_pipe(rest: &str) -> Option<(BracketCommand, usize)> {
     if let (Some(npc_id), Some(description), Some(difficulty), Some(suitability), Some(eta)) =
         (npc_id, description, difficulty, suitability, eta)
     {
+        // (2026-08-24 fix) Same single-line npc_id gate as the pipe form —
+        // a quoted kv value may span a newline (prompt-line forgery into
+        // the task directives otherwise).
+        let npc_id = clean_free_text(npc_id, NODE_ID_MAX);
         let description = clean_free_text(description, TASK_DESC_MAX);
         if !npc_id.is_empty() && !description.is_empty() && eta > 0 {
             return Some((
                 BracketCommand::Task {
-                    npc_id: npc_id.to_string(),
+                    npc_id,
                     description,
                     difficulty: difficulty.to_string(),
                     suitability: suitability.to_string(),
@@ -4097,7 +4811,10 @@ fn parse_task_no_pipe(rest: &str) -> Option<(BracketCommand, usize)> {
     }
     // Positional: need at least 5 tokens (npc_id + ≥1 desc + 3 trailing).
     if pos.len() >= 5 {
-        let npc_id = pos[0].to_string();
+        // (2026-08-24 fix) Same gate (a positional token is
+        // whitespace-delimited, but the gate is uniform across all three
+        // npc_id sources).
+        let npc_id = clean_free_text(pos[0], NODE_ID_MAX);
         let trailing = &pos[pos.len() - 3..];
         let description = clean_free_text(&pos[1..pos.len() - 3].join(" "), TASK_DESC_MAX);
         let difficulty = trailing[0].to_string();
@@ -4291,14 +5008,38 @@ fn parse_in_world_time_inner(s: &str) -> Option<i64> {
                     if parts[2].len() <= 2 && yy < 100 {
                         yy += 2000;
                     }
-                    if let Some(days) = days_from_civil(yy, mm, dd)
-                        .checked_sub(days_from_civil(1, 1, 1))
-                    {
-                        // Calendar dates are ABSOLUTE (days since 0001-01-01);
-                        // they override the relative "Day N" form.
-                        day_from_date = Some(days + 1);
-                        saw_any_signal = true;
-                        continue;
+                    // (2026-08-24 review fix) Component validation. The
+                    // `days_from_civil` conversion NORMALIZES out-of-range
+                    // components (31/02/2026 silently became March 3rd), so
+                    // a tracker typo advanced the world clock to a day
+                    // nobody authored. An impossible month/day skips the
+                    // fragment — the same malformed-fragment leniency as a
+                    // clock token with a non-numeric hour.
+                    let leap = (yy % 4 == 0 && yy % 100 != 0) || yy % 400 == 0;
+                    let month_len: u32 = match mm {
+                        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+                        4 | 6 | 9 | 11 => 30,
+                        2 => {
+                            if leap {
+                                29
+                            } else {
+                                28
+                            }
+                        }
+                        _ => 0,
+                    };
+                    let date_valid = (1..=12).contains(&mm) && dd >= 1 && dd <= month_len;
+                    if date_valid {
+                        if let Some(days) = days_from_civil(yy, mm, dd)
+                            .checked_sub(days_from_civil(1, 1, 1))
+                        {
+                            // Calendar dates are ABSOLUTE (days since
+                            // 0001-01-01); they override the relative
+                            // "Day N" form.
+                            day_from_date = Some(days + 1);
+                            saw_any_signal = true;
+                            continue;
+                        }
                     }
                 }
             }
@@ -4519,6 +5260,7 @@ mod tests {
                 description: "return the horse".into(),
                 deadline_minutes: 1440,
                 remove: false,
+                area: String::new(),
             }]
         );
         // Quoted descriptions with internal pipes: the LAST pipe splits.
@@ -4540,6 +5282,20 @@ mod tests {
                 description: "return the horse".into(),
                 deadline_minutes: 0,
                 remove: true,
+                area: String::new(),
+            }]
+        );
+        // (2026-08-25 fix) A removal re-carrying the add's `area=` anchor
+        // strips it — unstripped, the exact-equality removal silently no-ops.
+        let parsed = parse("[PROMISE mara -area=courtyard return the horse]");
+        assert_eq!(
+            parsed.commands,
+            vec![BracketCommand::Promise {
+                npc_id: "mara".into(),
+                description: "return the horse".into(),
+                deadline_minutes: 0,
+                remove: true,
+                area: String::new(),
             }]
         );
         // Malformed: no pipe, non-numeric window, zero window → drop.
@@ -4850,6 +5606,332 @@ mod tests {
     fn room_asset_promise_survive_case_insensitive_verbs() {
         let parsed = parse("[room hall] [asset guards count=2] [promise mara x | 5]");
         assert_eq!(parsed.commands.len(), 3, "case-insensitive verbs: {:?}", parsed.commands);
+    }
+
+    // ---- (2026-08-22 living-world) REST / ARCANA / QUEST ---------------
+
+    #[test]
+    fn rest_bare_form_only() {
+        assert_eq!(parse("[REST]").commands, vec![BracketCommand::Rest]);
+        // Case-insensitive.
+        assert_eq!(parse("[rest]").commands, vec![BracketCommand::Rest]);
+        // Any payload declines to literal prose ("[restore the door]" is
+        // not a rest).
+        assert!(parse("[RESTORE the door]").commands.is_empty());
+        assert!(parse("[rest 8 hours]").commands.is_empty());
+        // Prefix-safety vs ROOM/RUMOR is structural (diverge at char 2).
+        let parsed = parse("[ROOM hall] [RUMOR a stranger paid in gold]");
+        assert_eq!(parsed.commands.len(), 2);
+    }
+
+    #[test]
+    fn arcana_activation_and_steps() {
+        match &parse("[ARCANA biotics]").commands[..] {
+            [BracketCommand::Arcana { label, delta }] => {
+                assert_eq!(label, "biotics");
+                assert_eq!(*delta, 0);
+            }
+            other => panic!("expected activation, got {other:?}"),
+        }
+        match &parse("[ARCANA mana]").commands[..] {
+            [BracketCommand::Arcana { label, delta }] => {
+                assert_eq!(label, "mana");
+                assert_eq!(*delta, 0);
+            }
+            other => panic!("expected activation, got {other:?}"),
+        }
+        match &parse("[ARCANA +1]").commands[..] {
+            [BracketCommand::Arcana { label, delta }] => {
+                assert!(label.is_empty());
+                assert_eq!(*delta, 1);
+            }
+            other => panic!("expected step, got {other:?}"),
+        }
+        match &parse("[ARCANA -1]").commands[..] {
+            [BracketCommand::Arcana { label, delta }] => {
+                assert_eq!(*delta, -1);
+            }
+            other => panic!("expected step, got {other:?}"),
+        }
+        // A huge step clamps into the ladder's span; an unparseable body
+        // declines; an empty body declines.
+        match &parse("[ARCANA +99]").commands[..] {
+            [BracketCommand::Arcana { delta, .. }] => assert_eq!(*delta, 4),
+            other => panic!("expected clamped step, got {other:?}"),
+        }
+        assert!(parse("[ARCANA]").commands.is_empty());
+        // Any non-step body is an activation label ("now" included).
+        match &parse("[ARCANA now]").commands[..] {
+            [BracketCommand::Arcana { label, delta }] => {
+                assert_eq!(label, "now");
+                assert_eq!(*delta, 0);
+            }
+            other => panic!("expected label activation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quest_grammar_all_four_verbs() {
+        // new: giver + quoted title + pipe deadline + reward.
+        match &parse(r#"[QUEST new slay-warband giver=mara "Cull the Warband" | 1440 reward="30 silver"]"#).commands[..] {
+            [BracketCommand::Quest { op, quest_id, giver, title, deadline_minutes, reward, .. }] => {
+                assert_eq!(*op, QuestOp::New);
+                assert_eq!(quest_id, "slay-warband");
+                assert_eq!(giver, "mara");
+                assert_eq!(title, "Cull the Warband");
+                assert_eq!(*deadline_minutes, 1440);
+                assert_eq!(reward, "30 silver");
+            }
+            other => panic!("expected new, got {other:?}"),
+        }
+        // new: self-given (player giver), no deadline.
+        match &parse("[QUEST new find-heir giver=player Find the missing heir]").commands[..] {
+            [BracketCommand::Quest { op, giver, deadline_minutes, .. }] => {
+                assert_eq!(*op, QuestOp::New);
+                assert_eq!(giver, "player");
+                assert_eq!(*deadline_minutes, 0);
+            }
+            other => panic!("expected new, got {other:?}"),
+        }
+        // update: objective with counters (parenthesized form).
+        match &parse("[QUEST update slay-warband cull the wolves (cur=3 total=6)]").commands[..] {
+            [BracketCommand::Quest { op, objective, cur, total, objective_done, .. }] => {
+                assert_eq!(*op, QuestOp::Update);
+                assert_eq!(objective, "cull the wolves");
+                assert_eq!(*cur, 3);
+                assert_eq!(*total, 6);
+                assert!(!*objective_done);
+            }
+            other => panic!("expected update, got {other:?}"),
+        }
+        // update done: marks one objective complete.
+        match &parse("[QUEST update slay-warband done burn the shrine]").commands[..] {
+            [BracketCommand::Quest { op, objective, objective_done, .. }] => {
+                assert_eq!(*op, QuestOp::Update);
+                assert_eq!(objective, "burn the shrine");
+                assert!(*objective_done);
+            }
+            other => panic!("expected update-done, got {other:?}"),
+        }
+        // Terminal verbs.
+        match &parse("[QUEST done slay-warband]").commands[..] {
+            [BracketCommand::Quest { op, quest_id, .. }] => {
+                assert_eq!(*op, QuestOp::Done);
+                assert_eq!(quest_id, "slay-warband");
+            }
+            other => panic!("expected done, got {other:?}"),
+        }
+        match &parse("[QUEST fail find-heir]").commands[..] {
+            [BracketCommand::Quest { op, .. }] => assert_eq!(*op, QuestOp::Fail),
+            other => panic!("expected fail, got {other:?}"),
+        }
+    }
+
+    /// (2026-08-23 quest-grammar fix) The quoted-value surfaces the original
+    /// parser mangled: a pre-pipe quoted reward (used to yield
+    /// reward=`"30` + title pollution), a quoted multi-word giver, and the
+    /// `from=` alias — all now parse with the kv tokens fully excluded from
+    /// the title.
+    #[test]
+    fn quest_quoted_kv_values_parse_clean() {
+        match &parse(
+            r#"[QUEST new heist giver=mara reward="30 silver pieces" Heist at dusk | 1440]"#,
+        ).commands[..]
+        {
+            [BracketCommand::Quest { giver, title, reward, deadline_minutes, .. }] => {
+                assert_eq!(giver, "mara");
+                assert_eq!(reward, "30 silver pieces");
+                assert_eq!(title, "Heist at dusk");
+                assert_eq!(*deadline_minutes, 1440);
+            }
+            other => panic!("expected new, got {other:?}"),
+        }
+        match &parse(r#"[QUEST new errand from="Mara the Bold" Fetch water | 60]"#).commands[..] {
+            [BracketCommand::Quest { giver, title, .. }] => {
+                assert_eq!(giver, "Mara the Bold");
+                assert_eq!(title, "Fetch water");
+            }
+            other => panic!("expected new, got {other:?}"),
+        }
+    }
+
+    /// (2026-08-25 quest anchors) The `area=` kv on QUEST new/update +
+    /// PROMISE — captured as the anchor id, fully excluded from the title/
+    /// objective/description prose, and legal as the ONLY payload of an
+    /// update (the pure re-anchor form).
+    #[test]
+    fn quest_and_promise_area_anchor_forms_parse() {
+        match &parse(
+            "[QUEST new cutpurse giver=mara area=market-ward Investigate the cutpurse | 1440]",
+        )
+        .commands[..]
+        {
+            [BracketCommand::Quest { area, title, .. }] => {
+                assert_eq!(area, "market-ward");
+                assert_eq!(title, "Investigate the cutpurse");
+            }
+            other => panic!("expected anchored new, got {other:?}"),
+        }
+        // Pure re-anchor: area= with NO objective text.
+        match &parse("[QUEST update cutpurse area=harbor-quarter]").commands[..] {
+            [BracketCommand::Quest { area, objective, .. }] => {
+                assert_eq!(area, "harbor-quarter");
+                assert_eq!(objective, "", "the area-only update carries no objective");
+            }
+            other => panic!("expected re-anchor, got {other:?}"),
+        }
+        // Objective + area together: the kv never leaks into the prose.
+        match &parse("[QUEST update cutpurse area=harbor-quarter question the dockhands cur=2 total=4]").commands[..] {
+            [BracketCommand::Quest { area, objective, cur, total, .. }] => {
+                assert_eq!(area, "harbor-quarter");
+                assert_eq!(objective, "question the dockhands");
+                assert_eq!((*cur, *total), (2, 4));
+            }
+            other => panic!("expected combined update, got {other:?}"),
+        }
+        // Neither objective nor area → still malformed.
+        assert!(parse("[QUEST update cutpurse cur=2]").commands.is_empty());
+        // PROMISE: area rides the description head, stripped from the prose.
+        match &parse("[PROMISE mara area=courtyard meet me at the well | 90]").commands[..] {
+            [BracketCommand::Promise { area, description, .. }] => {
+                assert_eq!(area, "courtyard");
+                assert_eq!(description, "meet me at the well");
+            }
+            other => panic!("expected anchored promise, got {other:?}"),
+        }
+        // A post-pipe area= is not grammar — the strict minutes parse
+        // declines the bracket rather than smuggling an anchor.
+        assert!(parse("[PROMISE mara fetch water | area=x 90]").commands.is_empty());
+    }
+
+    /// (2026-08-23 audit) `[ARCANA -<word>]` is a mangled STEP, not a label —
+    /// it must decline instead of minting a junk `-biotics` label.
+    #[test]
+    fn arcana_minus_label_declines() {
+        assert!(parse("[ARCANA -biotics]").commands.is_empty());
+        assert!(parse("[ARCANA +fury]").commands.is_empty());
+        // A legit hyphenated label still activates.
+        match &parse("[ARCANA bio-electric charge]").commands[..] {
+            [BracketCommand::Arcana { label, delta }] => {
+                assert_eq!(label, "bio-electric charge");
+                assert_eq!(*delta, 0);
+            }
+            other => panic!("expected activation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quest_malformed_shapes_decline() {
+        // Missing id, missing title, junk verb, unparseable deadline pipe.
+        assert!(parse("[QUEST new giver=mara]").commands.is_empty());
+        assert!(parse("[QUEST update slay-warband]").commands.is_empty());
+        assert!(parse("[QUEST done]").commands.is_empty());
+        assert!(parse("[QUEST explode everything]").commands.is_empty());
+        assert!(
+            parse("[QUEST new x giver=mara Title | tomorrow]").commands.is_empty(),
+            "a non-numeric deadline window declines the whole bracket"
+        );
+        // cur > total clamps at parse (never an impossible counter).
+        match &parse("[QUEST update q count wolves cur=9 total=6]").commands[..] {
+            [BracketCommand::Quest { cur, total, .. }] => {
+                assert_eq!((*cur, *total), (6, 6));
+            }
+            other => panic!("expected clamped counters, got {other:?}"),
+        }
+        // Deadline clamps at the overflow guard.
+        match &parse("[QUEST new x giver=mara T | 999999999]").commands[..] {
+            [BracketCommand::Quest { deadline_minutes, .. }] => {
+                assert_eq!(*deadline_minutes, QUEST_DEADLINE_MAX);
+            }
+            other => panic!("expected clamped deadline, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn asset_deactivated_and_fleeing_words_parse() {
+        let parsed = parse("[ASSET pit-trap deactivated] [ASSET warband fled]");
+        assert_eq!(parsed.commands.len(), 2);
+        match &parsed.commands[0] {
+            BracketCommand::SiteAsset { asset_id, mutation } => {
+                assert_eq!(asset_id, "pit-trap");
+                assert_eq!(*mutation, AssetMutation::Deactivated);
+            }
+            other => panic!("expected deactivated, got {other:?}"),
+        }
+        match &parsed.commands[1] {
+            BracketCommand::SiteAsset { asset_id, mutation } => {
+                assert_eq!(asset_id, "warband");
+                assert_eq!(*mutation, AssetMutation::Fleeing);
+            }
+            other => panic!("expected fleeing, got {other:?}"),
+        }
+    }
+
+    /// (2026-08-22 multihog WS1) `[EXPIRY]` — the entity key form (absolute
+    /// + relative bodies), the `@`-asset form, and the reject paths.
+    #[test]
+    fn expiry_entity_and_asset_forms_parse() {
+        // Absolute body (Day 2, 14:00 = 1440 + 840 = 2280).
+        match &parse("[EXPIRY bridge-out | Day 2, 14:00]").commands[..] {
+            [BracketCommand::Expiry { target, minutes, relative }] => {
+                assert_eq!(target, "bridge-out");
+                assert_eq!(*minutes, 2280);
+                assert!(!*relative);
+            }
+            other => panic!("expected absolute expiry, got {other:?}"),
+        }
+        // Relative body: +N minutes resolved against the live clock at apply.
+        match &parse("[EXPIRY ward-vault | +90]").commands[..] {
+            [BracketCommand::Expiry { target, minutes, relative }] => {
+                assert_eq!(target, "ward-vault");
+                assert_eq!(*minutes, 90);
+                assert!(*relative);
+            }
+            other => panic!("expected relative expiry, got {other:?}"),
+        }
+        // Asset form: `<asset-id>@<node-id>` (empty node half legal — the
+        // apply resolves it to the current node).
+        match &parse("[EXPIRY warband-scouts@warren | +30]").commands[..] {
+            [BracketCommand::Expiry { target, minutes, relative }] => {
+                assert_eq!(target, "warband-scouts@warren");
+                assert_eq!(*minutes, 30);
+                assert!(*relative);
+            }
+            other => panic!("expected asset expiry, got {other:?}"),
+        }
+        match &parse("[expiry warband@ | Day 1, 09:00]").commands[..] {
+            [BracketCommand::Expiry { target, relative, .. }] => {
+                assert_eq!(target, "warband@");
+                assert!(!*relative);
+            }
+            other => panic!("expected bare-@ expiry, got {other:?}"),
+        }
+        // Rejects: no pipe, empty target, non-numeric relative, unparseable
+        // absolute, zero/negative window, over-clamp window.
+        assert!(parse("[EXPIRY bridge-out]").commands.is_empty());
+        assert!(parse("[EXPIRY | +30]").commands.is_empty());
+        assert!(parse("[EXPIRY ward | +soon]").commands.is_empty());
+        assert!(parse("[EXPIRY ward | next moonrise]").commands.is_empty());
+        assert!(parse("[EXPIRY ward | +0]").commands.is_empty());
+        assert!(parse("[EXPIRY ward | -30]").commands.is_empty());
+        assert!(parse("[EXPIRY ward | +999999999]").commands.is_empty());
+    }
+
+    /// (2026-08-22 multihog WS2) `[UNLOCK]` — the bare single-token form;
+    /// empty + multi-word bodies decline (only the first token is the id —
+    /// a trailing flag is parser residue, never a second target).
+    #[test]
+    fn unlock_parses_bare_area_id() {
+        match &parse("[UNLOCK vault]").commands[..] {
+            [BracketCommand::Unlock { area_id }] => assert_eq!(area_id, "vault"),
+            other => panic!("expected unlock, got {other:?}"),
+        }
+        match &parse("[unlock Iron-Vault]").commands[..] {
+            [BracketCommand::Unlock { area_id }] => assert_eq!(area_id, "Iron-Vault"),
+            other => panic!("expected ci unlock, got {other:?}"),
+        }
+        assert!(parse("[UNLOCK]").commands.is_empty());
+        assert!(parse("[UNLOCK   ]").commands.is_empty());
     }
 
     #[test]
@@ -5791,6 +6873,83 @@ mod tests {
         }
     }
 
+    /// (2026-08-24 fix) A float duration floors to whole minutes — the old
+    /// `.unwrap_or(0)` turned `60.5` (as_i64 fails) into the PERMANENT
+    /// sentinel. Only explicit null / absence may mean permanent; a
+    /// present-but-garbage value rejects the bracket instead.
+    #[test]
+    fn json_effect_float_duration_floors_never_permanent() {
+        // Float → floor.
+        let raw = "```json\n{ \"type\": \"effect\", \"label\": \"Blessed\", \"polarity\": \"buff\", \"duration_minutes\": 60.5 }\n```";
+        let parsed = parse(raw);
+        if let BracketCommand::Effect { duration_minutes, .. } = &parsed.commands[0] {
+            assert_eq!(*duration_minutes, 60, "60.5 floors to 60, never 0");
+        } else {
+            panic!("wrong variant");
+        }
+        // Explicit null IS the permanent choice.
+        let raw = "```json\n{ \"type\": \"effect\", \"label\": \"Cursed\", \"duration_minutes\": null }\n```";
+        let parsed = parse(raw);
+        if let BracketCommand::Effect { duration_minutes, .. } = &parsed.commands[0] {
+            assert_eq!(*duration_minutes, 0, "explicit null = permanent sentinel");
+        } else {
+            panic!("wrong variant");
+        }
+        // A huge float clamps to the EFFECT_DURATION_MINUTES_MAX ceiling.
+        let raw = "```json\n{ \"type\": \"effect\", \"label\": \"Warded\", \"duration_minutes\": 1e18 }\n```";
+        let parsed = parse(raw);
+        if let BracketCommand::Effect { duration_minutes, .. } = &parsed.commands[0] {
+            assert_eq!(*duration_minutes, EFFECT_DURATION_MINUTES_MAX);
+        } else {
+            panic!("wrong variant");
+        }
+        // A POSITIVE fraction floors UP to 1 — flooring to 0 would mint the
+        // permanent sentinel off a positive value.
+        let raw = "```json\n{ \"type\": \"effect\", \"label\": \"Blinking Ward\", \"duration_minutes\": 0.5 }\n```";
+        let parsed = parse(raw);
+        if let BracketCommand::Effect { duration_minutes, .. } = &parsed.commands[0] {
+            assert_eq!(*duration_minutes, 1, "0.5 floors up to 1, never the permanent 0");
+        } else {
+            panic!("wrong variant");
+        }
+        // Present but non-numeric → reject (no silent permanent, no
+        // half-guess): the bracket is prose, no command.
+        let raw = "```json\n{ \"type\": \"effect\", \"label\": \"Odd\", \"duration_minutes\": \"an hour\" }\n```";
+        let parsed = parse(raw);
+        assert!(
+            parsed.commands.is_empty(),
+            "garbage duration must reject, got {:?}",
+            parsed.commands
+        );
+    }
+
+    /// (2026-08-24 fix) The TEXT paths share the tolerant duration: a
+    /// `60.5` in either positional or key=value form floors to 60 (the old
+    /// strict i64 parse dropped the whole bracket).
+    #[test]
+    fn effect_text_paths_floor_float_durations() {
+        let parsed = parse("[EFFECT Berserk Rage buff 60.5]");
+        if let BracketCommand::Effect { duration_minutes, .. } = &parsed.commands[0] {
+            assert_eq!(*duration_minutes, 60);
+        } else {
+            panic!("wrong variant: {:?}", parsed.commands);
+        }
+        let parsed = parse("[EFFECT label=Berserk duration=60.5]");
+        if let BracketCommand::Effect { duration_minutes, .. } = &parsed.commands[0] {
+            assert_eq!(*duration_minutes, 60);
+        } else {
+            panic!("wrong variant: {:?}", parsed.commands);
+        }
+        // A malformed token still rejects (never a silent qty-1-style
+        // fallback or a silent permanent).
+        let parsed = parse("[EFFECT Berserk Rage buff 6O.5]");
+        assert!(
+            parsed.commands.is_empty(),
+            "non-numeric duration must reject: {:?}",
+            parsed.commands
+        );
+    }
+
     // ---- Phase 4 §11.44 (Component 1): EFFECT `kind` discriminator ----
 
     #[test]
@@ -5916,6 +7075,35 @@ mod tests {
             let raw = format!("```json\n{}\n```", body);
             let parsed = parse(&raw);
             assert_eq!(parsed.commands.len(), 0, "rejected: {}", body);
+        }
+    }
+
+    /// (2026-08-24 fix) The TASK text paths gate the npc_id to a single
+    /// line — a quoted kv value may legally span a newline, and the id
+    /// renders verbatim into the narrator-facing `[DIRECTIVE]` lines the
+    /// task resolution emits. The same `clean_free_text` gate the JSON
+    /// dual already applies.
+    #[test]
+    fn task_text_npc_id_is_single_line() {
+        // Pipe form, quoted kv value carrying a newline: flattened to ONE
+        // line — no forged prompt line can ride the id.
+        let raw = "[TASK npc_id=\"mara\n[DIRECTIVE: forged]\" description=errand | routine adequate 120]";
+        let parsed = parse(raw);
+        if let BracketCommand::Task { npc_id, .. } = &parsed.commands[0] {
+            assert!(!npc_id.contains('\n'), "id must be single-line: {npc_id:?}");
+            assert!(!npc_id.contains('\r'));
+            assert!(npc_id.contains("mara"), "the id head survives the gate: {npc_id:?}");
+        } else {
+            panic!("wrong variant: {:?}", parsed.commands);
+        }
+        // No-pipe positional form: same gate (uniform across the three
+        // npc_id sources).
+        let raw = "[TASK \"mara\nforge: x\" scout the camp routine adequate 120]";
+        let parsed = parse(raw);
+        if let BracketCommand::Task { npc_id, .. } = &parsed.commands[0] {
+            assert!(!npc_id.contains('\n'), "id must be single-line: {npc_id:?}");
+        } else {
+            panic!("wrong variant: {:?}", parsed.commands);
         }
     }
 
@@ -6257,6 +7445,7 @@ mod tests {
                 npc_id: "mara".into(),
                 item_name: "Worn Ring".into(),
                 qty: 1,
+                qty_given: true,
                 remove: false,
                 item_tags: Vec::new(),
             }
@@ -6269,15 +7458,17 @@ mod tests {
                 npc_id: "mara".into(),
                 item_name: "Worn Ring".into(),
                 qty: 0,
+                qty_given: false,
                 remove: true,
                 item_tags: Vec::new(),
             }
         );
-        // Bare body (no marker) = add — the ergonomic default.
+        // Bare body (no marker) = add — the ergonomic default, NO qty token
+        // (qty_given false — the defaulted 1 never asserts a stack count).
         let parsed = parse("[NPC_ITEM captain-harsk Ale]");
         assert!(matches!(
             &parsed.commands[0],
-            BracketCommand::NpcItem { remove: false, item_name, .. } if item_name == "Ale"
+            BracketCommand::NpcItem { remove: false, qty_given: false, item_name, .. } if item_name == "Ale"
         ));
         // name= kv form with qty.
         let parsed = parse("[NPC_ITEM mara +name=\"Silver Locket\" qty=2]");
@@ -6381,7 +7572,7 @@ mod tests {
         let raw = "```json\n{ \"kind\": \"npc_item\", \"npc_id\": \"mara\", \"item_name\": \"Worn Ring\", \"qty\": 1 }\n```";
         assert!(matches!(
             &parse(raw).commands[0],
-            BracketCommand::NpcItem { npc_id, item_name, remove: false, .. }
+            BracketCommand::NpcItem { npc_id, item_name, remove: false, qty_given: true, .. }
                 if npc_id == "mara" && item_name == "Worn Ring"
         ));
         let raw = "```json\n{ \"type\": \"mood\", \"npc\": \"mara\", \"emotion\": \"guarded\" }\n```";
@@ -6723,6 +7914,60 @@ mod tests {
         assert!(parse(raw).commands.is_empty());
     }
 
+    #[test]
+    fn appearance_bracket_strips_edge_quotes() {
+        // (2026-08-24 review fix) The E4B's quoting slips must not persist
+        // into current_appearance_deltas — every render would re-quote the
+        // value forever. Symmetric, asymmetric, + typographic forms.
+        for (raw, want) in [
+            ("[APPEARANCE hair_color=\"raven black\"]", "raven black"),
+            ("[APPEARANCE hair_color=\"raven black]", "raven black"),
+            ("[APPEARANCE hair_color=raven black\"]", "raven black"),
+            ("[APPEARANCE hair_color=\u{201C}ashen\u{201D}]", "ashen"),
+            ("[APPEARANCE hair_color='flaxen']", "flaxen"),
+        ] {
+            match &parse(raw).commands[0] {
+                BracketCommand::Appearance { key, value } => {
+                    assert_eq!(key, "hair_color");
+                    assert_eq!(value, want, "raw: {raw}");
+                }
+                other => panic!("expected Appearance, got {:?}", other),
+            }
+        }
+        // An all-quotes value cleans to empty = the clear sentinel.
+        match &parse("[APPEARANCE hair_color=\"\"]").commands[0] {
+            BracketCommand::Appearance { value, .. } => assert_eq!(value, ""),
+            other => panic!("expected Appearance, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn appearance_json_dual_strips_edge_quotes() {
+        let raw = "```json\n{\"kind\":\"appearance\",\"key\":\"hair_color\",\"value\":\"\\\"raven black\\\"\"}\n```";
+        match &parse(raw).commands[0] {
+            BracketCommand::Appearance { key, value } => {
+                assert_eq!(key, "hair_color");
+                assert_eq!(value, "raven black", "JSON dual carries the same quote strip");
+            }
+            other => panic!("expected Appearance, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn calendar_date_rejects_impossible_components() {
+        // (2026-08-24 review fix) days_from_civil NORMALIZES out-of-range
+        // components — 31/02 used to land on March 3rd. Impossible dates now
+        // skip the fragment: no day signal, no clock, → the whole body has
+        // no parseable signal.
+        assert_eq!(parse_in_world_time("31/02/2026"), None, "Feb 31 is not a day");
+        assert_eq!(parse_in_world_time("00/03/2026"), None, "day 0 is not a day");
+        assert_eq!(parse_in_world_time("15/13/2026"), None, "month 13 is not a month");
+        assert_eq!(parse_in_world_time("29/02/2023"), None, "2023 is not a leap year");
+        // Leap years + real dates still parse.
+        assert!(parse_in_world_time("29/02/2024").is_some(), "leap day parses");
+        assert!(parse_in_world_time("01/01/2026").is_some());
+    }
+
     /// (2026-08-18 clothing-as-inventory ruling) `outfit` is retired from
     /// the allowlist — a legacy tracker emission rejects like any unknown
     /// key (text form, JSON form, and any `look`-style alias attempt) so
@@ -7042,6 +8287,46 @@ mod tests {
         }
     }
 
+    /// (2026-08-24 fix) Malformed qty tokens (floats, letter-digits) must
+    /// NEVER assert a stack count: the old parse fell back to qty=1 +
+    /// qty_given=true — REPLACE semantics — so `[PACK Rope qty=1.5]`
+    /// restated a ×50 stack to ×1. Full-width DIGITS normalize to ASCII
+    /// first (`１０` == 10, replace semantics intact); anything that still
+    /// fails the strict integer parse drops the qty clause (additive
+    /// semantics — the stored stack keeps its count).
+    #[test]
+    fn malformed_qty_drops_the_clause_never_replaces_with_one() {
+        // Full-width digits normalize: １０ == 10, qty_given intact.
+        match &parse("[PACK name=\"Rope\" qty=１０]").commands[0] {
+            BracketCommand::Pack { qty, qty_given, .. } => {
+                assert_eq!(*qty, 10, "full-width digits normalize to ASCII");
+                assert!(*qty_given, "a normalized token still carries replace semantics");
+            }
+            other => panic!("expected Pack, got {:?}", other),
+        }
+        // Floats / full-width periods / letter-digits: the clause DROPS —
+        // qty_given=false, the defaulted 1 never clobbers a stored stack.
+        for raw in [
+            "[PACK name=\"Rope\" qty=1.5]",
+            "[BELT name=\"Rope\" qty=1.5]",
+            "[PACK name=\"Rope\" qty=１．５]",
+            "[NPC_ITEM mara +\"Worn Ring\" qty=2.5]",
+        ] {
+            match &parse(raw).commands[0] {
+                BracketCommand::Pack { qty, qty_given, .. }
+                | BracketCommand::Belt { qty, qty_given, .. } => {
+                    assert!(!*qty_given, "{raw}: a malformed qty must drop the clause");
+                    assert_eq!(*qty, 1);
+                }
+                BracketCommand::NpcItem { qty, qty_given, .. } => {
+                    assert!(!*qty_given, "{raw}: a malformed qty must drop the clause");
+                    assert_eq!(*qty, 1);
+                }
+                other => panic!("{raw}: expected an item command, got {:?}", other),
+            }
+        }
+    }
+
     #[test]
     fn bracket_fragment_names_dropped_entirely() {
         // 1-2 char fragments + quote-only husks → bracket dropped (a dropped
@@ -7136,7 +8421,7 @@ mod tests {
         let parsed = parse("[BELT name=\"Healing Potion\" tags=consumable,pocketable]");
         match &parsed.commands[0] {
             BracketCommand::Belt { item_tags, .. } => {
-                assert_eq!(*item_tags, vec![equipment::ItemTag::Consumable, equipment::ItemTag::Pocketable]);
+                assert_eq!(*item_tags, vec![equipment::ItemTag::Consumable, equipment::ItemTag::Pouchable]);
             }
             other => panic!("expected Belt, got {:?}", other),
         }
@@ -7150,7 +8435,7 @@ mod tests {
         let parsed = parse(body);
         match &parsed.commands[0] {
             BracketCommand::Pack { item_tags, .. } => {
-                assert_eq!(*item_tags, vec![equipment::ItemTag::Consumable, equipment::ItemTag::Pocketable]);
+                assert_eq!(*item_tags, vec![equipment::ItemTag::Consumable, equipment::ItemTag::Pouchable]);
             }
             other => panic!("expected Pack, got {:?}", other),
         }
@@ -7172,7 +8457,7 @@ mod tests {
             BracketCommand::Pack { item_name, qty, item_tags, .. } => {
                 assert_eq!(item_name, "Lockpick");
                 assert_eq!(*qty, 3);
-                assert_eq!(*item_tags, vec![equipment::ItemTag::Pocketable]);
+                assert_eq!(*item_tags, vec![equipment::ItemTag::Pouchable]);
             }
             other => panic!("expected Pack, got {:?}", other),
         }
@@ -7232,7 +8517,7 @@ mod tests {
         match &parsed.commands[0] {
             BracketCommand::Belt { item_name, item_tags, .. } => {
                 assert_eq!(item_name, "Belt Knife");
-                assert_eq!(*item_tags, vec![equipment::ItemTag::Consumable, equipment::ItemTag::Pocketable]);
+                assert_eq!(*item_tags, vec![equipment::ItemTag::Consumable, equipment::ItemTag::Pouchable]);
             }
             other => panic!("expected Belt, got {:?}", other),
         }

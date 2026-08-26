@@ -23,17 +23,19 @@ export function variantCount(variants) {
 //   count, active    : the variant count + the 0-based active index
 //   isLastAssistant  : true iff this beat is the trailing assistant message
 //
-// ‹ (swipe-prev) is enabled iff a previous variant exists.
-// › (swipe-next) is enabled when a next variant exists, OR — only on the
-//   trailing assistant beat — to roll a FRESH variant via reroll (Regenerate
-//   is folded into ›). User beats can never reroll; a mid-history assistant
-//   beat can't either (reroll targets the trailing turn).
+// SWIPE LOCK (backend contract): only the TRAILING assistant beat may touch
+// its variants — the backend locks swipes once turns start, so ‹/› on a
+// mid-history beat is a guaranteed error no matter how many variants it
+// carries. ‹ (swipe-prev) and › (swipe-next / the Regenerate fold) are both
+// enabled ONLY on the trailing assistant; user beats never reroll and carry
+// a single variant, so their stepper stays dark regardless.
 // nextLabel reads "Regenerate" at the last variant (where › would reroll),
 // "Next variant" otherwise.
 export function computeDrawerState({ role, count, active, isLastAssistant }) {
   const atEnd = active >= count - 1;
-  const canPrev = active > 0;
-  const canNext = !atEnd || (role === 'assistant' && !!isLastAssistant);
+  const swipeable = role === 'assistant' && !!isLastAssistant;
+  const canPrev = swipeable && active > 0;
+  const canNext = swipeable;
   const nextLabel = atEnd ? 'Regenerate' : 'Next variant';
   return { atEnd, canPrev, canNext, nextLabel };
 }
@@ -59,4 +61,35 @@ export function swipeNextAction({ count, active }) {
 // state is advisory).
 export function canEditMessage({ role, isLastAssistant }) {
   return role === 'user' || !!isLastAssistant;
+}
+
+// True iff `beat` is the TRAILING MESSAGE of the feed (and an assistant).
+// `roleBeats` is the feed's ordered list of role-bearing beats (user +
+// assistant — system/error beats are DOM-only, never backend messages).
+// The backend swipe/edit contracts refuse any beat with a LATER message
+// (`swipe_variant`: "index N is not the trailing beat (len M)"), so the
+// trailing test runs over user+assistant beats TOGETHER: the last ASSISTANT
+// alone is not enough when a user beat follows it (the composer restore
+// after api_lost / a rewind leaves exactly that shape — its ‹/› must stay
+// dead, not error).
+export function isTrailingAssistantBeat(beat, roleBeats) {
+  if (!Array.isArray(roleBeats) || roleBeats.length === 0) return false;
+  const last = roleBeats[roleBeats.length - 1];
+  return last === beat
+    && !!beat && !!beat.dataset && beat.dataset.role === 'assistant';
+}
+
+// True while any of the stage's CENTERED POPUPS is open over the feed: the
+// saves popup (screens/saves.js `.fable-saves-popup-overlay`), the session
+// manager (screens/sessions.js `.fable-sessions-popup-overlay`), the
+// chronicle panel (panels/chronicle.js `[data-chronicle-overlay]`), and
+// the NPC dossier (engine/npc-dossier.js `[data-npc-dossier]` — mounted
+// inside the panel overlay host, so still a stage-root descendant). The
+// stage keyboard shortcuts (variant arrows → swipe/reroll, the composer's
+// Enter submit/stop) consult this so they can never fire invisibly UNDER
+// a modal. Pure DOM read on the passed root — no globals, no side effects.
+export function centeredPopupOpen(stageRoot) {
+  if (!stageRoot || typeof stageRoot.querySelector !== 'function') return false;
+  return !!stageRoot.querySelector(
+    '.fable-saves-popup-overlay, .fable-sessions-popup-overlay, [data-chronicle-overlay], [data-npc-dossier]');
 }

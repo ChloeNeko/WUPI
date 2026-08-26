@@ -201,6 +201,15 @@ impl HttpBackend {
         let client = reqwest::Client::builder()
             .default_headers(headers)
             .connect_timeout(std::time::Duration::from_secs(30))
+            // (2026-08-24 Part II B5) TCP keep-alive probes every 30s. The
+            // stream audit: Fable deliberately has NO total timeout (TTFT 30s
+            // + inter-chunk 120s guards only) — but an idle TCP connection
+            // with no keep-alive can be silently reaped by NATs / provider
+            // load balancers on long thinking pauses, surfacing as a
+            // mid-stream connection-reset rather than a clean timeout. The
+            // probes hold the socket open; no behavior change for healthy
+            // streams.
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self { profile, client }
@@ -522,6 +531,20 @@ impl GenerationClient for HttpBackend {
             // legit 5+ minute narrations).
             let mut got_first_token = false;
             let mut stream_done = false;
+            // (2026-08-24 observability) Accumulated reasoning_content chars
+            // this stream DISCARDED. The GLM wire-disable is supposed to
+            // make these never arrive (z.ai counts generated reasoning
+            // against max_tokens — a leak eats the beat budget invisibly);
+            // one warn per stream when a meaningful body slipped through.
+            let mut reasoning_chars: usize = 0;
+            let warn_reasoning_leak = |chars: usize| {
+                if chars > 64 {
+                    tracing::warn!(
+                        chars = chars,
+                        "GLM reasoning leaked through the wire disable — discarded (budget-eating regression signal)"
+                    );
+                }
+            };
             let idle_dur =
                 std::time::Duration::from_millis(crate::settings::API_CHUNK_IDLE_TIMEOUT_MS);
 
@@ -538,7 +561,7 @@ impl GenerationClient for HttpBackend {
                 RepKill(ParsedOutput),
             }
             let mut process_line =
-                |full_content: &mut String, got_first_token: &mut bool, line: &str| -> LineOutcome {
+                |full_content: &mut String, got_first_token: &mut bool, reasoning_chars: &mut usize, line: &str| -> LineOutcome {
                     if line.is_empty() || !line.starts_with("data:") {
                         return LineOutcome::Next;
                     }
@@ -588,6 +611,11 @@ impl GenerationClient for HttpBackend {
                             // + the logs/ mirror).
                             if let Some(rc) = choice.delta.reasoning_content {
                                 if !rc.is_empty() {
+                                    // (2026-08-24 observability) Count what we
+                                    // discard so a wire-disable regression
+                                    // surfaces in the logs (see
+                                    // `warn_reasoning_leak`).
+                                    *reasoning_chars += rc.chars().count();
                                     if !*got_first_token {
                                         tracing::debug!(
                                             ttft_ms = %ttft_start.elapsed().as_millis(),
@@ -732,7 +760,7 @@ impl GenerationClient for HttpBackend {
                     }
                     let line = String::from_utf8_lossy(&buffer[..sep_pos]).trim().to_string();
                     drop(buffer.drain(..end));
-                    match process_line(&mut full_content, &mut got_first_token, &line) {
+                    match process_line(&mut full_content, &mut got_first_token, &mut reasoning_chars, &line) {
                         LineOutcome::Next => {}
                         LineOutcome::Done => {
                             stream_done = true;
@@ -746,6 +774,7 @@ impl GenerationClient for HttpBackend {
                         }
                         LineOutcome::RepKill(out) => {
                             buffer.clear();
+                            warn_reasoning_leak(reasoning_chars);
                             drop(stream);
                             return Ok(out);
                         }
@@ -759,19 +788,21 @@ impl GenerationClient for HttpBackend {
             if !buffer.is_empty() {
                 let line = String::from_utf8_lossy(&buffer).trim().to_string();
                 buffer.clear();
-                match process_line(&mut full_content, &mut got_first_token, &line) {
+                match process_line(&mut full_content, &mut got_first_token, &mut reasoning_chars, &line) {
                     LineOutcome::Next | LineOutcome::Done => {}
                     LineOutcome::Fail(msg) => {
                         drop(stream);
                         return Err(anyhow::anyhow!("API provider error (in-band): {msg}"));
                     }
                     LineOutcome::RepKill(out) => {
+                        warn_reasoning_leak(reasoning_chars);
                         drop(stream);
                         return Ok(out);
                     }
                 }
             }
 
+            warn_reasoning_leak(reasoning_chars);
             Ok(ParsedOutput {
                 content: full_content,
                 reasoning: String::new(),

@@ -40,6 +40,7 @@
 // =============================================================
 
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
+import { bottomWarning } from './stage.js';
 import { openPortraitCropper } from './portrait-cropper.js';
 import { bytesToBase64 } from './wizard-engine.js';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
@@ -125,8 +126,10 @@ export async function renderWorlds(root, handlers) {
   closeModal(root);
   // A sessions/saves popup left over from a resumed game (the popup outlives
   // the screen swap inside the hidden worlds screen) must not cover the grid.
-  closeSavesModal(root);
-  closeSessionsModal(root);
+  // (2026-08-24 review fix) Both now run the popup's FULL teardown — the old
+  // bare element sweep orphaned the document-capture Esc handlers.
+  closeSavesModal();
+  closeSessionsModal();
   let cards = [];
   try {
     cards = await invoke('fable_cards_list');
@@ -304,6 +307,26 @@ async function openModal(root, meta) {
   card.querySelector('[data-modal-delete]').addEventListener('click', () => {
     confirmDelete(root, meta);
   });
+  // (2026-08-24 Part II D2) EXPORT — zip the whole campaign (card folder +
+  // linked codices + the saves tree) to an OS-dialog destination. The modal
+  // stays open; the button latches while the zip builds; the resulting path
+  // surfaces on the document-level warning line (worlds has no stage toast).
+  // An empty path return = the user cancelled the dialog (silent no-op).
+  card.querySelector('[data-modal-export]').addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    if (btn.disabled) return;
+    btn.disabled = true;
+    btn.textContent = 'EXPORTING…';
+    try {
+      const path = await invoke('fable_campaign_export', { cardId: meta.id });
+      if (path) bottomWarning(`Campaign exported → ${path}`);
+    } catch (err) {
+      bottomWarning(`Export failed: ${err}`);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'EXPORT';
+    }
+  });
 }
 
 // Re-run a card's modal open after an out-of-band change (the raw-XML
@@ -401,9 +424,9 @@ function findRootClose(text) {
 // (2026-08-15 Chloe: the load menu must match the review exactly). The .sim is
 // TWO-ROOT (<sim_card> + its siblings), so slice at </sim_card> first — the
 // same trick sim_card.rs::parse uses; DOMParser rejects two-root documents.
-// Handles BOTH generations: v2 line-block identity/persona + the
-// world/location/inventory siblings, and the legacy element format.
-// Best-effort: any failure returns {} and the caller falls back to list-meta.
+// v2 line-block identity/persona + the world/location/intro/inventory
+// siblings. Best-effort: any failure returns {} and the caller falls back
+// to list-meta.
 function parseSimDraft(xmlText, subtype) {
   const out = { card_type: subtype || '' };
   try {
@@ -423,10 +446,7 @@ function parseSimDraft(xmlText, subtype) {
       const el = doc.querySelector(sel);
       return el ? el.textContent.trim() : '';
     };
-    // ── v2 detection: the direct <identity> child is a text LINE BLOCK (no
-    // <name> element child) — the legacy shape nests <name>/<persona> inside.
     const identityEl = doc.querySelector('sim_card > identity');
-    const isV2 = !!identityEl && !identityEl.querySelector('name');
     // Split a CDATA line block into {label → value} pairs.
     const labeled = (block) => {
       const map = {};
@@ -439,116 +459,45 @@ function parseSimDraft(xmlText, subtype) {
     };
     const listVal = (v) => (v ? v.split(',').map((s) => s.trim()).filter(Boolean) : []);
 
-    if (isV2) {
-      const idm = labeled(identityEl.textContent);
-      out.name = idm.name || '';
-      const ID_MAP = {
-        gender: 'gender', race: 'race', age: 'age', height: 'height', weight: 'weight',
-        body: 'body_type', skin: 'skin_complexion', eyes: 'eye_color',
-        hair_color: 'hair_color', hair_length: 'hair_length', hair_style: 'hair_style',
-        breast: 'breast_size', ears: 'ears', tail: 'tail', horn: 'horn',
-      };
-      for (const [k, key] of Object.entries(ID_MAP)) {
-        if (idm[k]) out[key] = idm[k];
-      }
-      // The v2 <persona> line block (direct child).
-      const personaEl = doc.querySelector('sim_card > persona');
-      if (personaEl) {
-        const pm = labeled(personaEl.textContent);
-        if (pm.personality) out.personality = pm.personality;
-        if (pm.conversation_style) out.dialogue_style = pm.conversation_style;
-        if (pm.likes) out.likes = pm.likes;
-        if (pm.dislikes) out.dislikes = pm.dislikes;
-        if (pm.flaws) out.flaws = pm.flaws;
-        if (pm.goals) out.goal = pm.goals;
-        if (pm.occupation) out.job = pm.occupation;
-        if (pm.backstory) out.backstory = pm.backstory;
-      }
-      // scenario/world dedicated prose.
-      out.setting = q('sim_card > setting');
-      const plot = q('sim_card > plot');
-      if (plot) {
-        const plm = labeled(plot);
-        out.directive = plm.premise || '';
-        if (plm.trigger) out.trigger_condition = plm.trigger;
-        if (plm.objective) out.primary_objective = plm.objective;
-        if (plm.actors) out.participating_actors = plm.actors;
-        if (plm.hazards) out.environmental_hazards = plm.hazards;
-        if (plm.outcomes) out.outcomes = plm.outcomes;
-        // Legacy npc goal form.
-        const gm = plot.match(/^Goal:\s*([\s\S]*)$/);
-        if (gm && gm[1].trim()) out.goal = gm[1].trim();
-      }
-      // The tail siblings are read by the COMMON block below (both card
-      // generations carry them).
-    } else {
-    // ── legacy format ──
-    out.name = q('identity > name') || q('name');
-    out.setting = q('setting');
-    out.tone = q('tone');
-    const persona = q('identity > persona') || q('persona');
-    out.dialogue_style = q('conversational_style > rules');
-    const npcRole = q('cast > npc > role');
-    if (npcRole) out.job = npcRole;
-    out.date = q('start > date');
-    out.time = q('start > time');
-    out.weather = q('start > weather');
-    // The legacy NPC <appearance> block: `Tag: value` lines.
-    const appearance = q('appearance');
-    if (appearance) {
-      const MAP = {
-        Gender: 'gender', Race: 'race', Age: 'age', Height: 'height', Weight: 'weight',
-        'Hair color': 'hair_color', 'Hair length': 'hair_length', 'Hair style': 'hair_style',
-        Body: 'body_type', Skin: 'skin_complexion', Eyes: 'eye_color',
-        Breast: 'breast_size', Ears: 'ears', Tail: 'tail', Horn: 'horn',
-      };
-      for (const line of appearance.split(/\r?\n/)) {
-        const m = line.match(/^\s*([^:]+?)\s*:\s*(.+?)\s*$/);
-        if (!m) continue;
-        if (m[1] === 'Clothing') {
-          out.clothing = m[2].split(',').map((s) => s.trim()).filter(Boolean);
-        } else if (m[1] === 'Accessories') {
-          out.accessories = m[2].split(',').map((s) => s.trim()).filter(Boolean);
-        } else if (MAP[m[1]]) {
-          out[MAP[m[1]]] = m[2];
-        }
-      }
+    const idm = labeled(identityEl ? identityEl.textContent : '');
+    out.name = idm.name || '';
+    const ID_MAP = {
+      gender: 'gender', race: 'race', age: 'age', height: 'height', weight: 'weight',
+      body: 'body_type', skin: 'skin_complexion', eyes: 'eye_color',
+      hair_color: 'hair_color', hair_length: 'hair_length', hair_style: 'hair_style',
+      breast: 'breast_size', ears: 'ears', tail: 'tail', horn: 'horn',
+    };
+    for (const [k, key] of Object.entries(ID_MAP)) {
+      if (idm[k]) out[key] = idm[k];
     }
-    // persona reads as the world/scenario Purpose (the serializer wrote the
-    // directive there); on an NPC it's the serializer's labeled composition —
-    // split the labels back into draft keys. Unlabeled prose falls to
-    // backstory.
-    if (persona) {
-      if ((subtype || '').toLowerCase() === 'npc') {
-        const LABELS = { Personality: 'personality', Flaws: 'flaws', Likes: 'likes', Dislikes: 'dislikes', Occupation: 'job', Backstory: 'backstory', Gear: 'gear', Tools: 'tools', Weapons: 'weapons' };
-        const parts = persona.split(/\r?\n\r?\n(?=(?:Personality|Flaws|Likes|Dislikes|Occupation|Backstory|Gear|Tools|Weapons):)/);
-        const leftovers = [];
-        for (const part of parts) {
-          const m = part.match(/^(Personality|Flaws|Likes|Dislikes|Occupation|Backstory|Gear|Tools|Weapons):\s*([\s\S]*)$/);
-          if (!m) { if (part.trim()) leftovers.push(part.trim()); continue; }
-          const val = m[2].trim();
-          if (!val) continue;
-          const key = LABELS[m[1]];
-          out[key] = ['gear', 'tools', 'weapons'].includes(key)
-            ? val.split(',').map((s) => s.trim()).filter(Boolean)
-            : val;
-        }
-        if (leftovers.length) out.backstory = [out.backstory, ...leftovers].filter(Boolean).join('\n\n');
-      } else {
-        out.directive = persona;
-      }
+    // The <persona> line block (direct child).
+    const personaEl = doc.querySelector('sim_card > persona');
+    if (personaEl) {
+      const pm = labeled(personaEl.textContent);
+      if (pm.personality) out.personality = pm.personality;
+      if (pm.conversation_style) out.dialogue_style = pm.conversation_style;
+      if (pm.likes) out.likes = pm.likes;
+      if (pm.dislikes) out.dislikes = pm.dislikes;
+      if (pm.flaws) out.flaws = pm.flaws;
+      if (pm.goals) out.goal = pm.goals;
+      if (pm.occupation) out.job = pm.occupation;
+      if (pm.backstory) out.backstory = pm.backstory;
     }
-    // NPC: the card-level <plot> carries the goal (the serializer wrote
-    // "Goal: …"). Scenario <plot> stays a scenario-only concern.
-    if ((subtype || '').toLowerCase() === 'npc') {
-      const gm = q('plot').match(/^Goal:\s*([\s\S]*)$/);
-      if (gm && gm[1].trim()) out.goal = gm[1].trim();
-    }
+    // scenario/world dedicated prose.
+    out.setting = q('sim_card > setting');
+    const plot = q('sim_card > plot');
+    if (plot) {
+      const plm = labeled(plot);
+      out.directive = plm.premise || '';
+      if (plm.trigger) out.trigger_condition = plm.trigger;
+      if (plm.objective) out.primary_objective = plm.objective;
+      if (plm.actors) out.participating_actors = plm.actors;
+      if (plm.hazards) out.environmental_hazards = plm.hazards;
+      if (plm.outcomes) out.outcomes = plm.outcomes;
     }
 
-    // ── tail siblings — BOTH generations (v2 world-state seeds + the intro;
-    // legacy cards carry the same `<intro>` sibling). The FULL `<intro>` text
-    // is the modal's Intro section (2026-08-20 Chloe: the intro never cuts
+    // ── tail siblings (v2 world-state seeds + the intro). The FULL `<intro>`
+    // text is the modal's Intro section (2026-08-20 Chloe: the intro never cuts
     // off — the 240-char `opening_scene_preview` list blurb is only the
     // unreadable-card fallback in buildModalModel).
     if (tail.trim()) {
@@ -569,7 +518,7 @@ function parseSimDraft(xmlText, subtype) {
         // the first is the default opening (out.intro — the modal's Intro
         // section), the rest ride as out.intro_variants so an EDIT run
         // re-emits them instead of silently dropping the alternates.
-        const introList = Array.from(tdoc.querySelectorAll('intro, introduction'))
+        const introList = Array.from(tdoc.querySelectorAll('intro'))
           .map((el) => el.textContent.trim())
           .filter(Boolean);
         if (introList.length) {
@@ -659,6 +608,7 @@ async function renderModalCard(card) {
     <div class="fable-player-modal-actions">
       <button type="button" class="fable-player-modal-btn fable-player-modal-btn--load" data-modal-new>NEW</button>
       <button type="button" class="fable-player-modal-btn fable-player-modal-btn--load" data-modal-resume>LOAD</button>
+      <button type="button" class="fable-player-modal-btn fable-player-modal-btn--edit" data-modal-export>EXPORT</button>
       <button type="button" class="fable-player-modal-btn fable-player-modal-btn--edit" data-modal-edit>EDIT</button>
       <button type="button" class="fable-player-modal-btn fable-player-modal-btn--delete" data-modal-delete>DELETE</button>
     </div>`;

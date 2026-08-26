@@ -99,20 +99,27 @@ const DEV_SCHEMA = {
       feet:      { outer: { name: 'Worn Travel Boots', tags: ['equippable'] } },
     },
     belt: [
-      { name: 'Health Potion', qty: 2, weight: 0.5, stats: 'restores 2d4 HP', tags: ['consumable', 'pocketable'] },
-      { name: 'Lockpick Set',  qty: 1, weight: 0.2, tags: ['pocketable'] },
-      { name: 'Throwing Knife', qty: 3, weight: 0.25, tags: ['equippable', 'pocketable'] },
+      { name: 'Health Potion', qty: 2, weight: 0.5, stats: 'restores 2d4 HP', tags: ['consumable', 'pouchable'] },
+      { name: 'Lockpick Set',  qty: 1, weight: 0.2, tags: ['pouchable'] },
+      { name: 'Throwing Knife', qty: 3, weight: 0.25, tags: ['equippable', 'pouchable'] },
       { name: 'Torch',         qty: 1, weight: 1.0 },
+    ],
+    // (2026-08-23 pouch ruling) The wallet stack — auto-routed coin/keys/ID
+    // cargo; the POUCH dock icon renders it in the dev preview too.
+    pouch: [
+      { name: 'Silver Coins',  qty: 12, weight: 0.02 },
+      { name: 'Brass Key',     qty: 1, weight: 0.1, stats: 'stamped with the mill mark' },
+      { name: 'Identity Papers', qty: 1, weight: 0.05 },
+      { name: 'Ruby',          qty: 1, weight: 0.1 },
     ],
     pack: [
       { name: 'Bedroll',           qty: 1, weight: 3.0 },
       { name: 'Rations',           qty: 4, weight: 1.0, tags: ['consumable'] },
       { name: 'Hempen Rope',       qty: 1, weight: 2.5, stats: '50 feet' },
-      { name: 'Antidote',          qty: 1, weight: 0.2, tags: ['consumable', 'pocketable'] },
+      { name: 'Antidote',          qty: 1, weight: 0.2, tags: ['consumable', 'pouchable'] },
       { name: 'Sealed Letter',     qty: 1, weight: 0.05, stats: 'wax seal unbroken' },
       { name: 'Tinderbox',         qty: 1, weight: 0.5 },
       { name: 'Old Map',           qty: 1, weight: 0.1 },
-      { name: 'Silver Coin Pouch', qty: 1, weight: 0.3, stats: '12 coins' },
     ],
   },
 };

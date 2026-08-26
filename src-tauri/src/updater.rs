@@ -247,20 +247,15 @@ pub async fn perform_update(
     std::process::exit(0);
 }
 
-/// Delete the updater's marker files if present. The `%TEMP%` marker
+/// Delete the updater's marker file if present. The `%TEMP%` marker
 /// (`wupi_update_result.json`) is PRESENCE-ONLY — the updater's
 /// user-takeover signal (it touches the empty file before its relaunch
 /// loop; a boot from this install deleting it = the user took over) — and
 /// carries no outcome: NO update result is ever surfaced to the UI
 /// (2026-08-20 Chloe ruling — a crashed update leaves crash logs; the
-/// updater's `%TEMP%` log is the apply-side trail). `exe_dir` is used ONLY
-/// for the one-hop legacy cleanup: the prior version's updater wrote
-/// `data/_update_result.json`, and this is the only code that will ever
-/// remove such a leftover — after one update hop + one boot the legacy
-/// path can never reappear, so the install folder stays marker-free.
-pub fn clear_result_markers(exe_dir: &Path) {
+/// updater's `%TEMP%` log is the apply-side trail).
+pub fn clear_result_markers() {
     let _ = std::fs::remove_file(std::env::temp_dir().join("wupi_update_result.json"));
-    let _ = std::fs::remove_file(exe_dir.join("data").join("_update_result.json"));
 }
 
 /// Resolve `<exe_dir>` — the directory containing `wupi.exe`.

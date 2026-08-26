@@ -6,8 +6,9 @@
 // MENU STATE: the menu buttons (Continue / New Game / Load / Online / Exit)
 // are wired to real handlers in fable.js. Continue resumes the freshest New
 // Game save (target stashed by _refreshTitleGate); New Game opens the card
-// picker; Load opens the worlds → saves picker; Online opens the in-Fable API
-// connection window. EXIT is the only close path
+// picker; Load opens the three-way LOAD split (PLAYER / SIM / CODEX, the
+// 2026-08-23 rework); Online opens the in-Fable API connection window. EXIT
+// is the only close path
 // (closes the app via the lifecycle manager).
 //
 // PARTICLES: the floating pollen/spore motes are a canvas particle system
@@ -122,7 +123,7 @@ export function buildTitle(handlers) {
            than firing a no-op click. -->
       <button class="fable-title-btn" data-act="continue" disabled>Continue</button>
       <button class="fable-title-btn" data-act="new" disabled>New Game</button>
-      <button class="fable-title-btn" data-act="load" disabled>Load Game</button>
+      <button class="fable-title-btn" data-act="load" disabled>Load</button>
       <button class="fable-title-btn fable-title-btn--online" data-act="online">Online</button>
       <button class="fable-title-btn" data-act="exit">Exit</button>
     </div>

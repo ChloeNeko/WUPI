@@ -140,6 +140,14 @@ pub struct MemoryEntry {
     /// which groups chunks of ONE message only and is NULL on single-chunk
     /// rows — neither key subsumes the other.
     pub turn_uuid: Option<String>,
+    /// (2026-08-22 multihog WS4) Pin flag — a pinned row neither counts
+    /// toward the [`MAX_EPISODIC_CHUNKS`] cap nor evicts (Multihog's
+    /// no-eviction-cascade rule). Pinned by TURN via
+    /// [`MemoryEngine::set_turn_pinned`], so in practice every row of a
+    /// pinned turn carries the flag together (turn-atomic pinning +
+    /// turn-atomic eviction stay in step).
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// The default `card_id` for memory that belongs to no specific simulation -
@@ -228,6 +236,11 @@ pub const CODEX_CARD_ID: &str = "__codex__";
 /// on sub-token-heavy roleplay text.
 pub const CHUNK_CHAR_BUDGET: usize = 1300;
 
+/// (2026-08-26) Minimum size of the tail chunk a hard char cut may strand
+/// (see `split_long_paragraph`) — keeps 1-2 char punctuation remainders
+/// from ever becoming their own archived chunk.
+const CHUNK_TAIL_FLOOR: usize = 32;
+
 /// Retention watermark: the maximum number of EPISODIC rows a card partition
 /// may hold before the next archival fires the prune (§4 retention policy,
 /// 2026-08-15). Per-partition (per `card_id`, including [`WUPI_CARD_ID`] —
@@ -259,6 +272,19 @@ pub struct RankedMemory {
     /// other list's rank is naturally absent).
     #[serde(default)]
     pub debug: DebugScores,
+}
+
+/// (2026-08-24 Part II C3) One Chronicle row: an archived TURN as the panel
+/// sees it. `snippet` is the turn's first chunk's head (the player-facing
+/// preview), `chunks` the row count, `pinned` the turn's flag (turn-granular
+/// — every row of the turn flips together).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TurnListRow {
+    pub turn_uuid: String,
+    pub snippet: String,
+    pub timestamp: i64,
+    pub pinned: bool,
+    pub chunks: u32,
 }
 
 /// Raw retrieval diagnostics for one fused result. Used to calibrate
@@ -491,6 +517,17 @@ fn ensure_vec_loaded() {
 // ---------------------------------------------------------------------------
 // Engine
 // ---------------------------------------------------------------------------
+
+/// (2026-08-23 WS6) One un-consolidated archived TURN, grouped for the
+/// consolidation worker: the turn key plus its constituent rows in
+/// (role, text) order (chunks of one message concatenated in chunk order).
+/// The JOURNAL's granularity — consolidation consumes whole turns, never
+/// loose lines.
+#[derive(Debug, Clone)]
+pub struct UnconsolidatedTurn {
+    pub turn_uuid: String,
+    pub parts: Vec<(Role, String)>,
+}
 
 /// Hybrid search engine. Owns one SQLite connection (behind a Mutex) and an
 /// embedder. Generic over `E` so tests inject a [`crate::memory_embedder::StubEmbedder`]
@@ -734,6 +771,21 @@ impl<E: Embedder> MemoryEngine<E> {
             };
             let codex_ids = codex_ids_among(&c, &candidate_ids)?;
 
+            // (2026-08-24 bug-1 fix) The sparse path passes the SAME dense
+            // floor: sparse-only candidates are verified against the ONE
+            // query embedding over their stored vec0 vectors (fetched by
+            // rowid), dense-list members reuse their distance — the floor is
+            // the rejection authority on BOTH recall paths, BM25 is
+            // precision-boost only.
+            let sparse = crate::memory_rrf::gate_sparse_on_floor(
+                &sparse,
+                &dense,
+                &sparse_candidate_cosines(&c, &sparse, &dense, &embedding)?,
+                floor,
+                &codex_ids,
+                crate::memory_rrf::CODEX_DENSE_FLOOR,
+            );
+
             let fused = crate::memory_rrf::fuse_scored_rrf(
                 &sparse,
                 &dense,
@@ -840,6 +892,18 @@ impl<E: Embedder> MemoryEngine<E> {
             };
             let codex_ids = codex_ids_among(&c, &candidate_ids)?;
 
+            // (2026-08-24 bug-1 fix) Same sparse-path dense-floor gate as
+            // `search` — see there. Runs on the RE-SORTED merged lists, and
+            // preserves their order (the re-sort-before-fusion rule).
+            let sparse = crate::memory_rrf::gate_sparse_on_floor(
+                &sparse,
+                &dense,
+                &sparse_candidate_cosines(&c, &sparse, &dense, &embedding)?,
+                floor,
+                &codex_ids,
+                crate::memory_rrf::CODEX_DENSE_FLOOR,
+            );
+
             let fused = crate::memory_rrf::fuse_scored_rrf(
                 &sparse,
                 &dense,
@@ -878,6 +942,7 @@ impl<E: Embedder> MemoryEngine<E> {
         active_card_id: &str,
         limit: usize,
         dense_floor: Option<f32>,
+        proximity: Option<&crate::memory_rrf::SceneProximityTerms>,
     ) -> anyhow::Result<Vec<RankedMemory>> {
         const RETRIEVAL_DEPTH: usize = 64;
 
@@ -886,6 +951,9 @@ impl<E: Embedder> MemoryEngine<E> {
 
         let query_owned = query.to_owned();
         let active_card_owned = active_card_id.to_owned();
+        // spawn_blocking is 'static — the tie-break terms ride as an owned
+        // clone (small: a handful of names + one node id).
+        let proximity_owned = proximity.cloned();
         let conn = self.conn.clone();
         Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<RankedMemory>> {
             let c = lock_conn(&conn);
@@ -948,6 +1016,17 @@ impl<E: Embedder> MemoryEngine<E> {
             };
             let codex_ids = codex_ids_among(&c, &candidate_ids)?;
 
+            // (2026-08-24 bug-1 fix) Same sparse-path dense-floor gate as
+            // `search` — see there.
+            let sparse = crate::memory_rrf::gate_sparse_on_floor(
+                &sparse,
+                &dense,
+                &sparse_candidate_cosines(&c, &sparse, &dense, &embedding)?,
+                floor,
+                &codex_ids,
+                crate::memory_rrf::CODEX_DENSE_FLOOR,
+            );
+
             let fused = crate::memory_rrf::fuse_scored_rrf(
                 &sparse,
                 &dense,
@@ -958,6 +1037,13 @@ impl<E: Embedder> MemoryEngine<E> {
                 limit,
             );
             let hydrated = fetch_entries(&c, &fused)?;
+            // (2026-08-24 Part II B6) Scene-proximity tie-break on the
+            // HYDRATED entries (text lives here, not in the fused shells):
+            // among EXACT score ties, a memory mentioning a present NPC or
+            // the current node lifts above equal-scored strangers. None =
+            // today's behavior.
+            let mut hydrated = hydrated;
+            crate::memory_rrf::apply_proximity_tie_break(&mut hydrated, proximity_owned.as_ref());
             Ok(hydrated)
         })
         .await
@@ -1056,6 +1142,11 @@ impl<E: Embedder> MemoryEngine<E> {
                 .map_err(|e| anyhow::anyhow!("delete memories_fts: {e:?}"))?;
             tx.execute("DELETE FROM memories_vec WHERE rowid = ?1", params![id])
                 .map_err(|e| anyhow::anyhow!("delete memories_vec: {e:?}"))?;
+            // The journal dies with its rows — every other delete path sweeps
+            // orphans; this per-row delete keeps the same invariant without
+            // the global sweep (codex rows carry no journal rows: no-op there).
+            tx.execute("DELETE FROM memory_journal WHERE row_id = ?1", params![id])
+                .map_err(|e| anyhow::anyhow!("delete memory_journal: {e:?}"))?;
             tx.commit()
                 .map_err(|e| anyhow::anyhow!("commit delete txn: {e:?}"))?;
             Ok(())
@@ -1086,7 +1177,7 @@ impl<E: Embedder> MemoryEngine<E> {
             let mut stmt = c
                 .prepare(
                     "SELECT id, text_content, timestamp, role, chunk_index, salience,
-                            metadata_json, card_id, session_id, parent_uuid, turn_uuid
+                            metadata_json, card_id, session_id, parent_uuid, turn_uuid, pinned
                      FROM memories
                      WHERE card_id = ?1
                      ORDER BY id DESC
@@ -1273,6 +1364,12 @@ impl<E: Embedder> MemoryEngine<E> {
                 [],
             )
             .map_err(|e| anyhow::anyhow!("wipe memories_vec orphans: {e:?}"))?;
+            // (2026-08-22 multihog WS4) The journal follows its rows.
+            tx.execute(
+                "DELETE FROM memory_journal WHERE row_id NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("wipe memory_journal orphans: {e:?}"))?;
 
             tx.commit()
                 .map_err(|e| anyhow::anyhow!("commit wipe txn: {e:?}"))?;
@@ -1337,9 +1434,13 @@ impl<E: Embedder> MemoryEngine<E> {
             // `add_memory` hardcodes metadata_json = None; only
             // `add_codex_entry` writes it). Codex rows are neither counted
             // nor evicted.
+            // (2026-08-22 multihog WS4) Episodic ≡ `metadata_json IS
+            // NULL AND pinned = 0`: pinned rows neither count toward the
+            // cap nor evict (Multihog's no-eviction-cascade rule).
             let count: i64 = c
                 .query_row(
-                    "SELECT COUNT(*) FROM memories WHERE card_id = ?1 AND metadata_json IS NULL",
+                    "SELECT COUNT(*) FROM memories
+                     WHERE card_id = ?1 AND metadata_json IS NULL AND pinned = 0",
                     params![&card_id],
                     |r| r.get(0),
                 )
@@ -1356,7 +1457,7 @@ impl<E: Embedder> MemoryEngine<E> {
             let mut stmt = c
                 .prepare(
                     "SELECT id, turn_uuid FROM memories
-                     WHERE card_id = ?1 AND metadata_json IS NULL
+                     WHERE card_id = ?1 AND metadata_json IS NULL AND pinned = 0
                      ORDER BY id ASC",
                 )
                 .map_err(|e| anyhow::anyhow!("prepare prune walk: {e:?}"))?;
@@ -1393,9 +1494,13 @@ impl<E: Embedder> MemoryEngine<E> {
                     .map(|i| format!("?{}", i + 2))
                     .collect::<Vec<_>>()
                     .join(", ");
+                // (WS4) `AND pinned = 0` here too: pinning is a PER-ROW
+                // lock that outranks turn-atomic eviction. In practice the
+                // pin API is turn-granular (every row of a turn pins
+                // together), so the expansion never splits a turn.
                 let sql = format!(
                     "SELECT id FROM memories
-                     WHERE card_id = ?1 AND metadata_json IS NULL
+                     WHERE card_id = ?1 AND metadata_json IS NULL AND pinned = 0
                        AND turn_uuid IN ({placeholders})"
                 );
                 let mut params_vec: Vec<&dyn rusqlite::ToSql> =
@@ -1454,12 +1559,629 @@ impl<E: Embedder> MemoryEngine<E> {
                 [],
             )
             .map_err(|e| anyhow::anyhow!("prune sweep memories_vec: {e:?}"))?;
+            // (2026-08-22 multihog WS4) The journal dies with its rows —
+            // the same orphan sweep, keeping it a live index.
+            tx.execute(
+                "DELETE FROM memory_journal WHERE row_id NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("prune sweep memory_journal: {e:?}"))?;
             tx.commit()
                 .map_err(|e| anyhow::anyhow!("commit prune txn: {e:?}"))?;
             Ok(deleted)
         })
         .await
         .map_err(|e| anyhow::anyhow!("prune join: {e}"))??)
+    }
+
+    /// (2026-08-22 multihog WS4) Roll back ONE archived turn: delete every
+    /// row carrying `(card_id, turn_uuid)` with the three-table discipline
+    /// (core delete + FTS5/vec0 orphan sweep) + journal cleanup, all in one
+    /// transaction. The enforcement + foundation half of the turn journal —
+    /// mechanically available for the manager/debug surface, and the
+    /// substrate the (2026-08-23 WS6, now-live) consolidation job required.
+    /// Returns the deleted core-row count (0 = no such turn).
+    pub async fn rollback_turn(
+        &self,
+        card_id: &str,
+        turn_uuid: &str,
+    ) -> anyhow::Result<usize> {
+        // (2026-08-23 audit fix) A `consol_*` key is a consolidation BATCH
+        // summary, not an episodic turn: deleting it here would strand its
+        // sources behind `superseded_by` with no flag-clearing surface —
+        // the facts would be permanently unretrievable. The consolidation
+        // rollback owns that key-space.
+        anyhow::ensure!(
+            !turn_uuid.starts_with("consol_"),
+            "rollback_turn: '{turn_uuid}' is a consolidation batch summary — use rollback_consolidation"
+        );
+        let conn = self.conn.clone();
+        let card_id = card_id.to_owned();
+        let turn_uuid = turn_uuid.to_owned();
+        Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let c = lock_conn(&conn);
+            let tx = c
+                .unchecked_transaction()
+                .map_err(|e| anyhow::anyhow!("begin rollback txn: {e:?}"))?;
+            let deleted = tx
+                .execute(
+                    "DELETE FROM memories WHERE card_id = ?1 AND turn_uuid = ?2",
+                    params![&card_id, &turn_uuid],
+                )
+                .map_err(|e| anyhow::anyhow!("rollback memories: {e:?}"))?;
+            tx.execute(
+                "DELETE FROM memories_fts WHERE rowid NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("rollback sweep memories_fts: {e:?}"))?;
+            tx.execute(
+                "DELETE FROM memories_vec WHERE rowid NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("rollback sweep memories_vec: {e:?}"))?;
+            tx.execute(
+                "DELETE FROM memory_journal WHERE card_id = ?1 AND turn_uuid = ?2",
+                params![&card_id, &turn_uuid],
+            )
+            .map_err(|e| anyhow::anyhow!("rollback memory_journal: {e:?}"))?;
+            tx.commit()
+                .map_err(|e| anyhow::anyhow!("commit rollback txn: {e:?}"))?;
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("rollback_turn join: {e}"))??)
+    }
+
+    /// (2026-08-22 multihog WS4) Pin or unpin ONE archived turn — every row
+    /// carrying `(card_id, turn_uuid)` flips together (pin by TURN: the
+    /// granularity eviction + rollback already operate at, so a pinned turn
+    /// is atomic in every direction). Pinned rows neither count toward the
+    /// retention cap nor evict. Returns the flipped row count.
+    pub async fn set_turn_pinned(
+        &self,
+        card_id: &str,
+        turn_uuid: &str,
+        pinned: bool,
+    ) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let card_id = card_id.to_owned();
+        let turn_uuid = turn_uuid.to_owned();
+        Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let c = lock_conn(&conn);
+            // (2026-08-24 review P2) Superseded rows refuse the pin: they
+            // are invisible to retrieval, and a pinned row never evicts —
+            // pinning one would mint a permanent ghost. (Unpin is equally
+            // gated, which is safe because `consolidate_apply`'s supersede
+            // guard carries `pinned = 0`: a pinned row can never BE
+            // superseded, so no pinned-superseded stratum exists to unstick.)
+            c.execute(
+                "UPDATE memories SET pinned = ?1
+                 WHERE card_id = ?2 AND turn_uuid = ?3
+                   AND superseded_by IS NULL",
+                params![pinned as i64, &card_id, &turn_uuid],
+            )
+            .map_err(|e| anyhow::anyhow!("set_turn_pinned: {e:?}"))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("set_turn_pinned join: {e}"))??)
+    }
+
+    /// (2026-08-24 Part II C3) List the card's archived episodic TURNS,
+    /// newest first, grouped by `turn_uuid` (the raw `memory_list` is
+    /// chunk-granular — the panel needs the turn grouping the journal +
+    /// rollback + pin all operate at). Consolidation batches (`consol_*`)
+    /// are DELIBERATELY excluded: they are system artifacts whose proper
+    /// reversal is `rollback_consolidation`, not the turn rollback the
+    /// panel exposes. (2026-08-24 review P2) SUPERSEDED turns are excluded
+    /// too — they are invisible to retrieval; listing them invited a PIN on
+    /// invisible rows (pinned rows never evict = permanent ghosts). `limit`
+    /// is clamped to 1..=500.
+    pub async fn list_turns(
+        &self,
+        card_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<TurnListRow>> {
+        let conn = self.conn.clone();
+        let card_id = card_id.to_owned();
+        let limit = limit.clamp(1, 500);
+        Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<TurnListRow>> {
+            let c = lock_conn(&conn);
+            let mut stmt = c
+                .prepare(
+                    "SELECT turn_uuid,
+                            (SELECT text_content FROM memories m2
+                              WHERE m2.card_id = m.card_id
+                                AND m2.turn_uuid = m.turn_uuid
+                              ORDER BY m2.id ASC LIMIT 1) AS snippet,
+                            MAX(timestamp) AS ts,
+                            MAX(pinned) AS pinned,
+                            COUNT(*) AS chunks
+                     FROM memories m
+                     WHERE m.card_id = ?1
+                       AND m.turn_uuid IS NOT NULL
+                       AND m.turn_uuid NOT LIKE 'consol\\_%' ESCAPE '\\'
+                       AND m.superseded_by IS NULL
+                     GROUP BY m.turn_uuid
+                     ORDER BY MAX(m.id) DESC
+                     LIMIT ?2",
+                )
+                .map_err(|e| anyhow::anyhow!("list_turns prepare: {e:?}"))?;
+            let rows = stmt
+                .query_map(params![&card_id, limit as i64], |r| {
+                    let snippet: String = r.get::<_, Option<String>>(1)?.unwrap_or_default();
+                    Ok(TurnListRow {
+                        turn_uuid: r.get::<_, String>(0)?,
+                        snippet: snippet.chars().take(200).collect(),
+                        timestamp: r.get::<_, i64>(2)?,
+                        pinned: r.get::<_, i64>(3)? != 0,
+                        chunks: r.get::<_, i64>(4)? as u32,
+                    })
+                })
+                .map_err(|e| anyhow::anyhow!("list_turns query: {e:?}"))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("list_turns row: {e:?}"))?;
+            Ok(rows)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("list_turns join: {e}"))??)
+    }
+
+    /// (2026-08-23 WS6) Count the card's un-consolidated episodic TURNS —
+    /// distinct turn keys that are live (not superseded), un-pinned,
+    /// non-codex, and not themselves consolidation batches (`consol_*`).
+    /// The worker's trigger reads this (> [`TRIGGER`] threshold → run).
+    pub async fn count_unconsolidated_turns(&self, card_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let card_id = card_id.to_owned();
+        Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let c = lock_conn(&conn);
+            c.query_row(
+                "SELECT COUNT(DISTINCT turn_uuid) FROM memories
+                 WHERE card_id = ?1
+                   AND turn_uuid IS NOT NULL
+                   AND turn_uuid NOT LIKE 'consol\\_%' ESCAPE '\\'
+                   AND superseded_by IS NULL
+                   AND pinned = 0
+                   AND metadata_json IS NULL",
+                params![&card_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|n| n as usize)
+            .map_err(|e| anyhow::anyhow!("count_unconsolidated_turns: {e:?}"))
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("count_unconsolidated_turns join: {e}"))??)
+    }
+
+    /// (2026-08-23 WS6) Fetch the card's un-consolidated turns, OLDEST rows
+    /// first (consolidation eats the oldest backlog), grouped into
+    /// [`UnconsolidatedTurn`]s with chunk texts concatenated in chunk
+    /// order. `row_cap` bounds the raw-row scan (the caller picks batches
+    /// out of the head).
+    pub async fn fetch_unconsolidated_turns(
+        &self,
+        card_id: &str,
+        row_cap: usize,
+    ) -> anyhow::Result<Vec<UnconsolidatedTurn>> {
+        let conn = self.conn.clone();
+        let card_id = card_id.to_owned();
+        Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<UnconsolidatedTurn>> {
+            let c = lock_conn(&conn);
+            let mut stmt = c
+                .prepare(
+                    "SELECT turn_uuid, role, text_content FROM memories
+                     WHERE card_id = ?1
+                       AND turn_uuid IS NOT NULL
+                       AND turn_uuid NOT LIKE 'consol\\_%' ESCAPE '\\'
+                       AND superseded_by IS NULL
+                       AND pinned = 0
+                       AND metadata_json IS NULL
+                     ORDER BY id ASC
+                     LIMIT ?2",
+                )
+                .map_err(|e| anyhow::anyhow!("prepare fetch_unconsolidated: {e:?}"))?;
+            let rows = stmt
+                .query_map(params![&card_id, row_cap as i64], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| anyhow::anyhow!("query fetch_unconsolidated: {e:?}"))?;
+            // (2026-08-24 review P2) Group by turn KEY, not row adjacency.
+            // Interleaved archival spawns (a user turn's spawn racing the
+            // previous assistant turn's) can interleave two turns' chunk
+            // rows in id order; the old `out.last_mut()` adjacency grouping
+            // split one turn into TWO UnconsolidatedTurns. Because the
+            // supersede UPDATE is keyed by turn_uuid (ALL live rows of the
+            // key), a batch carrying only fragment 1 committed a supersede
+            // that silently hid fragment 2's rows — data the extraction
+            // never saw. A first-seen index merges every row of a key into
+            // ONE group; first-seen order preserves turn order.
+            let mut out: Vec<UnconsolidatedTurn> = Vec::new();
+            let mut index: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            let mut rows_fetched = 0usize;
+            for r in rows {
+                let (turn, role, text) =
+                    r.map_err(|e| anyhow::anyhow!("fetch_unconsolidated row: {e:?}"))?;
+                rows_fetched += 1;
+                let role = Role::parse(&role)?;
+                match index.get(&turn) {
+                    Some(&i) => out[i].parts.push((role, text)),
+                    None => {
+                        index.insert(turn.clone(), out.len());
+                        out.push(UnconsolidatedTurn {
+                            turn_uuid: turn,
+                            parts: vec![(role, text)],
+                        });
+                    }
+                }
+            }
+            // (2026-08-24 bug-2 fix) The LIMIT cuts ROWS, not turns — and
+            // with interleaved archival (two turns' chunk rows interleaved
+            // in id order) the old `out.pop()` dropped the LAST FIRST-SEEN
+            // group, which is the partial one only by coincidence. When the
+            // cut actually landed inside an EARLIER group, the partial turn
+            // was returned beside its complete neighbors — and the batch
+            // commit then superseded rows the extraction prompt never saw,
+            // hiding them forever (superseded_by filters every retrieval).
+            // EXACT detection instead: re-count every fetched key's live
+            // rows under the SAME filters; a group whose fetched parts fall
+            // short of its true count is dropped wherever it sits. The next
+            // trigger picks the dropped turn up whole.
+            if rows_fetched >= row_cap {
+                let mut partial: std::collections::HashSet<String> =
+                    std::collections::HashSet::new();
+                for chunk in out.chunks(500) {
+                    let placeholders: String = (0..chunk.len())
+                        .map(|i| format!("?{}", i + 2))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let sql = format!(
+                        "SELECT turn_uuid, COUNT(*) FROM memories
+                         WHERE card_id = ?1
+                           AND turn_uuid IS NOT NULL
+                           AND turn_uuid NOT LIKE 'consol\\_%' ESCAPE '\\'
+                           AND superseded_by IS NULL
+                           AND pinned = 0
+                           AND metadata_json IS NULL
+                           AND turn_uuid IN ({placeholders})
+                         GROUP BY turn_uuid"
+                    );
+                    let mut stmt = c
+                        .prepare(&sql)
+                        .map_err(|e| anyhow::anyhow!("prepare unconsolidated partial check: {e:?}"))?;
+                    let mut params_vec: Vec<&dyn rusqlite::ToSql> =
+                        Vec::with_capacity(1 + chunk.len());
+                    params_vec.push(&card_id);
+                    for t in chunk {
+                        params_vec.push(&t.turn_uuid);
+                    }
+                    let rows = stmt
+                        .query_map(params_vec.as_slice(), |r| {
+                            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+                        })
+                        .map_err(|e| anyhow::anyhow!("query unconsolidated partial check: {e:?}"))?;
+                    let totals: Vec<(String, i64)> = rows
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| anyhow::anyhow!("unconsolidated partial row: {e:?}"))?;
+                    drop(stmt);
+                    for (key, total) in totals {
+                        let fetched = chunk
+                            .iter()
+                            .find(|t| t.turn_uuid == key)
+                            .map(|t| t.parts.len())
+                            .unwrap_or(0);
+                        if fetched < total as usize {
+                            partial.insert(key);
+                        }
+                    }
+                }
+                if !partial.is_empty() {
+                    tracing::debug!(
+                        dropped = partial.len(),
+                        "fetch_unconsolidated_turns: dropped boundary-partial turns \
+                         (a supersede must never hide rows the extraction never saw)"
+                    );
+                    out.retain(|t| !partial.contains(&t.turn_uuid));
+                }
+            }
+            Ok(out)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("fetch_unconsolidated join: {e}"))??)
+    }
+
+    /// (2026-08-23 WS6) THE CONSOLIDATION COMMIT — one transaction:
+    /// (1) insert the consolidated row(s) (the add_memory chunk discipline,
+    ///     `Role::Summary`, turn_uuid = the `consol_*` batch id, journal
+    ///     rides `insert_row` automatically);
+    /// (2) supersede every source turn's rows (`superseded_by` = batch id)
+    ///     under the IMMUTABLE SOURCE LAW guard: `pinned = 0`,
+    ///     `metadata_json IS NULL`, not already superseded. If the affected
+    ///     count disagrees with the in-txn pre-count of exactly those rows
+    ///     (a turn got pinned mid-pass), NOTHING commits — the pass is
+    ///     atomic and retried later.
+    /// The batch id is MINTED by the caller and passed in so it also keys
+    /// the journal rows and any later [`Self::rollback_consolidation`].
+    pub async fn consolidate_apply(
+        &self,
+        card_id: &str,
+        consolidated_text: String,
+        source_turn_uuids: &[String],
+        batch_turn_uuid: &str,
+    ) -> anyhow::Result<MemoryId> {
+        anyhow::ensure!(
+            batch_turn_uuid.starts_with("consol_"),
+            "consolidate_apply: batch id must be a consol_* key"
+        );
+        anyhow::ensure!(
+            !source_turn_uuids.is_empty(),
+            "consolidate_apply: no source turns"
+        );
+        // Chunk + embed FIRST (async, outside the blocking txn — the
+        // add_memory discipline; the embedder never sees empty input).
+        let chunks: Vec<String> = chunk_text(&consolidated_text)
+            .into_iter()
+            .filter(|c| !c.is_empty())
+            .collect();
+        anyhow::ensure!(!chunks.is_empty(), "consolidate_apply: empty summary text");
+        let mut embedded: Vec<(String, Vec<f32>)> = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            let vec = self.embedder.embed(chunk.clone()).await?;
+            embedded.push((chunk, vec));
+        }
+
+        let conn = self.conn.clone();
+        let card_id = card_id.to_owned();
+        let sources = source_turn_uuids.to_vec();
+        let batch = batch_turn_uuid.to_owned();
+        let first_id = tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryId> {
+            let c = lock_conn(&conn);
+            let tx = c
+                .unchecked_transaction()
+                .map_err(|e| anyhow::anyhow!("begin consolidate txn: {e:?}"))?;
+            // Insert the consolidated row(s) — the add_memory multi-chunk
+            // shape (chunk 0's id closes the parent loop).
+            let first_id = insert_row(
+                &tx, &embedded[0].0, &card_id, None, Role::Summary, 1.0, 0, None,
+                None, Some(&batch), &embedded[0].1,
+            )?;
+            let parent = first_id.to_string();
+            for (idx, (text, vec)) in embedded.iter().enumerate().skip(1) {
+                insert_row(
+                    &tx, text, &card_id, None, Role::Summary, 1.0, idx as i32, None,
+                    Some(&parent), Some(&batch), vec,
+                )?;
+            }
+            tx.execute(
+                "UPDATE memories SET parent_uuid = ?1 WHERE id = ?2",
+                params![&parent, first_id],
+            )
+            .map_err(|e| anyhow::anyhow!("consolidate chunk 0 parent: {e:?}"))?;
+            // Immutable Source Law: pre-count EVERY row of the source turns
+            // (UNguarded), then supersede under the pinned/codex/live guard.
+            // A pinned mid-pass turn (or an already-superseded source, or a
+            // codex row) makes affected < expected → no commit. NOTE the
+            // pre-count must NOT carry the UPDATE's guard — a guarded
+            // pre-count would always agree with the UPDATE and detect
+            // nothing (the pin-race blind spot caught at write time).
+            // The two statements carry DIFFERENT placeholder numbering
+            // (pre-count: ?1 card + sources ?2..; UPDATE: ?1 card, ?2
+            // batch, sources ?3..) — a repeated ?N would alias parameters,
+            // and rusqlite's params_from_iter binds POSITIONALLY (the Nth
+            // value → parameter N), so each statement's placeholders must
+            // match its own bind order exactly.
+            let count_placeholders: String = (0..sources.len())
+                .map(|i| format!("?{}", i + 2))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let expected: i64 = {
+                let sql = format!(
+                    "SELECT COUNT(*) FROM memories
+                     WHERE card_id = ?1
+                       AND turn_uuid IN ({count_placeholders})"
+                );
+                let mut stmt = tx
+                    .prepare(&sql)
+                    .map_err(|e| anyhow::anyhow!("prepare pre-count: {e:?}"))?;
+                let mut args: Vec<&dyn rusqlite::ToSql> = vec![&card_id];
+                for s in &sources {
+                    args.push(s);
+                }
+                stmt.query_row(rusqlite::params_from_iter(args.iter()), |r| {
+                    r.get::<_, i64>(0)
+                })
+                .map_err(|e| anyhow::anyhow!("consolidate pre-count: {e:?}"))?
+            };
+            // (2026-08-23 audit hardening) A zero pre-count means no source
+            // key matches any live row — the `affected == expected` guard
+            // would pass trivially at 0 == 0 and commit a phantom summary
+            // that supersedes nothing. Unreachable via the worker (its
+            // sources are freshly fetched); refuses here for defense.
+            anyhow::ensure!(
+                expected > 0,
+                "consolidate_apply: no source rows match the batch keys"
+            );
+            let update_placeholders: String = (0..sources.len())
+                .map(|i| format!("?{}", i + 3))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let affected = {
+                let sql = format!(
+                    "UPDATE memories SET superseded_by = ?2
+                     WHERE card_id = ?1
+                       AND pinned = 0
+                       AND metadata_json IS NULL
+                       AND superseded_by IS NULL
+                       AND turn_uuid IN ({update_placeholders})"
+                );
+                let mut stmt = tx
+                    .prepare(&sql)
+                    .map_err(|e| anyhow::anyhow!("prepare supersede: {e:?}"))?;
+                let mut args: Vec<&dyn rusqlite::ToSql> = vec![&card_id, &batch];
+                for s in &sources {
+                    args.push(s);
+                }
+                stmt.execute(rusqlite::params_from_iter(args.iter()))
+                    .map_err(|e| anyhow::anyhow!("consolidate supersede: {e:?}"))? as i64
+            };
+            anyhow::ensure!(
+                affected == expected,
+                "consolidate_apply: supersede guard mismatch (affected {affected}, \
+                 expected {expected}) — a source turn was pinned mid-pass; \
+                 nothing committed"
+            );
+            // (2026-08-24 review P1) Persist the batch's live source-ROW
+            // count as a journal marker anchored to the summary's first row
+            // (`row_id` must be a real memory id — the orphan sweeps delete
+            // journal rows whose row_id is not a live memory, so the count
+            // rides `op` and the anchor rides `row_id`; the marker dies with
+            // the summary row it points at). `rollback_consolidation` reads
+            // it to detect a PRUNED batch: pruning a source makes its batch
+            // permanent, and without the count a partial prune (FIFO cut
+            // landing mid-batch) was undetectable — rollback would delete
+            // the summary and permanently lose the pruned rows' facts.
+            tx.execute(
+                "INSERT INTO memory_journal (turn_uuid, card_id, op, row_id, timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    &batch,
+                    &card_id,
+                    format!("batch_sources:{expected}"),
+                    first_id,
+                    unix_now(),
+                ],
+            )
+            .map_err(|e| anyhow::anyhow!("consolidate journal marker: {e:?}"))?;
+            tx.commit()
+                .map_err(|e| anyhow::anyhow!("commit consolidate txn: {e:?}"))?;
+            Ok(first_id)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("consolidate_apply join: {e}"))??;
+        Ok(first_id)
+    }
+
+    /// (2026-08-23 WS6) Roll back ONE consolidation batch: clear the
+    /// supersede flags it set, delete its summary row(s), orphan-sweep all
+    /// three mirrors — one transaction (the `rollback_turn` discipline).
+    /// Sources pruned before this call stay gone (their journal rows died
+    /// with them; the summary carried the facts onward).
+    ///
+    /// (2026-08-24 review P1) **A pruned batch is PERMANENT** — the
+    /// documented law, now enforced. `consolidate_apply` journals the
+    /// batch's live source-row count (`batch_sources:N` marker); when the
+    /// surviving superseded rows fall short of it (FIFO pruning ate into
+    /// the batch — fully or partially), deleting the summary would
+    /// permanently destroy the pruned rows' ONLY carrier. The rollback
+    /// refuses as a clean no-op (`Ok(0)`, nothing mutated). Batches
+    /// committed before the marker existed fall back to the conservative
+    /// whole-batch check: zero surviving sources = pruned = no-op.
+    pub async fn rollback_consolidation(
+        &self,
+        card_id: &str,
+        batch_turn_uuid: &str,
+    ) -> anyhow::Result<usize> {
+        // (2026-08-23 audit fix) The consol_ prefix guard `consolidate_apply`
+        // carries: a regular turn key here would delete that turn's LIVE
+        // rows (only summary rows carry the batch key).
+        anyhow::ensure!(
+            batch_turn_uuid.starts_with("consol_"),
+            "rollback_consolidation: '{batch_turn_uuid}' is not a consolidation batch key"
+        );
+        let conn = self.conn.clone();
+        let card_id = card_id.to_owned();
+        let batch = batch_turn_uuid.to_owned();
+        Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let c = lock_conn(&conn);
+            // The pruned-batch guard: compare surviving superseded rows
+            // against the journaled source count. Marker op text is
+            // `batch_sources:<N>` (the count rides op because journal
+            // row_id must stay a REAL memory id for the orphan sweeps).
+            let marker: Option<String> = c
+                .query_row(
+                    "SELECT op FROM memory_journal
+                     WHERE card_id = ?1 AND turn_uuid = ?2 AND op LIKE 'batch_sources:%'",
+                    params![&card_id, &batch],
+                    |r| r.get::<_, String>(0),
+                )
+                .map(Some)
+                .or_else(|e| {
+                    if e == rusqlite::Error::QueryReturnedNoRows {
+                        Ok(None)
+                    } else {
+                        Err(e)
+                    }
+                })
+                .map_err(|e| anyhow::anyhow!("rollback marker read: {e:?}"))?;
+            let alive: i64 = c
+                .query_row(
+                    "SELECT COUNT(*) FROM memories
+                     WHERE card_id = ?1 AND superseded_by = ?2",
+                    params![&card_id, &batch],
+                    |r| r.get::<_, i64>(0),
+                )
+                .map_err(|e| anyhow::anyhow!("rollback alive count: {e:?}"))?;
+            let expected: Option<i64> = marker.as_deref().and_then(|op| {
+                op.strip_prefix("batch_sources:")
+                    .and_then(|n| n.parse::<i64>().ok())
+            });
+            let pruned = match expected {
+                Some(expected) => alive < expected,
+                // Legacy batch (pre-marker): enforce the whole-batch law we
+                // can still see — zero survivors means the FIFO walk ate
+                // every source; a partial prune is undetectable without
+                // the count, so this is best-effort for old batches only.
+                None => alive == 0,
+            };
+            if pruned {
+                tracing::info!(
+                    batch = %batch,
+                    alive,
+                    expected = expected.unwrap_or(0),
+                    "rollback_consolidation refused: batch is permanent (sources pruned)"
+                );
+                return Ok(0);
+            }
+            let tx = c
+                .unchecked_transaction()
+                .map_err(|e| anyhow::anyhow!("begin rollback txn: {e:?}"))?;
+            tx.execute(
+                "UPDATE memories SET superseded_by = NULL
+                 WHERE card_id = ?1 AND superseded_by = ?2",
+                params![&card_id, &batch],
+            )
+            .map_err(|e| anyhow::anyhow!("rollback supersede flags: {e:?}"))?;
+            let deleted = tx
+                .execute(
+                    "DELETE FROM memories WHERE card_id = ?1 AND turn_uuid = ?2",
+                    params![&card_id, &batch],
+                )
+                .map_err(|e| anyhow::anyhow!("rollback summary rows: {e:?}"))?;
+            tx.execute(
+                "DELETE FROM memories_fts WHERE rowid NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("rollback sweep memories_fts: {e:?}"))?;
+            tx.execute(
+                "DELETE FROM memories_vec WHERE rowid NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("rollback sweep memories_vec: {e:?}"))?;
+            tx.execute(
+                "DELETE FROM memory_journal WHERE row_id NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("rollback sweep memory_journal: {e:?}"))?;
+            tx.commit()
+                .map_err(|e| anyhow::anyhow!("commit rollback txn: {e:?}"))?;
+            Ok(deleted)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("rollback_consolidation join: {e}"))??)
     }
 
     /// Nuke an ENTIRE card partition — episodic AND codex rows — across all
@@ -1509,12 +2231,267 @@ impl<E: Embedder> MemoryEngine<E> {
                 [],
             )
             .map_err(|e| anyhow::anyhow!("purge sweep memories_vec: {e:?}"))?;
+            // (2026-08-22 multihog WS4) The journal follows its rows.
+            tx.execute(
+                "DELETE FROM memory_journal WHERE row_id NOT IN (SELECT id FROM memories)",
+                [],
+            )
+            .map_err(|e| anyhow::anyhow!("purge sweep memory_journal: {e:?}"))?;
             tx.commit()
                 .map_err(|e| anyhow::anyhow!("commit purge txn: {e:?}"))?;
             Ok(deleted)
         })
         .await
         .map_err(|e| anyhow::anyhow!("purge join: {e}"))??)
+    }
+
+    /// (2026-08-24 Part II D1) FORK — copy the source partition's EVERY row
+    /// (episodic turns, pinned rows, codex-tagged rows — the whole key) into
+    /// `fork_key`, in ONE transaction: fresh row ids, `parent_uuid` remapped
+    /// old→new so multi-chunk groups stay grouped, `turn_uuid` carried
+    /// verbatim (the journal + rollback + pin granularity survives the
+    /// fork), FTS5 content mirrored, and the vec0 embeddings copied
+    /// BYTE-VERBATIM by rowid (embeddings are pure functions of text — no
+    /// re-embed, no embedder needed). Fresh journal rows ride the insert.
+    /// Refuses: sentinel partitions (either side) and a NON-EMPTY fork key
+    /// (a branch fork happens exactly once per key). An EMPTY source is
+    /// LEGAL (2026-08-24 bug-5 fix): a young session with nothing archived
+    /// yet is exactly the one a player branches from — the fork is created
+    /// with zero rows (partitions are implicit in their rows) and `Ok(0)`
+    /// returns.
+    /// Returns the copied row count.
+    pub async fn fork_partition_to(
+        &self,
+        source: &str,
+        fork_key: &str,
+    ) -> anyhow::Result<usize> {
+        for key in [source, fork_key] {
+            if key == WUPI_CARD_ID
+                || key == WUPI_SYSTEM_CARD_ID
+                || key == FABLE_SYSTEM_CARD_ID
+                || key == CODEX_CARD_ID
+            {
+                return Err(anyhow::anyhow!(
+                    "fork refused: {key:?} is a sentinel partition"
+                ));
+            }
+        }
+        let conn = self.conn.clone();
+        let source = source.to_owned();
+        let fork_key = fork_key.to_owned();
+        Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<usize> {
+            let c = lock_conn(&conn);
+            let tx = c
+                .unchecked_transaction()
+                .map_err(|e| anyhow::anyhow!("begin fork txn: {e:?}"))?;
+            let existing: i64 = tx
+                .query_row(
+                    "SELECT COUNT(*) FROM memories WHERE card_id = ?1",
+                    params![&fork_key],
+                    |r| r.get(0),
+                )
+                .map_err(|e| anyhow::anyhow!("fork target count: {e:?}"))?;
+            if existing > 0 {
+                return Err(anyhow::anyhow!(
+                    "fork target {fork_key:?} already carries {existing} rows — branches fork exactly once"
+                ));
+            }
+            #[allow(clippy::type_complexity)]
+            let rows: Vec<(
+                i64,
+                String,
+                i64,
+                String,
+                i64,
+                f32,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                i64,
+                Option<String>,
+            )> = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT id, text_content, timestamp, role, chunk_index, salience,
+                                metadata_json, session_id, parent_uuid, turn_uuid, pinned, superseded_by
+                         FROM memories WHERE card_id = ?1 ORDER BY id ASC",
+                    )
+                    .map_err(|e| anyhow::anyhow!("fork source prepare: {e:?}"))?;
+                let out = stmt
+                    .query_map(params![&source], |r| {
+                        Ok((
+                            r.get(0)?,
+                            r.get(1)?,
+                            r.get(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                            r.get(6)?,
+                            r.get(7)?,
+                            r.get(8)?,
+                            r.get(9)?,
+                            r.get(10)?,
+                            r.get(11)?,
+                        ))
+                    })
+                    .map_err(|e| anyhow::anyhow!("fork source query: {e:?}"))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|e| anyhow::anyhow!("fork source row: {e:?}"))?;
+                out
+            };
+            if rows.is_empty() {
+                // (2026-08-24 bug-5 fix) An EMPTY source is a legal fork: a
+                // young session (nothing archived yet) is exactly the one a
+                // player branches from. The fork "exists" as zero rows —
+                // partitions are implicit in their rows — and the non-empty
+                // target guard above still pins the fork-once contract (a
+                // zero-row re-fork of an empty source is an idempotent
+                // no-op, not a double-branch).
+                tx.commit()
+                    .map_err(|e| anyhow::anyhow!("commit empty fork txn: {e:?}"))?;
+                return Ok(0);
+            }
+            let mut id_map: std::collections::HashMap<i64, i64> =
+                std::collections::HashMap::with_capacity(rows.len());
+            let mut copied = 0usize;
+            for (old_id, text, ts, role, chunk, salience, metadata, session, parent, turn, pinned, superseded) in
+                rows
+            {
+                // parent_uuid grouped one message's chunks under the first
+                // chunk's OLD id-as-string — remap so the copy stays grouped.
+                // A SELF-parent (chunk 0 closing its own loop, the add_memory
+                // / consolidate_apply shape) can never resolve through
+                // id_map (the row's own old→new mapping lands only AFTER its
+                // INSERT), so it inserts NULL and closes the loop
+                // post-insert below — otherwise the fork persisted the
+                // SOURCE partition's row id as a dangling cross-partition
+                // parent.
+                let self_parent =
+                    parent.as_deref().and_then(|p| p.parse::<i64>().ok()) == Some(old_id);
+                let parent_uuid = if self_parent {
+                    None
+                } else {
+                    parent
+                        .as_deref()
+                        .and_then(|p| p.parse::<i64>().ok())
+                        .and_then(|old| id_map.get(&old).map(|n| n.to_string()))
+                        .or_else(|| parent.clone())
+                };
+                tx.execute(
+                    "INSERT INTO memories
+                        (text_content, timestamp, role, chunk_index, salience, metadata_json,
+                         card_id, session_id, parent_uuid, turn_uuid, pinned, superseded_by)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        &text,
+                        ts,
+                        &role,
+                        chunk,
+                        salience,
+                        &metadata,
+                        &fork_key,
+                        &session,
+                        &parent_uuid,
+                        &turn,
+                        pinned,
+                        &superseded,
+                    ],
+                )
+                .map_err(|e| anyhow::anyhow!("fork insert row: {e:?}"))?;
+                let new_id = tx.last_insert_rowid();
+                id_map.insert(old_id, new_id);
+                // Close the self-parent loop (chunk 0): the new id exists
+                // only post-insert — the same closing UPDATE add_memory runs.
+                if self_parent {
+                    tx.execute(
+                        "UPDATE memories SET parent_uuid = ?1 WHERE id = ?2",
+                        params![new_id.to_string(), new_id],
+                    )
+                    .map_err(|e| anyhow::anyhow!("fork close self-parent: {e:?}"))?;
+                }
+                if let Some(t) = turn.as_deref() {
+                    tx.execute(
+                        "INSERT INTO memory_journal (turn_uuid, card_id, op, row_id, timestamp)
+                         VALUES (?1, ?2, 'insert', ?3, ?4)",
+                        params![t, &fork_key, new_id, ts],
+                    )
+                    .map_err(|e| anyhow::anyhow!("fork journal insert: {e:?}"))?;
+                }
+                tx.execute(
+                    "INSERT INTO memories_fts (rowid, text_content)
+                     SELECT ?1, text_content FROM memories_fts WHERE rowid = ?2",
+                    params![new_id, old_id],
+                )
+                .map_err(|e| anyhow::anyhow!("fork fts copy: {e:?}"))?;
+                tx.execute(
+                    "INSERT INTO memories_vec (rowid, embedding)
+                     SELECT ?1, embedding FROM memories_vec WHERE rowid = ?2",
+                    params![new_id, old_id],
+                )
+                .map_err(|e| anyhow::anyhow!("fork vec copy: {e:?}"))?;
+                copied += 1;
+            }
+            tx.commit()
+                .map_err(|e| anyhow::anyhow!("commit fork txn: {e:?}"))?;
+            Ok(copied)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("fork join: {e}"))??)
+    }
+
+    /// (2026-08-24 Part II D1) Purge a card's WHOLE partition family — the
+    /// base `card_id` partition plus every branch fork `card_id#<session>`.
+    /// Card delete's cleanup: a branch's rows must never outlive the card
+    /// (they'd be unreachable ghosts). Refuses sentinels via the per-key
+    /// `purge_card_partition` guard. Returns the total purged row count.
+    ///
+    /// (2026-08-24 bug-3 fix) The fork-prefix match is Rust-side
+    /// `starts_with("<card>#")` over the ENUMERATED partition list
+    /// ([`card_family_keys_sync`]) — never SQL `LIKE` (its `%`/`_` are live
+    /// metachars in slug ids, and an adversarially-similar sibling's forks
+    /// would be swept into this purge) and never `substr` (the old match
+    /// passed a BYTE-length prefix against SQLite's CHARACTER-indexed
+    /// substr, so a Unicode id like `café` never matched its forks and card
+    /// delete leaked branch partitions as permanent ghosts). Destruction
+    /// must not pattern-match in SQL.
+    pub async fn purge_card_family(&self, card_id: &str) -> anyhow::Result<usize> {
+        let conn = self.conn.clone();
+        let card_id = card_id.to_owned();
+        let keys: Vec<String> = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+            let c = lock_conn(&conn);
+            card_family_keys_sync(&c, &card_id)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("family keys join: {e}"))??;
+        let mut total = 0usize;
+        for key in keys {
+            total += self.purge_card_partition(&key).await?;
+        }
+        Ok(total)
+    }
+
+    /// (2026-08-24 bug-4 fix) Enumerate the base card's BRANCH FORK
+    /// partition keys — every `"<card>#<session>"` partition on disk
+    /// (chained branches included: a branch's fork key is always
+    /// `<base-card>#<session>`, only its SOURCE may be another fork). The
+    /// codex family seeder ([`crate::codex::seed_linked_codices_family`])
+    /// uses this so linked-lore edits/unlinks reconcile at the fork keys
+    /// too, not just the base card. Chars-safe by construction (see
+    /// [`card_family_keys_sync`]); the base partition itself is NOT
+    /// included; sorted for determinism.
+    pub async fn list_fork_partitions(&self, card_id: &str) -> anyhow::Result<Vec<String>> {
+        let conn = self.conn.clone();
+        let card_id = card_id.to_owned();
+        Ok(tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<String>> {
+            let c = lock_conn(&conn);
+            let mut keys = card_family_keys_sync(&c, &card_id)?;
+            keys.retain(|k| k != &card_id);
+            keys.sort();
+            Ok(keys)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("list_fork_partitions join: {e}"))??)
     }
 
     /// List every Codex-tagged entry in a card partition. Returns
@@ -1616,8 +2593,41 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
             -- shared by the user + assistant add_memory calls and all their
             -- chunks. The prune evicts whole turns via this key. NULL on
             -- codex rows + legacy pre-column rows.
-            turn_uuid      TEXT
+            turn_uuid      TEXT,
+            -- (2026-08-22 multihog WS4) Pin flag: a pinned row neither
+            -- counts toward the retention cap nor evicts. Pinned by TURN
+            -- (set_turn_pinned updates every row sharing the key).
+            pinned         INTEGER NOT NULL DEFAULT 0,
+            -- (2026-08-23 WS6) Consolidation supersede flag: NULL = live;
+            -- non-NULL = the id of the CONSOLIDATION BATCH (turn_uuid
+            -- "consol_*") whose summary row replaced this row. Carrying the
+            -- batch id (rather than a bare flag) makes rollback + provenance
+            -- derivable without new journal ops. THE GOLDEN RETRIEVAL RULE:
+            -- every retrieval query filters `superseded_by IS NULL` so a
+            -- source row can never double-count against its own summary.
+            -- Never set on codex rows or pinned turns (Immutable Source Law,
+            -- enforced in consolidate_apply's UPDATE guard).
+            superseded_by  TEXT
         );
+
+        -- (2026-08-22 multihog WS4) The turn journal: one row per episodic
+        -- insert/delete, written in the SAME transaction as the row change
+        -- (turn_uuid NOT NULL filters codex rows out naturally). The live
+        -- mapping turn_uuid → live row_ids that rollback_turn inverts and
+        -- the (2026-08-23 WS6, now-live) consolidation job consumes — journal
+        -- rows die with their row_id (the orphan sweep every delete path
+        -- runs), keeping it an index, never an append-only audit log.
+        CREATE TABLE IF NOT EXISTS memory_journal (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            turn_uuid   TEXT NOT NULL,
+            card_id     TEXT NOT NULL,
+            op          TEXT NOT NULL,
+            row_id      INTEGER NOT NULL,
+            timestamp   INTEGER NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_journal_turn
+            ON memory_journal(card_id, turn_uuid);
 
         -- Index card_id so the retrieval subquery `WHERE card_id = ?` is a
         -- cheap point lookup, not a scan. Memory is read every chat turn.
@@ -1646,6 +2656,12 @@ fn init_schema(conn: &Connection) -> anyhow::Result<()> {
     // NULL and evict as ungrouped singles — they are the oldest by id, so FIFO
     // sweeps them first anyway.
     migrate_add_column(conn, "memories", "turn_uuid", "TEXT")?;
+    // (2026-08-22 multihog WS4) The pin flag — legacy rows default 0 (fully
+    // evictable, the pre-WS4 behavior).
+    migrate_add_column(conn, "memories", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
+    // (2026-08-23 WS6) The consolidation supersede flag — legacy rows stay
+    // NULL (= live, the pre-WS6 behavior).
+    migrate_add_column(conn, "memories", "superseded_by", "TEXT")?;
 
     // §8C data migration: the Wupi-assistant card_id sentinel was renamed
     // from `__wupi_os__` to `__wupi__` (constant WUPI_OS_CARD_ID → WUPI_CARD_ID).
@@ -1752,6 +2768,17 @@ fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
         idx -= 1;
     }
     idx
+}
+
+/// (2026-08-26 chronicle-hygiene) True iff a prose string carries anything
+/// worth archiving: at least one alphanumeric character. A stray "/" or
+/// "..." in the composer (an accidental keypress + Enter) used to archive
+/// as a real turn — the Chronicle then listed a row whose entire snippet
+/// was punctuation. Punctuation/whitespace-only content is noise for
+/// retrieval too (nothing semantic to embed), so the archive sites skip it
+/// outright. Pure fn.
+pub fn archivable_prose(s: &str) -> bool {
+    s.chars().any(|c| c.is_alphanumeric())
 }
 
 pub fn chunk_text(text: &str) -> Vec<String> {
@@ -1861,9 +2888,17 @@ fn split_long_paragraph(para: &str) -> Vec<String> {
         } else {
             // Run-on sentence longer than the budget: hard char cut. Walk on
             // a char boundary so we never split a multi-byte UTF-8 sequence.
+            // (2026-08-26) Degenerate-tail guard: a straight budget cut can
+            // leave a 1-2 char remainder that becomes its own (meaningless)
+            // chunk — the Chronicle's "/"-row class. When the next cut would
+            // strand less than CHUNK_TAIL_FLOOR chars, shift the cut back so
+            // the tail keeps a minimum size instead.
             let mut s = sentence.as_str();
             while s.len() > CHUNK_CHAR_BUDGET {
                 let mut cut = CHUNK_CHAR_BUDGET;
+                if s.len() - cut < CHUNK_TAIL_FLOOR {
+                    cut = s.len().saturating_sub(CHUNK_TAIL_FLOOR).max(1);
+                }
                 while cut > 0 && !s.is_char_boundary(cut) {
                     cut -= 1;
                 }
@@ -1897,6 +2932,33 @@ fn lock_conn(conn: &Mutex<Connection>) -> std::sync::MutexGuard<'_, Connection> 
         );
         poisoned.into_inner()
     })
+}
+
+/// (2026-08-24 bug-3/bug-4 fix) The base partition + every branch fork key
+/// (`<card>#...`), enumerated CHARS-SAFELY: `SELECT DISTINCT card_id`, then
+/// a Rust-side `k == card_id || k.starts_with("<card>#")` filter over the
+/// actual partition list. The old `substr(card_id, 1, ?byte_len) = ?prefix`
+/// mixed a BYTE length with SQLite's CHARACTER-indexed substr — a Unicode
+/// id like `café#` (5 chars / 6 bytes) never matched its forks, so card
+/// delete leaked branch partitions as permanent ghosts. `str::starts_with`
+/// is a byte-prefix test that can only match at char boundaries (UTF-8 is
+/// self-synchronizing), so it is exact for any id. And no SQL `LIKE`
+/// anywhere near this: `%`/`_` are live metachars in slug ids. The
+/// DISTINCT scan rides the `idx_memories_card_id` index; partition count is
+/// small.
+fn card_family_keys_sync(conn: &Connection, card_id: &str) -> anyhow::Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT DISTINCT card_id FROM memories")
+        .map_err(|e| anyhow::anyhow!("family keys prepare: {e:?}"))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| anyhow::anyhow!("family keys query: {e:?}"))?;
+    let mut keys: Vec<String> = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("family keys row: {e:?}"))?;
+    let fork_prefix = format!("{card_id}#");
+    keys.retain(|k| k == card_id || k.starts_with(&fork_prefix));
+    Ok(keys)
 }
 
 /// Insert one memory into all three tables inside a single transaction.
@@ -1963,13 +3025,27 @@ fn insert_row(
     // directly (None → SQL NULL, Some → TEXT): no intermediate dyn indirection
     // needed (which would borrow a local pattern binding and fail E0597).
     tx.execute(
-        "INSERT INTO memories (text_content, timestamp, role, chunk_index, salience, metadata_json, card_id, session_id, parent_uuid, turn_uuid)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT INTO memories (text_content, timestamp, role, chunk_index, salience, metadata_json, card_id, session_id, parent_uuid, turn_uuid, pinned)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
         params![text, ts, role.as_str(), chunk_index, salience, metadata_json, card_id, session_id, parent_uuid, turn_uuid],
     )
     .map_err(|e| anyhow::anyhow!("insert memories: {e:?}"))?;
 
     let id = tx.last_insert_rowid();
+
+    // (2026-08-22 multihog WS4) The turn journal rides the SAME
+    // transaction: one 'insert' row per EPISODIC mint (turn_uuid NOT NULL
+    // filters codex rows out naturally). Journal rows die with their
+    // row_id (every delete path orphan-sweeps), so the table stays a live
+    // turn→rows index.
+    if let Some(turn) = turn_uuid {
+        tx.execute(
+            "INSERT INTO memory_journal (turn_uuid, card_id, op, row_id, timestamp)
+             VALUES (?1, ?2, 'insert', ?3, ?4)",
+            params![turn, card_id, id, ts],
+        )
+        .map_err(|e| anyhow::anyhow!("insert memory_journal: {e:?}"))?;
+    }
 
     // 2. FTS5 mirror, same rowid.
     tx.execute(
@@ -2030,7 +3106,8 @@ fn fts5_top_k(
             "SELECT rowid, bm25(memories_fts) AS score
              FROM memories_fts
              WHERE memories_fts MATCH ?1
-               AND rowid IN (SELECT id FROM memories WHERE card_id = ?2)
+               AND rowid IN (SELECT id FROM memories
+                             WHERE card_id = ?2 AND superseded_by IS NULL)
              ORDER BY score ASC
              LIMIT ?3",
         )
@@ -2107,7 +3184,8 @@ fn vec0_top_k(
         .prepare(
             "SELECT rowid, distance FROM memories_vec
              WHERE embedding MATCH ?1
-               AND rowid IN (SELECT id FROM memories WHERE card_id = ?2)
+               AND rowid IN (SELECT id FROM memories
+                             WHERE card_id = ?2 AND superseded_by IS NULL)
              ORDER BY distance
              LIMIT ?3",
         )
@@ -2126,13 +3204,60 @@ fn vec0_top_k(
     Ok(out)
 }
 
+/// (2026-08-24 bug-1 fix) TRUE cosines for the sparse candidates the dense
+/// top-k never returned: their stored vec0 vectors are fetched BY ROWID (the
+/// same point-lookup shape `fork_partition_to`'s vec copy uses) and scored
+/// against the ONE query embedding the search already computed — the query
+/// is still embedded exactly once per search; this adds point lookups only,
+/// never embedder work. Ids already in `dense` are skipped: the gate
+/// converts their distance instead (one source of truth). A row missing
+/// from vec0 (or a length-mismatched vector, which vec0 cannot store) just
+/// yields no entry — the gate's documented policy then DROPS that candidate
+/// (unverifiable must not bypass the floor). Card/partition scoping is
+/// inherited: every id here came from a card-scoped FTS5 subquery, so the
+/// rowid fetch can never cross partitions.
+fn sparse_candidate_cosines(
+    conn: &Connection,
+    sparse: &[(MemoryId, f32)],
+    dense: &[(MemoryId, f32)],
+    query_embedding: &[f32],
+) -> anyhow::Result<std::collections::HashMap<MemoryId, f32>> {
+    let mut out = std::collections::HashMap::new();
+    let mut stmt = conn
+        .prepare("SELECT embedding FROM memories_vec WHERE rowid = ?1")
+        .map_err(|e| anyhow::anyhow!("prepare sparse cosine fetch: {e:?}"))?;
+    for (id, _) in sparse {
+        if dense.iter().any(|(d, _)| d == id) {
+            continue; // distance known — the gate converts it
+        }
+        let blob: Option<Vec<u8>> = stmt
+            .query_row(params![id], |r| r.get::<_, Vec<u8>>(0))
+            .map(Some)
+            .or_else(|e| {
+                if e == rusqlite::Error::QueryReturnedNoRows {
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("sparse cosine fetch row {id}: {e:?}"))?;
+        let Some(blob) = blob else { continue };
+        let vec = bytes_to_embedding(&blob);
+        if vec.len() != query_embedding.len() {
+            continue; // defensive: treat as missing (vec0 enforces the dim)
+        }
+        out.insert(*id, cosine_similarity(query_embedding, &vec));
+    }
+    Ok(out)
+}
+
 /// Read one `MemoryEntry` from a `memories` table row. Shared by
 /// [`fetch_entries`] (fused-search hydration) and [`MemoryEngine::list_memories`]
 /// (browser enumerate) so the column↔field mapping lives in one place.
 ///
 /// Column order (must match every SELECT in this module):
 /// `id, text_content, timestamp, role, chunk_index, salience,
-///  metadata_json, card_id, session_id, parent_uuid, turn_uuid`.
+///  metadata_json, card_id, session_id, parent_uuid, turn_uuid, pinned`.
 fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
     let role_str: String = r.get(3)?;
     Ok(MemoryEntry {
@@ -2148,6 +3273,7 @@ fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
         session_id: r.get(8)?,
         parent_uuid: r.get(9)?,
         turn_uuid: r.get(10)?,
+        pinned: r.get::<_, i64>(11)? != 0,
     })
 }
 
@@ -2167,7 +3293,7 @@ fn fetch_entries(conn: &Connection, fused: &[RankedMemory]) -> anyhow::Result<Ve
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT id, text_content, timestamp, role, chunk_index, salience, metadata_json, card_id, session_id, parent_uuid, turn_uuid
+        "SELECT id, text_content, timestamp, role, chunk_index, salience, metadata_json, card_id, session_id, parent_uuid, turn_uuid, pinned
          FROM memories
          WHERE id IN ({placeholders})"
     );
@@ -2191,6 +3317,7 @@ fn fetch_entries(conn: &Connection, fused: &[RankedMemory]) -> anyhow::Result<Ve
             let session_id: Option<String> = r.get(8)?;
             let parent_uuid: Option<String> = r.get(9)?;
             let turn_uuid: Option<String> = r.get(10)?;
+            let pinned: i64 = r.get(11)?;
             Ok(MemoryEntry {
                 id: r.get(0)?,
                 text_content: r.get(1)?,
@@ -2204,6 +3331,7 @@ fn fetch_entries(conn: &Connection, fused: &[RankedMemory]) -> anyhow::Result<Ve
                 session_id,
                 parent_uuid,
                 turn_uuid,
+                pinned: pinned != 0,
             })
         })
         .map_err(|e| anyhow::anyhow!("query fetch_entries: {e:?}"))?;
@@ -2291,6 +3419,31 @@ fn embed_to_bytes(v: &[f32]) -> Vec<u8> {
     out
 }
 
+/// Decode a vec0 embedding blob back to f32s — the inverse of
+/// [`embed_to_bytes`] (little-endian). Used by the bug-1 sparse-floor gate
+/// to TRUE-cosine sparse-only candidates against the query vector.
+fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// TRUE cosine (dot / |a||b|) with a zero-norm guard → 0.0. Full-magnitude
+/// cosine, not the unit-vector dot shortcut, so even a legacy un-normalized
+/// row scores on the true axis. Mirrors the self-test's private helper in
+/// memory_embedder_llama.rs (kept per-module — the CUDA-free seam must not
+/// import from the llama-linked one).
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let mag_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mag_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if mag_a <= 0.0 || mag_b <= 0.0 {
+        return 0.0;
+    }
+    dot / (mag_a * mag_b)
+}
+
 /// Unix epoch seconds.
 fn unix_now() -> i64 {
     std::time::SystemTime::now()
@@ -2338,6 +3491,7 @@ mod tests {
                 session_id: None,
                 parent_uuid: None,
                 turn_uuid: None,
+                pinned: false,
             },
             score: 0.0,
             debug: DebugScores::default(),
@@ -2588,6 +3742,42 @@ mod tests {
             // Every chunk must be valid UTF-8 (would panic on construction if
             // not, but assert explicitly for clarity).
             assert!(std::str::from_utf8(c.as_bytes()).is_ok());
+        }
+    }
+
+    /// (2026-08-26 chronicle-hygiene) Punctuation-only content is never
+    /// archived — the live repro was a Chronicle row whose entire snippet
+    /// was a stray "/".
+    #[test]
+    fn archivable_prose_requires_an_alphanumeric() {
+        assert!(archivable_prose("GOC??? What are they doing here"));
+        assert!(archivable_prose("Yes."));
+        assert!(archivable_prose("42 confirmed dead"));
+        assert!(!archivable_prose("/"));
+        assert!(!archivable_prose("..."));
+        assert!(!archivable_prose("* * *"));
+        assert!(!archivable_prose(""));
+        assert!(!archivable_prose("   \n\t "));
+    }
+
+    /// (2026-08-26) The hard-cut tail floor: a run-on whose final remainder
+    /// would strand under CHUNK_TAIL_FLOOR chars shifts its last cut back so
+    /// no degenerate 1-2 char chunk is ever emitted.
+    #[test]
+    fn chunk_text_hard_cut_never_strands_a_degenerate_tail() {
+        // Budget + 1 chars: the old straight cut left a 1-char tail chunk.
+        let text = "x".repeat(CHUNK_CHAR_BUDGET + 1);
+        let chunks = chunk_text(&text);
+        assert_eq!(chunks.len(), 2, "budget+1 splits into exactly two chunks");
+        assert!(
+            chunks.last().unwrap().len() >= CHUNK_TAIL_FLOOR,
+            "the tail keeps a minimum size (got {})",
+            chunks.last().unwrap().len()
+        );
+        // No bytes lost — the shifted cut still partitions the whole text.
+        assert_eq!(chunks.concat().len(), text.len());
+        for (i, c) in chunks.iter().enumerate() {
+            assert!(c.len() <= CHUNK_CHAR_BUDGET, "chunk {i} over budget");
         }
     }
 
@@ -2869,6 +4059,577 @@ mod tests {
             let b = new_turn_uuid();
             assert_ne!(a, b);
             assert!(a.starts_with("turn-"));
+        }
+
+        // ---- (2026-08-22 multihog WS4) pinning + turn journal -------------
+
+        /// Pinned rows survive the prune AND do not count toward the cap;
+        /// unpinned eviction stays turn-atomic beside them.
+        #[tokio::test]
+        async fn pinned_rows_survive_prune_and_do_not_count() {
+            let (engine, _dir) = open_engine();
+            let card = "pin-card";
+            for t in ["t-a", "t-b"] {
+                archive_turn(&engine, card, t, "question", "answer").await;
+            }
+            // Pin the OLDEST turn — it must neither evict nor count.
+            let n = engine.set_turn_pinned(card, "t-a", true).await.expect("pin");
+            assert_eq!(n, 2, "both rows of the turn pin together");
+
+            // 4 episodic rows, 2 pinned → the count sees 2 evictable, under
+            // the cap → no-op. (Counting all 4 — the pre-WS4 behavior —
+            // would cross cap 3 and evict.)
+            let pruned = engine.prune_episodic_card_with(card, 3, 2).await.expect("prune");
+            assert_eq!(pruned, 0, "pinned rows do not count toward the cap");
+
+            // One more turn → 4 evictable > cap 3, target 2 → excess 2 →
+            // t-b falls WHOLE (2 rows); the pinned t-a survives beside it.
+            archive_turn(&engine, card, "t-c", "question", "answer").await;
+            let pruned = engine.prune_episodic_card_with(card, 3, 2).await.expect("prune");
+            assert_eq!(pruned, 2, "the unpinned turn falls whole");
+            let rows = engine.list_memories(card, 100, 0).await.expect("list");
+            assert!(rows.iter().all(|e| e.turn_uuid.as_deref() != Some("t-b")));
+            let pinned_rows: Vec<&MemoryEntry> = rows
+                .iter()
+                .filter(|e| e.turn_uuid.as_deref() == Some("t-a"))
+                .collect();
+            assert_eq!(pinned_rows.len(), 2, "the pinned turn survives intact");
+            assert!(pinned_rows.iter().all(|e| e.pinned), "the flag round-trips");
+            assert!(
+                rows.iter().any(|e| e.turn_uuid.as_deref() == Some("t-c") && !e.pinned),
+                "the fresh unpinned turn stays unpinned"
+            );
+
+            // Unpinning restores evictability: t-a (ids lowest) falls whole.
+            engine.set_turn_pinned(card, "t-a", false).await.expect("unpin");
+            let pruned = engine.prune_episodic_card_with(card, 3, 2).await.expect("prune");
+            assert_eq!(pruned, 2, "the unpinned former pin falls");
+            let rows = engine.list_memories(card, 100, 0).await.expect("list");
+            assert!(rows.iter().all(|e| e.turn_uuid.as_deref() != Some("t-a")));
+        }
+
+        /// rollback_turn deletes EXACTLY one turn across all three tables +
+        /// cleans its journal rows; siblings + the episodic search surface
+        /// stay intact.
+        #[tokio::test]
+        async fn rollback_turn_deletes_exactly_one_turn_three_tables() {
+            let (engine, _dir) = open_engine();
+            let card = "rb-card";
+            let long_asst = "sentence. ".repeat(300); // multi-chunk turn
+            archive_turn(&engine, card, "t-keep", "question", "answer").await;
+            archive_turn(&engine, card, "t-drop", "hello", &long_asst).await;
+            archive_turn(&engine, card, "t-keep2", "question", "answer").await;
+
+            let before = engine.list_memories(card, 100, 0).await.expect("list");
+            let drop_rows: Vec<i64> = before
+                .iter()
+                .filter(|e| e.turn_uuid.as_deref() == Some("t-drop"))
+                .map(|e| e.id)
+                .collect();
+            assert!(drop_rows.len() > 2, "the dropped turn chunked");
+
+            let n = engine.rollback_turn(card, "t-drop").await.expect("rollback");
+            assert_eq!(n, drop_rows.len(), "exactly the turn's rows deleted");
+
+            let after = engine.list_memories(card, 100, 0).await.expect("list");
+            assert!(after.iter().all(|e| e.turn_uuid.as_deref() != Some("t-drop")));
+            assert_eq!(after.len(), before.len() - drop_rows.len());
+
+            // Three-table discipline: no orphaned FTS/vec rows (a search for
+            // the dropped content finds nothing; the kept turns still do).
+            let gone = engine.search("hello", card, 5, None).await.expect("search");
+            assert!(
+                gone.iter().all(|h| h.entry.turn_uuid.as_deref() != Some("t-drop")),
+                "no dropped-turn rows reachable through any table"
+            );
+            let kept = engine.search("question", card, 5, None).await.expect("search");
+            assert!(!kept.is_empty(), "sibling turns still retrievable");
+
+            // Journal cleanup: rolling the SAME turn back again is a no-op
+            // (its journal rows died with it).
+            let n2 = engine.rollback_turn(card, "t-drop").await.expect("rollback again");
+            assert_eq!(n2, 0, "the journal no longer knows the turn");
+        }
+
+        /// The journal records episodic inserts (one row per minted row)
+        /// and stays clean after a prune (rows die with their row_ids).
+        #[tokio::test]
+        async fn journal_records_inserts_and_dies_with_rows() {
+            let (engine, _dir) = open_engine();
+            let card = "jr-card";
+            archive_turn(&engine, card, "t-1", "q", "a").await;
+            // The journal's presence is observable through rollback's count
+            // (0 only when nothing knows the turn) — a fresh turn rolls
+            // back its exact 2 rows.
+            let n = engine.rollback_turn(card, "t-1").await.expect("rollback");
+            assert_eq!(n, 2, "2 rows minted, 2 journaled, 2 rolled back");
+            // Codex rows are never journaled (turn_uuid NULL).
+            engine
+                .add_codex_entry(
+                    "lore".to_owned(),
+                    card,
+                    1.0,
+                    r#"{"kind":"codex","title":"lore"}"#.to_owned(),
+                )
+                .await
+                .expect("codex");
+            let rows = engine.list_memories(card, 100, 0).await.expect("list");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].turn_uuid, None);
+        }
+
+        /// (2026-08-23 WS6) The Golden Retrieval Rule: after a batch
+        /// commits, the sources are invisible to search (both backends) and
+        /// only the summary row remains; `rollback_consolidation` restores
+        /// the sources and removes the summary; the un-consolidated count
+        /// tracks every transition.
+        #[tokio::test]
+        async fn consolidation_supersedes_and_rolls_back_cleanly() {
+            let (engine, _dir) = open_engine();
+            let card = "consol-card";
+            archive_turn(
+                &engine, card, "t-1",
+                "wren drills the sword forms in the courtyard",
+                "Wren drills you through the same sword forms; your arms burn.",
+            )
+            .await;
+            archive_turn(
+                &engine, card, "t-2",
+                "wren drills the sword forms in the courtyard again",
+                "Wren drills you through the same sword forms; your arms burn.",
+            )
+            .await;
+            archive_turn(&engine, card, "t-3", "unrelated visit", "the market square bustles").await;
+            assert_eq!(engine.count_unconsolidated_turns(card).await.unwrap(), 3);
+
+            let batch = "consol_test_batch";
+            let summary = "Consolidated record of 2 turns: Wren drilled the sword forms in the courtyard over two sessions.".to_owned();
+            let id = engine
+                .consolidate_apply(card, summary, &["t-1".to_owned(), "t-2".to_owned()], batch)
+                .await
+                .expect("consolidate");
+            let _ = id;
+
+            // Sources superseded (invisible through BOTH tables); summary live.
+            let hits = engine.search("sword forms", card, 10, None).await.expect("search");
+            assert!(
+                hits.iter().all(|h| {
+                    h.entry.turn_uuid.as_deref() != Some("t-1")
+                        && h.entry.turn_uuid.as_deref() != Some("t-2")
+                }),
+                "superseded sources must never surface: {:?}",
+                hits.iter().map(|h| h.entry.turn_uuid.clone()).collect::<Vec<_>>()
+            );
+            assert!(
+                hits.iter().any(|h| h.entry.turn_uuid.as_deref() == Some(batch)),
+                "the summary row surfaces for the same query"
+            );
+            // The count excludes the consolidated pair + the batch itself.
+            assert_eq!(engine.count_unconsolidated_turns(card).await.unwrap(), 1);
+
+            // Rollback: flags clear, summary dies, sources return.
+            let deleted = engine
+                .rollback_consolidation(card, batch)
+                .await
+                .expect("rollback");
+            assert!(deleted >= 1, "the summary row(s) deleted");
+            assert_eq!(engine.count_unconsolidated_turns(card).await.unwrap(), 3);
+            let back = engine.search("sword forms", card, 10, None).await.expect("search");
+            assert!(
+                back.iter().any(|h| h.entry.turn_uuid.as_deref() == Some("t-1")),
+                "the restored source is retrievable again"
+            );
+        }
+
+        /// (2026-08-24 review P1) **A pruned batch is permanent**: when any
+        /// source row of a committed batch is gone (here simulated via
+        /// `rollback_turn` deleting one source turn outright — the same row
+        /// state the FIFO prune leaves), `rollback_consolidation` must
+        /// refuse as a CLEAN NO-OP — deleting the summary would permanently
+        /// destroy the pruned rows' only surviving fact carrier.
+        #[tokio::test]
+        async fn rollback_consolidation_refuses_when_sources_were_pruned() {
+            let (engine, _dir) = open_engine();
+            let card = "consol-pruned-card";
+            archive_turn(
+                &engine, card, "t-1",
+                "wren drills the sword forms in the courtyard",
+                "Wren drills you through the same sword forms; your arms burn.",
+            )
+            .await;
+            archive_turn(
+                &engine, card, "t-2",
+                "wren drills the sword forms again",
+                "Wren drills you through the same forms; your arms burn.",
+            )
+            .await;
+
+            let batch = "consol_pruned_batch";
+            engine
+                .consolidate_apply(
+                    card,
+                    "Consolidated record of 2 turns: Wren drilled the sword forms.".to_owned(),
+                    &["t-1".to_owned(), "t-2".to_owned()],
+                    batch,
+                )
+                .await
+                .expect("consolidate");
+
+            // Simulate the prune: one source turn's rows vanish (the FIFO
+            // walk's row state — the journal rows die with them).
+            let removed = engine.rollback_turn(card, "t-1").await.expect("prune t-1");
+            assert!(removed >= 1, "the source turn's rows existed");
+
+            // The batch is now permanent: rollback must be a clean no-op.
+            let deleted = engine
+                .rollback_consolidation(card, batch)
+                .await
+                .expect("rollback refuses cleanly, not errors");
+            assert_eq!(deleted, 0, "nothing deleted — pruned batch is permanent");
+
+            // The summary SURVIVES (it carries the pruned turn's facts).
+            let rows = engine.list_memories(card, 100, 0).await.expect("list");
+            assert!(
+                rows.iter().any(|r| r.turn_uuid.as_deref() == Some(batch)),
+                "the summary row must survive a refused rollback"
+            );
+            // …and t-2's supersede flag is untouched: it must NOT resurface
+            // as an un-consolidated turn (a wrongly-cleared flag would).
+            assert_eq!(
+                engine.count_unconsolidated_turns(card).await.unwrap(),
+                0,
+                "the surviving source stays superseded — nothing was mutated"
+            );
+
+            // Contrast: with BOTH sources intact a fresh batch rolls back.
+            let batch2 = "consol_intact_batch";
+            archive_turn(&engine, card, "t-3", "a third drill session", "the forms again").await;
+            engine
+                .consolidate_apply(
+                    card,
+                    "Consolidated record of a third drill.".to_owned(),
+                    &["t-3".to_owned()],
+                    batch2,
+                )
+                .await
+                .expect("consolidate 2");
+            let deleted2 = engine
+                .rollback_consolidation(card, batch2)
+                .await
+                .expect("rollback 2");
+            assert!(deleted2 >= 1, "an intact batch still rolls back");
+        }
+
+        /// (2026-08-23 WS6) The Immutable Source Law, atomically: if a
+        /// source turn was PINNED after batch selection, the whole commit
+        /// refuses — no summary row, no partial supersede.
+        #[tokio::test]
+        async fn consolidation_refuses_atomically_when_a_source_is_pinned() {
+            let (engine, _dir) = open_engine();
+            let card = "pin-race-card";
+            archive_turn(&engine, card, "t-1", "q", "a").await;
+            archive_turn(&engine, card, "t-2", "q2", "a2").await;
+            engine.set_turn_pinned(card, "t-2", true).await.expect("pin");
+
+            let err = engine
+                .consolidate_apply(
+                    card,
+                    "Consolidated record of 2 turns: summary.".to_owned(),
+                    &["t-1".to_owned(), "t-2".to_owned()],
+                    "consol_pin_race",
+                )
+                .await;
+            assert!(err.is_err(), "the pinned source must refuse the batch");
+
+            // Nothing committed: no summary row exists, sources unsuperseded.
+            assert_eq!(engine.count_unconsolidated_turns(card).await.unwrap(), 2);
+            let rows = engine.list_memories(card, 100, 0).await.expect("list");
+            assert_eq!(rows.len(), 4, "exactly the original rows — no summary landed");
+            // And the batch is fully roll-back-able as a no-op.
+            let n = engine
+                .rollback_consolidation(card, "consol_pin_race")
+                .await
+                .expect("rollback");
+            assert_eq!(n, 0);
+        }
+
+        // ---- (2026-08-24 Part II D1) branch forks ----------------------------
+
+        /// FORK copies rows verbatim under the new key: turn keys + pins
+        /// carry, chunk groups stay grouped (parent_uuid remaps old→new ids),
+        /// journal rows land (rollback works on the fork), and the SOURCE
+        /// never loses anything.
+        #[tokio::test]
+        async fn fork_partition_copies_rows_verbatim_under_new_key() {
+            let (engine, _dir) = open_engine();
+            let long_asst = "sentence. ".repeat(300); // multi-chunk assistant
+            archive_turn(&engine, "card-a", "t1", "hello", &long_asst).await;
+            archive_turn(&engine, "card-a", "t2", "again", "short beat").await;
+            engine
+                .set_turn_pinned("card-a", "t1", true)
+                .await
+                .expect("pin t1");
+
+            let copied = engine
+                .fork_partition_to("card-a", "card-a#session_x")
+                .await
+                .expect("fork");
+            let src = engine.list_memories("card-a", 10_000, 0).await.unwrap();
+            assert_eq!(copied, src.len());
+            let fork = engine
+                .list_memories("card-a#session_x", 10_000, 0)
+                .await
+                .unwrap();
+            assert_eq!(fork.len(), src.len());
+            // Every fork row mirrors a source row (text + turn key + pin).
+            for e in &fork {
+                let mirror = src
+                    .iter()
+                    .find(|s| s.turn_uuid == e.turn_uuid && s.text_content == e.text_content)
+                    .expect("mirror row");
+                assert_eq!(e.pinned, mirror.pinned, "pins carry verbatim");
+            }
+            // Chunk grouping survives: a fork parent_uuid that parses as an
+            // id must reference a FORK id (old ids never dangle through).
+            let fork_ids: std::collections::HashSet<i64> =
+                fork.iter().map(|e| e.id).collect();
+            for e in &fork {
+                if let Some(p) = e.parent_uuid.as_deref().and_then(|p| p.parse::<i64>().ok()) {
+                    assert!(fork_ids.contains(&p), "fork parent_uuid {} not in fork ids", p);
+                }
+            }
+            // Journal rows landed: the fork rolls back its OWN turn...
+            let n = engine
+                .rollback_turn("card-a#session_x", "t2")
+                .await
+                .expect("rollback fork turn");
+            assert!(n >= 1);
+            // ...while the SOURCE partition never lost a row.
+            assert_eq!(
+                engine.list_memories("card-a", 10_000, 0).await.unwrap().len(),
+                src.len(),
+                "the fork never touches the source"
+            );
+        }
+
+        /// FORK refuses: sentinel partitions (either side) and a second fork
+        /// into a NON-EMPTY key (branches fork exactly once). An empty
+        /// source is legal — see the test below.
+        #[tokio::test]
+        async fn fork_refuses_sentinels_and_double_fork() {
+            let (engine, _dir) = open_engine();
+            assert!(engine.fork_partition_to(WUPI_CARD_ID, "x").await.is_err());
+            assert!(engine.fork_partition_to("a", CODEX_CARD_ID).await.is_err());
+            archive_turn(&engine, "card-b", "t1", "hi", "there").await;
+            engine
+                .fork_partition_to("card-b", "card-b#s1")
+                .await
+                .expect("fork once");
+            assert!(
+                engine.fork_partition_to("card-b", "card-b#s1").await.is_err(),
+                "a key forks exactly once"
+            );
+        }
+
+        /// (2026-08-24 bug-5 fix) Branching a session whose source partition
+        /// is EMPTY (a young session — nothing archived yet) is legal: the
+        /// fork is created with zero rows and Ok returns. The partition then
+        /// behaves normally (rows can be archived into it; the family purge
+        /// sees it).
+        #[tokio::test]
+        async fn fork_from_empty_source_creates_a_legal_zero_row_fork() {
+            let (engine, _dir) = open_engine();
+            let copied = engine
+                .fork_partition_to("young-card", "young-card#session_1")
+                .await
+                .expect("empty source is a legal fork");
+            assert_eq!(copied, 0, "zero rows copied");
+            assert!(
+                engine
+                    .list_memories("young-card#session_1", 100, 0)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "the fork starts empty"
+            );
+            // The fork key is a live partition: archival lands in it...
+            archive_turn(&engine, "young-card#session_1", "t1", "hello", "there").await;
+            let rows = engine
+                .list_memories("young-card#session_1", 100, 0)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2, "the fork accepts archival after the empty fork");
+            // ...and the family tools enumerate it.
+            assert_eq!(
+                engine.list_fork_partitions("young-card").await.unwrap(),
+                vec!["young-card#session_1".to_owned()],
+                "the zero-row-then-filled fork is enumerated as a fork"
+            );
+            // An empty-source re-fork into the SAME (still-empty) key stays
+            // an idempotent no-op.
+            assert_eq!(
+                engine
+                    .fork_partition_to("young-card", "young-card#session_2")
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+
+        /// The FAMILY purge sweeps the base partition AND every
+        /// `card#<session>` branch fork — a branch's rows never outlive its
+        /// card; sibling cards are untouched.
+        #[tokio::test]
+        async fn purge_family_sweeps_base_and_branches() {
+            let (engine, _dir) = open_engine();
+            archive_turn(&engine, "card-c", "t1", "hi", "there").await;
+            engine
+                .fork_partition_to("card-c", "card-c#s1")
+                .await
+                .expect("fork");
+            archive_turn(&engine, "other-card", "t1", "hi", "there").await;
+
+            let purged = engine.purge_card_family("card-c").await.expect("family purge");
+            assert!(purged >= 4, "base 2 rows + fork 2 rows: {purged}");
+            assert_eq!(engine.list_memories("card-c", 100, 0).await.unwrap().len(), 0);
+            assert_eq!(
+                engine.list_memories("card-c#s1", 100, 0).await.unwrap().len(),
+                0
+            );
+            assert_eq!(
+                engine.list_memories("other-card", 100, 0).await.unwrap().len(),
+                2,
+                "sibling cards untouched"
+            );
+        }
+
+        /// (2026-08-24 bug-3 fix) The family prefix match is chars-safe: a
+        /// Unicode card id ("café") sweeps its own forks and NEVER the
+        /// lookalike sibling ("caféx") — the old byte-length `substr`
+        /// against SQLite's CHARACTER-indexed substr never matched the
+        /// forks at all (branch partitions survived card delete as ghosts).
+        #[tokio::test]
+        async fn purge_family_is_chars_safe_for_unicode_card_ids() {
+            let (engine, _dir) = open_engine();
+            archive_turn(&engine, "café", "t1", "hi", "there").await;
+            archive_turn(&engine, "café#session_1", "t1", "hi", "there").await;
+            archive_turn(&engine, "caféx", "t1", "hi", "there").await;
+
+            // Fork enumeration sees exactly the base's forks — not the
+            // lookalike sibling (its prefix is "caféx#", not "café#").
+            let forks = engine.list_fork_partitions("café").await.unwrap();
+            assert_eq!(forks, vec!["café#session_1".to_owned()]);
+
+            let purged = engine.purge_card_family("café").await.expect("family purge");
+            assert_eq!(purged, 4, "base 2 rows + fork 2 rows: {purged}");
+            assert!(engine.list_memories("café", 100, 0).await.unwrap().is_empty());
+            assert!(
+                engine
+                    .list_memories("café#session_1", 100, 0)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                engine.list_memories("caféx", 100, 0).await.unwrap().len(),
+                2,
+                "the lookalike sibling survives"
+            );
+        }
+
+        /// (2026-08-24 bug-2 fix) A boundary-exact fetch (LIMIT hits the row
+        /// cap) must drop EXACTLY the turns whose rows were cut — not the
+        /// last first-seen group. Interleaved archival puts the PARTIAL turn
+        /// anywhere in first-seen order; the old `out.pop()` dropped the
+        /// wrong group and returned a partially-read turn whose supersede
+        /// then hid rows the extraction prompt never saw.
+        #[tokio::test]
+        async fn fetch_unconsolidated_drops_partial_turns_not_the_last_group() {
+            let (engine, _dir) = open_engine();
+            let card = "interleave-card";
+            // Insert so id order is: t1-user, t2-user, t2-assistant,
+            // t1-assistant (two archival spawns interleaved).
+            engine
+                .add_memory("one".to_owned(), card, Role::User, 1.0, Some("t1"))
+                .await
+                .unwrap();
+            engine
+                .add_memory("two".to_owned(), card, Role::User, 1.0, Some("t2"))
+                .await
+                .unwrap();
+            engine
+                .add_memory("two more".to_owned(), card, Role::Assistant, 1.0, Some("t2"))
+                .await
+                .unwrap();
+            engine
+                .add_memory("one more".to_owned(), card, Role::Assistant, 1.0, Some("t1"))
+                .await
+                .unwrap();
+
+            // row_cap 3 cuts INSIDE t1 (its assistant row is id 4): t1 is
+            // partial, t2 complete. First-seen order is [t1, t2] — the old
+            // out.pop() dropped COMPLETE t2 and returned PARTIAL t1.
+            let turns = engine.fetch_unconsolidated_turns(card, 3).await.unwrap();
+            let keys: Vec<&str> = turns.iter().map(|t| t.turn_uuid.as_str()).collect();
+            assert_eq!(keys, vec!["t2"], "only the complete turn survives the cut");
+            assert_eq!(turns[0].parts.len(), 2, "t2 carries BOTH its rows");
+
+            // A cap above the row count returns every turn whole.
+            let all = engine.fetch_unconsolidated_turns(card, 10).await.unwrap();
+            assert_eq!(all.len(), 2);
+            assert!(all.iter().any(|t| t.turn_uuid == "t1" && t.parts.len() == 2));
+        }
+
+        /// (2026-08-24 bug-1 fix) The sparse path passes the same dense
+        /// floor. 64 char-overlap fillers outrank the target in the dense
+        /// top-k (making it sparse-only); the target matches BM25 on its
+        /// rare token — and a floor above every true cosine rejects ALL of
+        /// it: BM25 can no longer float a semantically-distant hit into the
+        /// prompt ungated.
+        #[tokio::test]
+        async fn search_gates_sparse_candidates_on_the_dense_floor() {
+            let (engine, _dir) = open_engine();
+            let card = "sparse-gate-card";
+            // The target: BM25-matches "zorbuloon", stub-cosine ≈ 0.878.
+            engine
+                .add_memory("wupi zorbuloon raid".to_owned(), card, Role::User, 1.0, Some("t1"))
+                .await
+                .unwrap();
+            // 64 fillers: NO FTS5 token match ("zorbuloonm" is a different
+            // token) but a higher stub cosine (≈ 0.978) — they fill the
+            // dense top-k and push the target out of it (sparse-only).
+            for _ in 0..64 {
+                engine
+                    .add_memory("zorbuloonm".to_owned(), card, Role::User, 1.0, None)
+                    .await
+                    .unwrap();
+            }
+            // Default floor (0.72): the target clears it via its FETCHED
+            // vector (the sparse-only path) and surfaces with a sparse rank
+            // and no dense rank.
+            let hits = engine.search("zorbuloon", card, 70, None).await.unwrap();
+            let target = hits
+                .iter()
+                .find(|h| h.entry.text_content == "wupi zorbuloon raid")
+                .expect("the sparse-only target clears the default floor");
+            assert!(
+                target.debug.sparse_rank.is_some(),
+                "it arrived via the sparse list: {:?}",
+                target.debug
+            );
+            assert!(
+                target.debug.dense_rank.is_none(),
+                "it never rode the dense list: {:?}",
+                target.debug
+            );
+            // A floor above every true cosine (the fillers sit at ≈ 0.978,
+            // the target at ≈ 0.878) rejects everything — the old code let
+            // the BM25 match surface sparse-only, ungated.
+            let none = engine.search("zorbuloon", card, 70, Some(0.999)).await.unwrap();
+            assert!(
+                none.is_empty(),
+                "no candidate may bypass the floor — not even a rank-1 BM25 match"
+            );
         }
     }
 }
