@@ -1446,6 +1446,28 @@ fn clean_item_name(raw: &str) -> Option<String> {
     // reject the residual junk words outright (a 3+ char floor already
     // exists below — these are the words that PASS it).
     let cleaned = cleaned.trim_start_matches('+').trim();
+    // (2026-08-27 playtest H5) Trailing qualifier parentheticals — the
+    // tracker emits "Dagger (standard)", "Pleading (state)", "Blood (on
+    // head)": a paren group at the END of an item name is metadata, never
+    // the name. Stripping it lets the bare noun hit the stored stack — the
+    // playtest's "Dagger (standard)" DUPLICATED the dagger (the paren-
+    // variant equipped while the original rode in the pack). A name that
+    // is ONLY the paren group has no name left → reject.
+    let cleaned = if cleaned.ends_with(')') && cleaned.len() >= 3 {
+        match cleaned.rfind('(') {
+            Some(open) if open > 0 => {
+                let head = cleaned[..open].trim_end();
+                if head.chars().count() >= 3 {
+                    head
+                } else {
+                    return None;
+                }
+            }
+            _ => cleaned,
+        }
+    } else {
+        cleaned
+    };
     if matches!(cleaned.to_lowercase().as_str(), "none" | "null" | "nan" | "extra") {
         return None;
     }
@@ -5157,6 +5179,39 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─────────────────────────────────────────────────────────────────────
+    // (2026-08-27 playtest H5) The trailing-parenthetical strip — tracker
+    // qualifier emissions ("Dagger (standard)", "Pleading (state)") land as
+    // the bare noun so they merge with the stored stack.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn pack_name_strips_trailing_parenthetical() {
+        let parsed = parse("[PACK name=\"Dagger (standard)\"]");
+        match parsed.commands.as_slice() {
+            [BracketCommand::Pack { item_name, remove: false, .. }] => {
+                assert_eq!(item_name, "Dagger", "paren qualifier stripped");
+            }
+            other => panic!("expected one PACK add, got {other:?}"),
+        }
+        // A name that is ONLY the paren group is not rescued by the strip
+        // (the junk gates own it).
+        let parsed = parse("[PACK name=\"(state)\"]");
+        assert!(
+            parsed.commands.is_empty(),
+            "paren-only name must not survive: {:?}",
+            parsed.commands
+        );
+        // Names without parens are untouched.
+        let parsed = parse("[PACK name=\"Lockpick Set\"]");
+        match parsed.commands.as_slice() {
+            [BracketCommand::Pack { item_name, .. }] => {
+                assert_eq!(item_name, "Lockpick Set");
+            }
+            other => panic!("expected one PACK add, got {other:?}"),
+        }
+    }
 
     // ─────────────────────────────────────────────────────────────────────
     // (2026-08-19) ROOM / ASSET / PROMISE — the hidden-site-maps + Referee

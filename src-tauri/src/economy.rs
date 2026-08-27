@@ -434,6 +434,40 @@ pub fn wealth_gain_grounded(corpus: &[&str]) -> bool {
     })
 }
 
+/// (2026-08-27 playtest C4) Does the narrative window carry a money-
+/// MOVEMENT signal — either direction? The mirror of
+/// [`wealth_gain_grounded`] widened with the SPEND-side stems (buy /
+/// purchase / spend / cost): the 2026-08-27 playtest went 0-for-6 on
+/// money tracking (payments to a fisherman, a tavern meal, wages earned,
+/// bribes) — the tracker narrated coin moving and emitted no `[LEDGER]`
+/// at all, so `wealth` never moved in 30 turns. This detector arms the
+/// `<emit_errors>` teach-back on turns where coin language appears but no
+/// LEDGER fired. Same word-boundary discipline as the gain gate. A false
+/// positive costs one conditional coaching line (the tracker still only
+/// emits when the pocket genuinely moved); a false negative is the status
+/// quo — an untracked economy.
+pub fn narrative_carries_money_movement(corpus: &[&str]) -> bool {
+    const MONEY_STEMS: &[&str] = &[
+        // Gain side (shared with wealth_gain_grounded's intent).
+        "paid", "pays", "payment", "repaid", "reward", "rewarded",
+        "earns", "earned", "wage", "wages", "salary", "bounty",
+        "looted", "plundered", "pocketed", "tipped", "gifted", "handed",
+        // Spend side (new: the playtest's payment class).
+        "buy", "buys", "bought", "buying",
+        "purchase", "purchases", "purchased",
+        "spend", "spends", "spent", "spending",
+        "cost", "costs", "costed",
+        "charge", "charges", "charged",
+        "fee", "fees", "fare", "fares", "rent", "rents",
+        "stiffed",
+    ];
+    corpus.iter().any(|text| {
+        text.split(|c: char| !c.is_alphanumeric())
+            .filter(|t| !t.is_empty())
+            .any(|w| MONEY_STEMS.contains(&w.to_lowercase().as_str()))
+    })
+}
+
 /// The `<economy_anchor>` block (2026-08-21 Chloe addendum): the Rust-owned
 /// relative price ladder rendered inside `<world_state>` — the
 /// anti-price-hallucination scaffolding. Deterministic values ONLY (the
@@ -860,6 +894,22 @@ mod tests {
         // accident), and "coinpurse" must NOT match any stem.
         assert!(wealth_gain_grounded(&["Repayment arrives by courier"]));
         assert!(!wealth_gain_grounded(&["coinpurse coinpurse coinpurse"]));
+    }
+
+    /// (2026-08-27 playtest C4) The money-MOVEMENT detector — both
+    /// directions, word-boundary, the playtest's actual miss classes.
+    #[test]
+    fn narrative_carries_money_movement_catches_spend_and_gain() {
+        // T2: copper paid to the fisherman.
+        assert!(narrative_carries_money_movement(&["I press two copper into the fisherman's palm; he was paid fairly."]));
+        // T3: stew + beer.
+        assert!(narrative_carries_money_movement(&["Stew and beer bought and paid for, I take the corner bench."]));
+        // T12: a wage.
+        assert!(narrative_carries_money_movement(&["Garrow counts out my wages for the afternoon's work."]));
+        // Descriptive coin only — no movement stem — stays quiet.
+        assert!(!narrative_carries_money_movement(&["Her gold hair catches the lantern light; the coinless table gleams."]));
+        // Word-boundary: "paid" inside "unpaid" never matches.
+        assert!(!narrative_carries_money_movement(&["The unpaid apprentices watch."]));
     }
 
     // ── Curves ────────────────────────────────────────────────────────────

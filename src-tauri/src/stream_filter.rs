@@ -54,6 +54,47 @@ pub fn strip_bracket_shaped(text: &str) -> String {
     re.replace_all(text, "").into_owned()
 }
 
+/// (2026-08-27 playtest C1) Strip a LEADING run of bracket-shaped spans —
+/// ANY content, not just taught verbs — from the head of a narration beat.
+///
+/// The verb-shaped `strip_bracket_shaped` only removes brackets whose first
+/// word is a taught verb. GLM sometimes opens a beat with protocol-LOOKALIKE
+/// free-form brackets (`[old_nettle mood: greedy-shrewd]`) that no verb arm
+/// matches; stored verbatim they re-enter the 16-message history and the
+/// model imitates its own leak — self-reinforcing contamination. Narration
+/// never legitimately STARTS with a bracket, so a leading-run strip is safe
+/// without touching mid-prose brackets (dialogue may quote `[sic]`-shaped
+/// text legitimately). Quote-aware close scan mirrors `find_bracket_close`:
+/// a `]` inside a double-quoted value is literal. An UNCLOSED leading `[`
+/// stops the strip (conservative: the tail may be prose).
+pub fn strip_leading_bracket_run(text: &str) -> String {
+    let mut rest = text.trim_start();
+    loop {
+        if !rest.starts_with('[') {
+            break;
+        }
+        // Scan for the first unquoted `]`.
+        let mut in_quotes = false;
+        let mut close: Option<usize> = None;
+        for (idx, c) in rest.char_indices() {
+            match c {
+                '"' => in_quotes = !in_quotes,
+                ']' if !in_quotes => {
+                    close = Some(idx);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        match close {
+            // Drop the span (+ any whitespace after it) and keep stripping.
+            Some(idx) => rest = rest[idx + 1..].trim_start(),
+            None => break,
+        }
+    }
+    rest.trim_start().to_string()
+}
+
 /// (2026-08-24 review fix) Quote-aware close scan, mirroring the parser's
 /// `find_bracket_close`: a `]` inside a double-quoted value is literal, not
 /// a bracket close. Used by feed's holdback check + flush's partial-bracket
@@ -2107,6 +2148,43 @@ mod tests {
         let bare = strip_bracket_shaped("He sleeps. [REST] Morning.");
         assert!(!bare.contains("["), "bare REST leaked: {bare:?}");
         assert!(bare.contains("He sleeps."), "prose survives");
+    }
+
+    /// (2026-08-27 playtest C1) Free-form protocol-lookalike head brackets —
+    /// first word an NPC id, not a taught verb — must strip from the head of
+    /// a finalized beat. Observed verbatim on playtest turns 8 + 10:
+    /// `[old_nettle mood: greedy-shrewd][old_nettle intent: "…"]`.
+    #[test]
+    fn strip_leading_bracket_run_removes_free_form_head_leak() {
+        let text = "[old_nettle mood: greedy-shrewd][old_nettle intent: \"bleed the lighthouse dry\"]\
+                    [old_nettle holding: 1 Gold]\n\nThe old woman's fingers never stop moving.";
+        let stripped = strip_leading_bracket_run(text);
+        assert!(!stripped.starts_with('['), "head leak survived: {stripped:?}");
+        assert!(stripped.starts_with("The old woman"), "prose head wrong: {stripped:?}");
+        assert!(!stripped.contains("old_nettle"), "leak body survived: {stripped:?}");
+    }
+
+    /// Mid-prose brackets are NOT touched by the leading-run strip (dialogue
+    /// may legitimately quote bracket-shaped text); an unclosed head bracket
+    /// stops the strip conservatively.
+    #[test]
+    fn strip_leading_bracket_run_leaves_mid_prose_and_unclosed() {
+        let mid = "She reads the note [sic] aloud.";
+        assert_eq!(strip_leading_bracket_run(mid), mid);
+        let unclosed = "[old_nettle mood: greedy the rest is prose";
+        assert_eq!(strip_leading_bracket_run(unclosed), unclosed);
+        let clean = "Plain beat, no brackets.";
+        assert_eq!(strip_leading_bracket_run(clean), clean.trim());
+    }
+
+    /// A quoted `]` inside a head bracket is literal (parity with the
+    /// parser's `find_bracket_close`), and a RUN of brackets + interleaved
+    /// whitespace strips entirely.
+    #[test]
+    fn strip_leading_bracket_run_is_quote_aware_and_consumes_runs() {
+        let text = "[kira intent: \"say \"]\" then leave]  \n[t] She goes.";
+        let stripped = strip_leading_bracket_run(text);
+        assert_eq!(stripped, "She goes.");
     }
 
     /// (2026-08-24 review P1) The whitespace gate: bracket-shaped PROSE that

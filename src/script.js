@@ -3395,6 +3395,28 @@ const dropdownMenu = document.getElementById('dropdownMenu');
         }
         updateConnectEnabled();
         setStatus('');
+        // (2026-08-27 playtest LOW) Show the SELECTED profile's stored
+        // fields in the editor when it sits pristine (not editing, all
+        // fields blank, focus elsewhere) — the panel used to render an
+        // empty form over a stored profile, which read as data loss.
+        // A pristine fill carries the editing contract (the status line
+        // says "+ overwrites"), so it can never mint a duplicate.
+        if (
+          editingId == null &&
+          profileSelect.value &&
+          !nameEl.value && !endpointEl.value && !keyEl.value &&
+          !(editorEl.contains(document.activeElement))
+        ) {
+          const p = findProfile(profileSelect.value);
+          if (p) {
+            nameEl.value = p.name || '';
+            endpointEl.value = p.endpoint || '';
+            keyEl.value = p.api_key || '';
+            editingId = p.id;
+            editorEl.classList.add('editing');
+            setStatus('Editing "' + (p.name || '') + '". + overwrites.');
+          }
+        }
       } catch (err) {
         console.warn('[wupi] load failed', err);
       }

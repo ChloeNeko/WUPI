@@ -701,6 +701,11 @@ function finishTurn() {
   // a LATER `cancelled` event fired a spurious reroll of the wrong beat.
   deferredReroll = false;
   clearSliceState();
+  // (2026-08-27 playtest M1) Turn-end drawer self-heal: whatever path
+  // produced the turn, the trailing assistant beats' chevron stamps now
+  // match the feed (a stale is-locked variantbar used to survive turn
+  // completion with no later append/rebuild to fix it).
+  beats.refreshTrailingDrawers();
   // (audit #5) Hand the reverted turn's typed text to the stage so it can
   // restore it into the composer (the bubble is gone; without this the
   // player's action would be lost entirely). Undefined on non-revert paths.

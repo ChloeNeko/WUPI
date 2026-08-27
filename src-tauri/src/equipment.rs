@@ -640,8 +640,10 @@ pub fn resolve_item_fragment(
     }
 
     // ── Step 1: narrative noun-phrase expansion ──────────────────────────
+    // (2026-08-27 playtest H5) Over DIALOGUE-STRIPPED narration — spoken
+    // phrasing is not item naming.
     for text in narrative {
-        for (tok_raw, nexts) in noun_phrase_windows(text) {
+        for (tok_raw, nexts) in noun_phrase_windows(&strip_dialogue_spans(text)) {
             if tok_raw.to_lowercase() != frag_lower {
                 continue;
             }
@@ -709,6 +711,17 @@ fn noun_phrase_windows(text: &str) -> Vec<(String, Vec<String>)> {
             if PHRASE_STOPWORDS.contains(&lower.as_str()) {
                 break;
             }
+            // (2026-08-27 playtest H5) Verb wall — the narrative's follow-on
+            // VERBS used to absorb as name material: "copper tells", "gold
+            // coin sitting", "ledger says". A common narrative verb (or any
+            // lowercase ≥5-char -ing participle: "sitting", "glinting")
+            // ends the phrase exactly like a stopword. The ≥5 floor keeps
+            // "ring"/"king"/"wing" absorbable.
+            if ABSORB_VERB_WALL.contains(&lower.as_str())
+                || (lower.chars().count() >= 5 && lower.ends_with("ing"))
+            {
+                break;
+            }
             let bare = clean.strip_suffix("'s").unwrap_or(clean);
             if bare.chars().count() < 2 {
                 break;
@@ -716,6 +729,62 @@ fn noun_phrase_windows(text: &str) -> Vec<(String, Vec<String>)> {
             nexts.push(bare.to_string());
         }
         out.push((tok_raw, nexts));
+    }
+    out
+}
+
+/// (2026-08-27 playtest H5) Narrative verbs that END a noun phrase — the
+/// absorber swallowed them as item-name material ("copper tells", "gold
+/// coin sitting", "ledger says certain names"). Word-boundary lowercase
+/// members of a phrase, matched as absorption walls in
+/// [`noun_phrase_windows`]. Keep tight: a word here stops phrase growth,
+/// so a legitimate item named exactly one of these ("Wheat Ale") still
+/// works (the HEAD noun is never walled, only absorbed follow-ons).
+const ABSORB_VERB_WALL: &[&str] = &[
+    "tells", "told", "says", "said", "asks", "asked", "replies", "replied",
+    "whispers", "whispered", "mutters", "muttered", "shouts", "shouted",
+    "growls", "growled", "calls", "called",
+    "sits", "sat", "stands", "stood", "lies", "lay", "rests", "rested",
+    "waits", "waited", "left", "leaves", "arrives", "arrived",
+    "settles", "settled",
+    "takes", "took", "gives", "gave", "holds", "held", "offers", "offered",
+    "opens", "opened", "closes", "closed", "falls", "fell", "slides",
+    "slid", "slips", "slipped", "rides", "rode", "carries", "carried",
+    "drops", "dropped", "spills", "spilled", "catches", "caught", "cuts",
+    "runs", "ran", "walks", "walked", "wakes", "woke", "looks", "looked",
+    "seems", "seemed", "feels", "felt", "reads", "wears", "clinks",
+    "glints", "gleams", "hangs", "belongs", "matters", "means", "meant",
+    "counted", "counts", "presses", "pressed",
+];
+
+/// (2026-08-27 playtest H5) Remove double-quoted dialogue spans from a
+/// narrative text (both straight and typographic quotes). Item-name
+/// expansion must not mine DIALOGUE — the playtest minted the pack item
+/// "ledger says certain names" from a spoken line's phrasing. Speech is
+/// not narration; an item referenced only inside quotes keeps its
+/// fragment form (Step 2's inventory match still applies). Pure.
+fn strip_dialogue_spans(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_quote = false;
+    for c in text.chars() {
+        match c {
+            '"' | '\u{201c}' | '\u{201d}' => {
+                in_quote = !in_quote;
+                // The quote marks themselves are dropped.
+            }
+            '\u{2018}' | '\u{2019}' => {
+                // Apostrophes ("her palm's copper") are not quote toggles
+                // here — the narrator's dialogue law uses doubles.
+                if !in_quote {
+                    out.push(c);
+                }
+            }
+            _ => {
+                if !in_quote {
+                    out.push(c);
+                }
+            }
+        }
     }
     out
 }
@@ -2994,5 +3063,57 @@ mod tests {
         assert_eq!(route_item_to_slot("silk hosiery"), Some(EquipSlot::Feet));
         // Weapon vocabulary still wins over garment needles in compounds.
         assert_eq!(route_item_to_slot("shortsword"), Some(EquipSlot::MainHand));
+    }
+
+    /// (2026-08-27 playtest H5) The verb wall + participle wall: the
+    /// narrative's follow-on verbs never absorb into item names.
+    #[test]
+    fn fragment_absorption_stops_at_narrative_verbs() {
+        // "copper tells" (T2): absorbs nothing past the verb.
+        let out = resolve_item_fragment(
+            "copper",
+            &["The copper tells the whole story of this port."],
+            &[],
+        );
+        assert_eq!(out.as_deref(), Some("copper"));
+        // "gold coin sitting" (T4): "coin" absorbs, "sitting" walls.
+        let out = resolve_item_fragment(
+            "gold",
+            &["A gold coin sitting on the counter catches my eye."],
+            &[],
+        );
+        assert_eq!(out.as_deref(), Some("gold coin"));
+        // "copper left" (T3, "The copper left her palm"): "left" walls.
+        let out = resolve_item_fragment("copper", &["The copper left her palm."], &[]);
+        assert_eq!(out.as_deref(), Some("copper"));
+        // "dagger settled" (playtest 2 T4, "The spare dagger settled onto
+        // her left hip"): "settled" walls — it minted a phrase-name clone.
+        let out = resolve_item_fragment(
+            "dagger",
+            &["The spare dagger settled onto her left hip."],
+            &[],
+        );
+        assert_eq!(out.as_deref(), Some("dagger"));
+        // Genuine multi-word names still absorb name-y words.
+        let out = resolve_item_fragment(
+            "hard",
+            &["a wedge of hard cheese and a block of wax"],
+            &[],
+        );
+        assert_eq!(out.as_deref(), Some("hard cheese"));
+    }
+
+    /// (2026-08-27 playtest H5) Dialogue spans are not item naming — the
+    /// "ledger says certain names" mint came from a spoken line.
+    #[test]
+    fn fragment_expansion_ignores_dialogue() {
+        let out = resolve_item_fragment(
+            "ledger",
+            &["Vess sneers. \"This ledger says certain names, girl.\" She slides it across."],
+            &[],
+        );
+        // The dialogue's phrasing never absorbs; narration outside the
+        // quotes carries no follow-on either → the fragment stands alone.
+        assert_eq!(out.as_deref(), Some("ledger"));
     }
 }

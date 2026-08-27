@@ -24,7 +24,7 @@
 //   channel events → see narrator.js
 // =============================================================
 
-import { variantCount, computeDrawerState, swipeNextAction, canEditMessage, centeredPopupOpen, isTrailingAssistantBeat } from './drawer-logic.js';
+import { variantCount, computeDrawerState, swipeNextAction, centeredPopupOpen, isTrailingAssistantBeat } from './drawer-logic.js';
 
 let feedEl = null;
 
@@ -684,7 +684,7 @@ export function refreshDrawer(beat) {
 // the centered-popup gate the stage keyboard shortcuts consult, + the pure
 // trailing-beat predicate behind isTrailingAssistant) so stage.js routes ›
 // through the same logic the unit tests pin (one import path).
-export { swipeNextAction, computeDrawerState, canEditMessage, centeredPopupOpen, isTrailingAssistantBeat };
+export { swipeNextAction, computeDrawerState, centeredPopupOpen, isTrailingAssistantBeat };
 
 function appendMes(root) {
   if (!feedEl) return null;
@@ -855,6 +855,21 @@ export function lastNarratorBeat() {
   if (!feedEl) return null;
   const beats = feedEl.querySelectorAll('.fable-mes[data-role="assistant"]');
   return beats.length ? beats[beats.length - 1] : null;
+}
+
+// (2026-08-27 playtest M1) Turn-end self-heal for the trailing drawer
+// stamps: refresh the LAST TWO assistant beats' chevron state (the new
+// trailing beat unlocks + re-enables ›; the formerly-trailing one retires
+// to locked). Whatever path produced the turn (crossroads→send,
+// edit→regen, a late-chunk race), the affordance state after the turn
+// matches the feed — the playtest's trailing beat kept a stale is-locked
+// variantbar (display:none) with no later append/rebuild to fix it.
+export function refreshTrailingDrawers() {
+  if (!feedEl) return;
+  const asst = feedEl.querySelectorAll('.fable-mes[data-role="assistant"]');
+  if (!asst.length) return;
+  refreshDrawer(asst[asst.length - 1]);
+  if (asst.length >= 2) refreshDrawer(asst[asst.length - 2]);
 }
 
 // Prepare a beat for an in-place re-stream (reroll): clear its body +

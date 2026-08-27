@@ -103,23 +103,29 @@ pub const CTX_API: u32 = 16384;
 pub const CTX_LOCAL_WITH_API: u32 = 8192;
 
 /// Fable engine context (the tracker pass). **2026-08-08: 3072. 2026-08-21
-/// Chloe ruling — FINAL: 8192 (E4B; same-day interims at 4096).** The local
+/// Chloe ruling: 8192 (E4B; same-day interims at 4096). 2026-08-27 Chloe
+/// ruling: 8704** — the tracker decode wall rose 512→1024 (fable_engine.rs,
+/// same directive), and the DERIVED prompt budget
+/// `(CTX_FABLE − TRACKER_MAX_TOKENS) × 3.6` must stay ≥ the pinned 26.3k
+/// worst-case composition: at 8192 the 1024 wall would have cut it to
+/// ~25.8k — UNDER the pin, breaking the NO-DEGRADE contract. 8704 restores
+/// the budget to EXACTLY its long-standing 27,648 ((8704 − 1024) × 3.6).
+/// This retires the "exactly half the API narrator's 16384" parity law —
+/// the fable context is now sized by the tracker's generation reserve, not
+/// the API's budget. KV cost: ~+10 MiB Q8_0 over 8192 (sublinear — the
+/// E4B's 512-token SWA layers don't grow; read the exact MiB off the boot
+/// telemetry). The local
 /// model's Fable role is TRACKING ONLY (bracket commands + schema state) —
 /// the API narrates. The tracker window is 2 messages (1 turn) — it relies
-/// on the schema delta + Rust state, not re-read history. 3072 fit the
-/// 2026-08-08 teaching set, but the 2026-08-18→21 verb growth (NPC interior
-/// + site + economy) pushed real campaigns against the derived char budget
-/// from turn ~22 (the Cinderfen economy playtest). 8192 + the raised
-/// world-state visibility caps (STAGE0 + WS_BUDGET, lib.rs) are one ruling:
+/// on the schema delta + Rust state, not re-read history. 8192 + the raised
+/// world-state visibility caps (STAGE0 + WS_BUDGET, lib.rs) were one ruling:
 /// track MORE stuff, and extremely long roleplays must never approach the
 /// ceiling — the worst realistic composition (fixed teaching ~7.6k + WS
 /// ≤17k + maxed window) lands ~90% of the derived budget, and a REAL
-/// campaign world state (~1-3k) never approaches it. KV cost:
-/// ~120-190 MiB Q8_0 in the swap-locked fable slot (sublinear in practice —
-/// the E4B's 512-token SWA layers don't grow; read the exact MiB off the
-/// boot telemetry). `TRACKER_PROMPT_CHAR_BUDGET` is DERIVED from this (see
+/// campaign world state (~1-3k) never approaches it.
+/// `TRACKER_PROMPT_CHAR_BUDGET` is DERIVED from this (see
 /// below): raising this constant automatically raises the budget.
-pub const CTX_FABLE: u32 = 8192;
+pub const CTX_FABLE: u32 = 8704;
 
 /// Schema-delta engine context. The micro-delta pass only needs system
 /// instruction + current schema JSON + one exchange (see schema_engine.rs).
@@ -282,7 +288,16 @@ pub const API_TOP_P: f32 = 0.95;
 /// enforces server-side. The creator assistant + slice-regen paths stay
 /// UNCAPPED (`None`): lorebook batch conversion legitimately needs long
 /// outputs and slice spans are short by construction.
-pub const API_NARRATOR_MAX_TOKENS: u32 = 800;
+/// (2026-08-27 playtest C2: 800 → 1280) z.ai no longer honors the
+/// `thinking: disabled` injection — `GLM reasoning leaked` fired on 31/31
+/// turns (76–2,082 chars ≈ up to ~520 tokens) and reasoning counts against
+/// max_tokens, silently amputating up to a quarter of the beat budget. 1280
+/// = the intended ~800-token prose ceiling + the observed worst-case leak
+/// with margin. The client-side discard + its WARN telemetry stay (the
+/// leak is discarded, never rendered); if the provider ever honors the
+/// disable again, the pacing law — not this cap — keeps beats sized, so
+/// lowering it back is optional.
+pub const API_NARRATOR_MAX_TOKENS: u32 = 1280;
 
 /// (2026-08-24 hybrid chat) `max_tokens` for the WUPI-chat API reply pass.
 /// The real verbosity fix lives in `data/wupi.prompt`'s pacing law (answer

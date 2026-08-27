@@ -4628,36 +4628,48 @@ async fn dispatch_fable_state_tool(
             // discipline): a detached task parks on the lock + fires the
             // moment chat_send's agent loop releases it.
             //
-            // (2026-08-16 bug 14) Same up-front non-trailing refusal as the
-            // IPC path: the model may cite any index, but a committed
-            // mid-history assistant edit permanently diverges prose from
-            // world (the detached retrack skips non-trailing beats).
-            let (messages, is_assistant) = {
+            // (2026-08-16 bug 14 + 2026-08-27 Chloe ruling) The model may
+            // cite any index — every message is editable. Only the TRAILING
+            // assistant beat gets the deferred re-track; every other edit
+            // (user beats, mid-history assistant beats) commits as a pure
+            // prose swap, world state untouched (the re-track would revert
+            // the live schema to that beat's base and discard every later
+            // turn's tracked world). The intro beat mirrors the IPC path:
+            // strict card write-through FIRST, no re-track ever.
+            let intro_active_idx = {
+                let gs = state.fable_session.lock().await;
+                gs.messages
+                    .get(index)
+                    .filter(|m| m.is_intro)
+                    .map(|m| m.active_idx)
+            };
+            if let Some(active_idx) = intro_active_idx {
+                write_intro_variant_to_card(app, &card_id, Some(active_idx), &content)?;
+            }
+            let (messages, retrack_needed) = {
                 let mut gs = state.fable_session.lock().await;
-                {
-                    let len = gs.messages.len();
-                    if let Some(m) = gs.messages.get(index) {
-                        if m.role == session::Role::Assistant && len > index + 1 {
-                            return Err(format!(
-                                "fable_message_edit: index {index} is not the trailing assistant beat (len {len}) — edit the trailing beat, or rewind the timeline first"
-                            ));
-                        }
-                    }
-                }
+                let len = gs.messages.len();
                 apply_edit(&mut gs, index, content)?;
-                let is_assistant = gs
+                let retrack_needed = gs
                     .messages
                     .get(index)
-                    .map(|m| m.role == session::Role::Assistant)
+                    .map(|m| m.role == session::Role::Assistant && !m.is_intro && len == index + 1)
                     .unwrap_or(false);
-                (project_messages(&gs), is_assistant)
+                (project_messages(&gs), retrack_needed)
             };
             persist_fable_session(app, state, &card_id).await?;
+            // Prose-swap edits refresh the reserved autosave (the rewind/
+            // cascade discipline — a stale Continue checkpoint would revert
+            // the edit after a crash). The retrack branch autosaves at its
+            // own success tail.
+            if !retrack_needed {
+                spawn_reserved_autosave(app, state).await;
+            }
             let _ = app.emit(
                 "fable-session-changed",
                 serde_json::json!({ "kind": "messages", "messages": messages }),
             );
-            if is_assistant {
+            if retrack_needed {
                 let app_handle = app.clone();
                 // (2026-08-16 bug 14) The parked task must re-verify the
                 // session identity before firing (the tick discipline): it
@@ -5562,7 +5574,16 @@ async fn run_agent_loop(
                                     (false, "error: that card's game session is active — exit to the title screen before deleting it".to_string())
                                 } else {
                                     match tool.execute(&call.args, &ctx) {
-                                        Ok(output) => (true, output),
+                                        Ok(output) => {
+                                            // (2026-08-27 playtest M8) Bound
+                                            // every tool result BEFORE it
+                                            // renders — a 1M-char file_read
+                                            // used to flood the dispatch
+                                            // prompt + get amputated by the
+                                            // engine truncator after the
+                                            // fact.
+                                            (true, tools::cap_tool_result(output))
+                                        }
                                         Err(e) => (false, format!("error: {e}")),
                                     }
                                 }
@@ -7413,6 +7434,13 @@ async fn apply_phase3_bracket_commands(
                 } else {
                     name.trim().to_string()
                 };
+                // (2026-08-27 playtest H2) An unset DISCOVER setting infers
+                // from the diegetic label — same law as the TRAVEL mint.
+                let setting = if setting.trim().is_empty() {
+                    schema::infer_node_setting(&label).to_string()
+                } else {
+                    setting.trim().to_string()
+                };
                 let node = schema::Node {
                     id: id.clone(),
                     name: label.clone(),
@@ -7429,7 +7457,8 @@ async fn apply_phase3_bracket_commands(
                             !n.is_empty() && *n != id && !schema::is_garbage_identifier(n)
                         })
                         .collect(),
-                    setting: setting.trim().to_string(), ..Default::default()
+                    setting,
+                    ..Default::default()
                 };
                 let was_empty_graph = !s.travel_graph.is_set();
                 if s.travel_graph.upsert_node(node) {
@@ -9184,8 +9213,16 @@ async fn apply_phase3_bracket_commands(
             // ghost NPC the narrator then played as a second Lacey. The
             // applier is not blind: `player_slug` (hoisted above the loop)
             // rejects an exact id/name match with a teaching directive.
+            // (2026-08-27 playtest H4) Fragment matches too: the playtest's
+            // `[PRESENCE kira …]` auto-registered the player ("Kira
+            // Vandel") as NPC "kira" because the guard was exact-slug-only;
+            // the ghost then received every misdirected MOOD/INTENT/NPC_ITEM
+            // emission for 25 turns.
             if !player_slug.is_empty()
-                && (id == player_slug || sanitize_slug(&label) == player_slug)
+                && (id == player_slug
+                    || sanitize_slug(&label) == player_slug
+                    || is_player_name_fragment(&id, &player_slug)
+                    || is_player_name_fragment(&label, &player_slug))
             {
                 reject_directives.push(format!(
                     "NPC not registered — \"{label}\" is the player's own name. The player is never an NPC: never register them and never assert their presence."
@@ -9311,6 +9348,27 @@ async fn apply_phase3_bracket_commands(
                 // "captain-harsk"; Chloe's recommendation 2, 2026-08-17).
                 match schema::resolve_npc_surface(&registry_entries, npc_id) {
                     Some(entry) => {
+                        // (2026-08-27 playtest 2, finding 3) The
+                        // player-name law runs on KNOWN ids too: a polluted
+                        // session's ghost registry entry (the playtest's
+                        // "kira") resolved through this exact-id arm and
+                        // re-asserted the player into `present:` on every
+                        // grounded turn. The player is never an NPC
+                        // regardless of what the registry thinks it knows —
+                        // the ghost entry itself stays (run-time data) but
+                        // can no longer be asserted; it rides grace decay.
+                        if npc_item_targets_player(npc_id, &player_slug)
+                            || npc_item_targets_player(&entry.id, &player_slug)
+                        {
+                            reject_directives.push(format!(
+                                "Presence not recorded — \"{npc_id}\" is the player's own name. The player is never an NPC; never register or assert them."
+                            ));
+                            tracing::debug!(
+                                npc_id = %entry.id,
+                                "[PRESENCE] rejected — player-name match on a known id (ghost entry)"
+                            );
+                            continue;
+                        }
                         // (2026-08-22 playtest, Chloe directive) GROUNDING
                         // gate: the tracker may only assert an NPC its own
                         // narrative window mentions (the same bounded-
@@ -9339,7 +9397,13 @@ async fn apply_phase3_bracket_commands(
                         // gets the pointed directive — the generic
                         // "not a known NPC" message invites a registration
                         // attempt next turn instead of teaching the collision.
-                        if !player_slug.is_empty() && sanitize_slug(npc_id) == player_slug {
+                        // (2026-08-27 playtest H4) Fragment matches too —
+                        // "kira" against the player "Kira Vandel" was the
+                        // playtest's ghost-NPC mint (T5).
+                        if !player_slug.is_empty()
+                            && (sanitize_slug(npc_id) == player_slug
+                                || is_player_name_fragment(npc_id, &player_slug))
+                        {
                             reject_directives.push(format!(
                                 "Presence not recorded — \"{npc_id}\" is the player's own name. The player is never an NPC; never register or assert them."
                             ));
@@ -9650,6 +9714,12 @@ async fn apply_phase3_bracket_commands(
         // internal parks). Consulted before any player-rack ADD applies;
         // cleared by removals. See `track_player_item_add`.
         let mut player_item_adds: Vec<String> = Vec::new();
+        // (2026-08-27 playtest C5) The NPC-rack churn ledger — (npc_id, name)
+        // pairs ADDED to registry NPCs' racks this pass. A same-pass removal
+        // of a just-added pair is tracker self-talk (the playtest's
+        // `+Ledger`/`-Ledger` pair on one rack canceled the acquisition);
+        // the removal is skipped so the add survives.
+        let mut npc_item_adds: Vec<(String, String)> = Vec::new();
         for cmd in &equip_cmds {
             if let bracket_parser::BracketCommand::Equip {
                 slot,
@@ -9915,6 +9985,18 @@ async fn apply_phase3_bracket_commands(
                 let pre_list = s.player_state.belt.clone();
                 let pre_schema = s.clone();
                 if *remove {
+                    // (2026-08-27 playtest C5) Same-pass churn guard: a removal
+                    // of a name ADDED earlier in this same emission is the
+                    // tracker talking itself out of a real acquisition (the
+                    // playtest's `+Ledger`/`-Ledger` self-canceling pair
+                    // dropped the campaign's central object). Keep the add.
+                    if player_item_added_this_turn(&player_item_adds, item_name) {
+                        tracing::debug!(
+                            name = %item_name,
+                            "[BELT] removal skipped — same-pass churn of an applied add"
+                        );
+                        continue;
+                    }
                     let existed = equipment::stack_remove(&mut s.player_state.belt, item_name, 0);
                     if existed {
                         untrack_player_item_add(&mut player_item_adds, item_name);
@@ -9937,6 +10019,38 @@ async fn apply_phase3_bracket_commands(
                             "[BELT] skipped — same-turn echo of an applied add"
                         );
                         continue;
+                    }
+                    // (2026-08-27 playtest H6) A BELT-add of a name already
+                    // sitting in the pack (or pouch) MOVES one unit onto the
+                    // belt — the mirror of EQUIP's consume-from-belt-then-pack
+                    // law. Before this, `[BELT name="Lockpick Set"]` while the
+                    // set was packed left BOTH racks holding it (still true at
+                    // the playtest's session end, 30 turns later).
+                    // (H6 audit follow-up) Consume ONLY when the belt's
+                    // holdings of the name actually grow: a bare re-assertion
+                    // of a name the belt already holds keeps the stored count
+                    // (stack_restate below), so consuming a stash unit there
+                    // vaporizes it. An explicit `+` add always grows the belt
+                    // (upsert sums) and always consumes — EQUIP's law.
+                    let belt_holds = s
+                        .player_state
+                        .belt
+                        .iter()
+                        .any(|b| b.name.trim().to_lowercase() == item_name.trim().to_lowercase());
+                    let grows_belt = !(*asserted && belt_holds);
+                    let moved_from_stash = grows_belt
+                        && (equipment::stack_remove(
+                            &mut s.player_state.pack,
+                            item_name,
+                            1,
+                        ) || equipment::stack_remove(&mut s.player_state.pouch, item_name, 1));
+                    if moved_from_stash {
+                        undo_snapshot.get_or_insert(pre_schema.clone());
+                        mutated = true;
+                        tracing::info!(
+                            name = %item_name,
+                            "[BELT] add consumed one unit from the stash (no cross-rack duplicate)"
+                        );
                     }
                     let belt_item = equipment::StackItem {
                         name: item_name.to_string(),
@@ -10070,6 +10184,16 @@ async fn apply_phase3_bracket_commands(
                 };
                 let pre_schema = s.clone();
                 if *remove {
+                    // (2026-08-27 playtest C5) Same-pass churn guard (the BELT
+                    // branch twin): a removal of a name ADDED earlier in this
+                    // same emission keeps the add.
+                    if player_item_added_this_turn(&player_item_adds, item_name) {
+                        tracing::debug!(
+                            name = %item_name,
+                            "[PACK] removal skipped — same-pass churn of an applied add"
+                        );
+                        continue;
+                    }
                     // Removals draw pack-first, then the pouch — the tracker
                     // removes what it READS, and coin/key lines render on the
                     // pouch: line.
@@ -10329,9 +10453,17 @@ async fn apply_phase3_bracket_commands(
                 // NPC registry and silently drop the item. A GENUINE registry
                 // entry still wins (resolve first), so an NPC actually named
                 // "Player" is never shadowed.
-                let entry_opt = schema::resolve_npc_surface(&s.npc_registry.entries, npc_id);
-                let Some(entry) = entry_opt else {
-                    if npc_item_targets_player(npc_id, &player_slug) {
+                // (2026-08-27 playtest H1) A grounded UNKNOWN id (not the
+                // player) auto-registers a Named stub here instead of
+                // rejecting — the PRESENCE ruling extended to the track
+                // verbs, so "[NPC_ITEM sable +Ledger]" tracks on its first
+                // appearance even when [NPC_REGISTER] was never emitted.
+                let entry_opt =
+                    schema::resolve_npc_surface(&s.npc_registry.entries, npc_id).cloned();
+                let entry = match entry_opt {
+                    Some(e) => e,
+                    None => {
+                        if npc_item_targets_player(npc_id, &player_slug) {
                         // Default-stash semantics, the [PACK] discipline in
                         // miniature: adds fragment-resolve through the
                         // narrative window + the existing stash names (pack +
@@ -10358,6 +10490,15 @@ async fn apply_phase3_bracket_commands(
                             s.player_state.pack.clone()
                         };
                         if *remove {
+                            // (2026-08-27 playtest C5) Same-pass churn guard
+                            // (the BELT/PACK branch twin).
+                            if player_item_added_this_turn(&player_item_adds, item_name) {
+                                tracing::debug!(
+                                    name = %item_name,
+                                    "[NPC_ITEM player] removal skipped — same-pass churn of an applied add"
+                                );
+                                continue;
+                            }
                             let removed_from = if equipment::stack_remove(&mut s.player_state.pack, item_name, 0)
                             {
                                 "pack"
@@ -10431,16 +10572,34 @@ async fn apply_phase3_bracket_commands(
                             }
                         }
                         continue;
+                        }
+                        // (2026-08-27 playtest H1) Grounded unknown id → mint
+                        // the Named stub + track this emission this turn.
+                        if let Some((e, pre)) = try_auto_register_track_npc(
+                            &mut *s,
+                            &narrative_corpus,
+                            npc_id,
+                            &player_slug,
+                        ) {
+                            undo_snapshot.get_or_insert(pre);
+                            mutated = true;
+                            tracing::info!(
+                                npc_id = %e.id,
+                                "[NPC_ITEM] auto-registered (grounded unknown id)"
+                            );
+                            e
+                        } else {
+                            tracing::warn!(
+                                npc_id = %npc_id,
+                                "[NPC_ITEM] rejected — unknown npc_id"
+                            );
+                            reject_directives.push(format!(
+                                "NPC item change not recorded — \"{}\" is not a known NPC. Re-emit with an id from the cast line; a NEW named NPC is [NPC_REGISTER <id> name=<name>] first; the player's own items are [PACK].",
+                                echo_id(npc_id, 40)
+                            ));
+                            continue;
+                        }
                     }
-                    tracing::warn!(
-                        npc_id = %npc_id,
-                        "[NPC_ITEM] rejected — unknown npc_id"
-                    );
-                    reject_directives.push(format!(
-                        "NPC item change not recorded — \"{}\" is not a known NPC. Re-emit with an id from the cast line; a NEW named NPC is [NPC_REGISTER <id> name=<name>] first; the player's own items are [PACK].",
-                        echo_id(npc_id, 40)
-                    ));
-                    continue;
                 };
                 let id = entry.id.clone();
                 // (2026-08-21 garment routing) The fragment-resolution corpus
@@ -10558,6 +10717,21 @@ async fn apply_phase3_bracket_commands(
                 })
                 .unwrap_or(false);
                 if *remove {
+                    // (2026-08-27 playtest C5) Same-pass churn guard for the
+                    // NPC racks: a removal of a name ADDED to this NPC's rack
+                    // earlier in this same emission keeps the add.
+                    let churn_key = (id.clone(), item_name.trim().to_lowercase());
+                    if npc_item_adds
+                        .iter()
+                        .any(|(nid, n)| *nid == churn_key.0 && *n == churn_key.1)
+                    {
+                        tracing::debug!(
+                            npc_id = %id,
+                            name = %item_name,
+                            "[NPC_ITEM] removal skipped — same-pass churn of an applied add"
+                        );
+                        continue;
+                    }
                     // Held rack first, then the outfit — you take off what
                     // you wear or what you hold.
                     let mut existed = equipment::stack_remove(&mut interior.items, item_name, 0);
@@ -10637,6 +10811,9 @@ async fn apply_phase3_bracket_commands(
                     // false used to escape the old items-only detection.
                     if interior.items != pre_items || interior.worn != pre_worn {
                         changed = true;
+                        // (2026-08-27 playtest C5) Feed the churn ledger so a
+                        // later same-pass removal of this pair no-ops.
+                        npc_item_adds.push((id.clone(), item_name.trim().to_lowercase()));
                         tracing::info!(npc_id = %id, name = %item_name, qty, "[NPC_ITEM] added");
                     }
                 }
@@ -10650,19 +10827,52 @@ async fn apply_phase3_bracket_commands(
         // (2026-08-18 Dedicated-NPC interior state) [MOOD] — an on-camera
         // NPC's emotional read. Last-wins per NPC (what's true now). Unknown
         // ids reject like PRESENCE. Snapshot only on a real change.
+        // (2026-08-27 playtest H1) A GROUNDED unknown id auto-registers a
+        // Named stub (the PRESENCE ruling extended) instead of rejecting —
+        // the tracker emitting [MOOD marlow …] before any [NPC_REGISTER]
+        // used to drop 4 straight emissions.
         for cmd in &mood_cmds {
             if let bracket_parser::BracketCommand::Mood { npc_id, mood } = cmd {
-                let Some(entry) = schema::resolve_npc_surface(&s.npc_registry.entries, npc_id)
-                else {
-                    tracing::warn!(
-                        npc_id = %npc_id,
-                        "[MOOD] rejected — unknown npc_id"
-                    );
-                    reject_directives.push(format!(
-                        "Mood not recorded — \"{}\" is not a known NPC. Re-emit with an id from the cast line; a NEW named NPC is [NPC_REGISTER <id> name=<name>] first.",
-                        echo_id(npc_id, 40)
-                    ));
-                    continue;
+                let entry = match schema::resolve_npc_surface(&s.npc_registry.entries, npc_id)
+                    .cloned()
+                {
+                    Some(e) => e,
+                    None => {
+                        if npc_item_targets_player(npc_id, &player_slug) {
+                            reject_directives.push(format!(
+                                "Mood not recorded — \"{}\" is the player's own name. The player has no tracked mood.",
+                                echo_id(npc_id, 40)
+                            ));
+                            continue;
+                        }
+                        match try_auto_register_track_npc(
+                            &mut *s,
+                            &narrative_corpus,
+                            npc_id,
+                            &player_slug,
+                        ) {
+                            Some((e, pre)) => {
+                                undo_snapshot.get_or_insert(pre);
+                                mutated = true;
+                                tracing::info!(
+                                    npc_id = %e.id,
+                                    "[MOOD] auto-registered (grounded unknown id)"
+                                );
+                                e
+                            }
+                            None => {
+                                tracing::warn!(
+                                    npc_id = %npc_id,
+                                    "[MOOD] rejected — unknown npc_id"
+                                );
+                                reject_directives.push(format!(
+                                    "Mood not recorded — \"{}\" is not a known NPC. Re-emit with an id from the cast line; a NEW named NPC is [NPC_REGISTER <id> name=<name>] first.",
+                                    echo_id(npc_id, 40)
+                                ));
+                                continue;
+                            }
+                        }
+                    }
                 };
                 let id = entry.id.clone();
                 let pre_schema = s.clone();
@@ -10692,17 +10902,47 @@ async fn apply_phase3_bracket_commands(
         // scheme without the model ever re-reading its own reasoning.
         for cmd in &intent_cmds {
             if let bracket_parser::BracketCommand::Intent { npc_id, intent } = cmd {
-                let Some(entry) = schema::resolve_npc_surface(&s.npc_registry.entries, npc_id)
-                else {
-                    tracing::warn!(
-                        npc_id = %npc_id,
-                        "[INTENT] rejected — unknown npc_id"
-                    );
-                    reject_directives.push(format!(
-                        "Intent not recorded — \"{}\" is not a known NPC. Re-emit with an id from the cast line; a NEW named NPC is [NPC_REGISTER <id> name=<name>] first.",
-                        echo_id(npc_id, 40)
-                    ));
-                    continue;
+                // (2026-08-27 playtest H1) Same auto-registration as [MOOD].
+                let entry = match schema::resolve_npc_surface(&s.npc_registry.entries, npc_id)
+                    .cloned()
+                {
+                    Some(e) => e,
+                    None => {
+                        if npc_item_targets_player(npc_id, &player_slug) {
+                            reject_directives.push(format!(
+                                "Intent not recorded — \"{}\" is the player's own name. The player has no tracked intent.",
+                                echo_id(npc_id, 40)
+                            ));
+                            continue;
+                        }
+                        match try_auto_register_track_npc(
+                            &mut *s,
+                            &narrative_corpus,
+                            npc_id,
+                            &player_slug,
+                        ) {
+                            Some((e, pre)) => {
+                                undo_snapshot.get_or_insert(pre);
+                                mutated = true;
+                                tracing::info!(
+                                    npc_id = %e.id,
+                                    "[INTENT] auto-registered (grounded unknown id)"
+                                );
+                                e
+                            }
+                            None => {
+                                tracing::warn!(
+                                    npc_id = %npc_id,
+                                    "[INTENT] rejected — unknown npc_id"
+                                );
+                                reject_directives.push(format!(
+                                    "Intent not recorded — \"{}\" is not a known NPC. Re-emit with an id from the cast line; a NEW named NPC is [NPC_REGISTER <id> name=<name>] first.",
+                                    echo_id(npc_id, 40)
+                                ));
+                                continue;
+                            }
+                        }
+                    }
                 };
                 let id = entry.id.clone();
                 let pre_schema = s.clone();
@@ -10744,6 +10984,34 @@ async fn apply_phase3_bracket_commands(
 fn npc_item_targets_player(npc_id: &str, player_slug: &str) -> bool {
     npc_id.trim().eq_ignore_ascii_case("player")
         || (!player_slug.is_empty() && sanitize_slug(npc_id) == player_slug)
+        // (2026-08-27 playtest H4) First-name-only addressing: the player
+        // "Kira Vandel" slugs to "kira_vandel", but the tracker emits
+        // `[NPC_ITEM kira +1 Gold]` — the exact-slug-only gate let the
+        // player register as NPC "kira" (T5) and then absorb every
+        // misdirected item/currency emission for the rest of the campaign.
+        || is_player_name_fragment(npc_id, player_slug)
+}
+
+/// (2026-08-27 playtest H4) Slug-fragment player match: the emission's id
+/// ("kira") is a non-empty whole-word SUBSET of the player's name slug
+/// ("kira_vandel" — first-name-only or last-name-only addressing).
+/// Word-set containment, not prefix, so "kir" never matches while "vandel"
+/// does. Minimum 3 chars so degenerate one-letter emissions can't collide.
+/// Pure + unit-tested.
+fn is_player_name_fragment(raw_id: &str, player_slug: &str) -> bool {
+    if player_slug.is_empty() {
+        return false;
+    }
+    let id_slug = sanitize_slug(raw_id);
+    if id_slug.is_empty() || id_slug == player_slug || id_slug.chars().count() < 3 {
+        return false;
+    }
+    let player_words: std::collections::HashSet<&str> = player_slug
+        .split('_')
+        .filter(|w| !w.is_empty())
+        .collect();
+    let id_words: Vec<&str> = id_slug.split('_').filter(|w| !w.is_empty()).collect();
+    !id_words.is_empty() && id_words.iter().all(|w| player_words.contains(w))
 }
 
 /// (2026-08-22 playtest, Chloe directive — the mirror guard) Does the player
@@ -10872,6 +11140,56 @@ fn auto_register_presence_stub(surface: &str) -> Option<schema::NpcEntry> {
         tier: None,
         prominence: schema::NpcProminence::Named,
     })
+}
+
+/// (2026-08-27 playtest H1) Auto-registration for the TRACK verbs (MOOD /
+/// INTENT / NPC_ITEM) — the PRESENCE auto-registration ruling extended: a
+/// GROUNDED unknown id mints a Named stub instead of rejecting. The
+/// playtest's tracker emitted track-verbs for principals it never
+/// registered (marlow: 4 rejected emissions; sable: 5; vess: 2 full turns
+/// untracked) and the reject-feedback loop only recovered when PRESENCE
+/// happened to fire — registration-before-tracking must not depend on the
+/// tracker remembering the register verb.
+///
+/// Refusals (→ `None`, the caller keeps its coached reject): the player
+/// (fragment match — the player is never an NPC), an ungrounded id (the
+/// anti-hallucination gate), a garbage identifier, a near-name collision
+/// of a registered NPC (no ghost twins — the same protection
+/// [NPC_REGISTER] carries), or a registry-cap refusal even after the
+/// archived-eviction relief.
+///
+/// On a mint, returns the entry PLUS the pre-mutation schema for the
+/// caller's undo snapshot (the insert is already committed here — the
+/// caller folds `mutated = true` + the snapshot in).
+fn try_auto_register_track_npc(
+    s: &mut schema::WorldSchema,
+    narrative_corpus: &[&str],
+    npc_id: &str,
+    player_slug: &str,
+) -> Option<(schema::NpcEntry, schema::WorldSchema)> {
+    if npc_item_targets_player(npc_id, player_slug) {
+        return None;
+    }
+    if !narrative_grounded(narrative_corpus, npc_id, npc_id, npc_id) {
+        return None;
+    }
+    let stub = auto_register_presence_stub(npc_id)?;
+    // Near-name: a grounded id that is a near-miss of a REGISTERED NPC is a
+    // typo of them, not a new person — the [NPC_REGISTER] protection.
+    let incoming_id = stub.id.clone();
+    if schema::near_name_collision(npc_id, &s.npc_registry, &incoming_id).is_some() {
+        return None;
+    }
+    let pre_schema = s.clone();
+    let mut inserted = s.npc_registry.upsert_entry(stub.clone());
+    if !inserted && s.evict_archived_registry_entry().is_some() {
+        inserted = s.npc_registry.upsert_entry(stub.clone());
+    }
+    if inserted {
+        Some((stub, pre_schema))
+    } else {
+        None
+    }
 }
 
 /// (2026-08-22 playtest, Chloe directive — presence grounding) Bounded-
@@ -11318,9 +11636,24 @@ async fn decode_site_map_with_repair(
         match parsed {
             Ok(m) => return Some(m),
             Err(errors) if pass < total_passes => {
+                // (2026-08-27 playtest 2, H2 probe) The pass's reject
+                // reasons were invisible — a whole architect round failed
+                // with nothing but the standdown WARN to show for it, and
+                // the forensics had to guess the shape mismatch blind.
+                tracing::warn!(
+                    pass,
+                    errors = ?errors,
+                    "site architect: pass failed — queuing repair pass"
+                );
                 attempt_prompt = render_site_architect_repair(&raw, &errors);
             }
-            Err(_) => {}
+            Err(errors) => {
+                tracing::warn!(
+                    pass,
+                    errors = ?errors,
+                    "site architect: final pass failed"
+                );
+            }
         }
     }
     None
@@ -15222,11 +15555,18 @@ async fn enter_fable_session(
             let cleaned = schema::clean_location_label(loc);
             let name = if cleaned.is_empty() { loc.to_owned() } else { cleaned };
             let node_id = crate::slugify_card_stem(&name).unwrap_or_else(|| "start".into());
+            // (2026-08-27 playtest H2) The seeded starting location gets
+            // the same setting inference as minted nodes — the playtest
+            // scenario's <location> town seeded with setting:"" and the
+            // JIT architect (indoor|settlement|seeds|pressure) never
+            // fired once in 30 turns.
+            let setting = schema::infer_node_setting(&name).to_string();
             let node = schema::Node {
                 id: node_id.clone(),
                 name,
                 neighbors: vec![],
-                setting: String::new(), ..Default::default()
+                setting,
+                ..Default::default()
             };
             if prior_schema.travel_graph.upsert_node(node) {
                 prior_schema.travel_graph.current_node = Some(node_id.clone());
@@ -15479,11 +15819,15 @@ async fn enter_fable_session(
             // an existing graph is preserved). upsert_node + set current_node.
             if let Some((ref id, ref name)) = a.location {
                 if prior_schema.travel_graph.nodes.is_empty() {
+                    // (2026-08-27 playtest H2) Same setting inference as the
+                    // card-<location> seed + travel mints.
+                    let setting = schema::infer_node_setting(name).to_string();
                     let node = schema::Node {
                         id: id.clone(),
                         name: name.clone(),
                         neighbors: vec![],
-                        setting: String::new(), ..Default::default()
+                        setting,
+                        ..Default::default()
                     };
                     if prior_schema.travel_graph.upsert_node(node) {
                         prior_schema.travel_graph.current_node = Some(id.clone());
@@ -15945,6 +16289,15 @@ pub(crate) fn cap_assistant_prose(
     cap: usize,
 ) -> Vec<session::Message> {
     for m in window.iter_mut() {
+        // (2026-08-27 playtest C1) Heal bracket-leak contamination from
+        // stored assistant beats BEFORE they re-enter any prompt window:
+        // beats finalized before the leading-run strip (or by a provider
+        // mid-stream hiccup) carry protocol-lookalike head brackets that
+        // the tracker would imitate. Prompt-build-time sanitize keeps the
+        // leak from compounding even in legacy sessions.
+        if m.role == session::Role::Assistant {
+            m.content = stream_filter::strip_leading_bracket_run(&m.content);
+        }
         // Char-count gate (2026-08-15 audit fix): the old byte-length check
         // made multibyte prose over the byte threshold take the branch with
         // FEWER than `cap` chars — the char-boundary cut then truncated
@@ -16114,6 +16467,155 @@ pub(crate) fn distill_tracker_emit_errors(rejects: &[String]) -> Vec<String> {
     out
 }
 
+/// (2026-08-27 playtest C3) Word-bounded single words that signal a
+/// multi-hour transition in the player's action. Checked against a
+/// space-padded lowercase copy so "slept" never matches "unslept"-shaped
+/// substrings.
+const MULTIHOUR_SIGNAL_WORDS: &[&str] = &[
+    "slept",
+    "asleep",
+    "overnight",
+    "dawn",
+    "daybreak",
+    "sunrise",
+    "sundown",
+    "nightfall",
+    "voyage",
+    "journey",
+    "crossing",
+];
+
+/// (2026-08-27 playtest C3) Multi-word phrases that signal a multi-hour
+/// transition (sleep-through, work-through, travel-span). Substring match
+/// on the lowercase action — the phrases are long enough to be unambiguous.
+const MULTIHOUR_SIGNAL_PHRASES: &[&str] = &[
+    "sleep through",
+    "sleeps through",
+    "slept through",
+    "sleep until",
+    "sleeps until",
+    "through the night",
+    "spend the night",
+    "spends the night",
+    "stay the night",
+    "stays the night",
+    "rest until",
+    "rests until",
+    "until dawn",
+    "until morning",
+    "until dark",
+    "until dusk",
+    "until sundown",
+    "until nightfall",
+    "work through",
+    "works through",
+    "worked through",
+    "all afternoon",
+    "all evening",
+    "all morning",
+    "all night",
+    "for hours",
+    "several hours",
+    "the better part of",
+    "set out",
+    "sets out",
+    "set off",
+    "sets off",
+    "set sail",
+    "sets sail",
+];
+
+/// (2026-08-27 playtest C3) Does the player's action carry a strong
+/// multi-hour time signal (sleep, journey, work-through)? The 2026-08-27
+/// playtest showed the tracker systematically failing exactly these turns:
+/// a "sleep through the night" produced ZERO emissions (world desynced for
+/// the rest of the session), a 17-hour crossing advanced the clock 1
+/// minute, an afternoon's work landed at 13:35. Used to arm a one-line
+/// teach-back into the NEXT turn's `<emit_errors>` block — the existing
+/// reject-feedback channel — so the model self-corrects. Pure + tested.
+/// (2026-08-27 playtest 2 polish) A full-day span is a multi-hour signal
+/// by definition — the fullday list feeds this fn too.
+pub(crate) fn action_carries_multihour_signal(action: &str) -> bool {
+    let padded = format!(" {} ", action.to_lowercase());
+    MULTIHOUR_SIGNAL_WORDS
+        .iter()
+        .any(|w| padded.contains(&format!(" {w} ")))
+        || MULTIHOUR_SIGNAL_PHRASES
+            .iter()
+            .any(|p| padded.contains(p))
+        || FULDAY_SIGNAL_PHRASES
+            .iter()
+            .any(|p| padded.contains(p))
+}
+
+/// (2026-08-27 playtest 2 polish) Phrases that signal a FULL-DAY span —
+/// not just multi-hour. These raise the clock-advance floor: playtest 2's
+/// "spend the rest of the morning and the whole afternoon ... until the
+/// light goes" advanced only +240 against a ~12h fiction span, sailing
+/// over the 120-minute multi-hour floor without tripping the teach-back.
+/// Half-day-plus markers ("the whole afternoon") belong here; bare "until
+/// the light fails" does NOT (an afternoon-to-dusk beat can honestly be
+/// ~4h — that stays at the 120 floor via "work through").
+/// Substring match on the lowercase action, same discipline as the
+/// multi-hour phrases.
+const FULDAY_SIGNAL_PHRASES: &[&str] = &[
+    "all day",
+    "the whole day",
+    "entire day",
+    "spend the day",
+    "spends the day",
+    "spending the day",
+    "from dawn to dusk",
+    "dawn to dusk",
+    "sunrise to sunset",
+    "from morning to night",
+    "morning until night",
+    "the whole afternoon",
+    "the entire afternoon",
+    "the whole morning",
+    "the entire morning",
+    "the whole evening",
+    "the entire evening",
+];
+
+/// (2026-08-27 playtest 2 polish) Does the action describe a FULL DAY
+/// passing? Selects the stricter teach-back floor. Pure + tested.
+pub(crate) fn action_carries_fullday_signal(action: &str) -> bool {
+    let padded = format!(" {} ", action.to_lowercase());
+    FULDAY_SIGNAL_PHRASES
+        .iter()
+        .any(|p| padded.contains(p))
+}
+
+/// (2026-08-27 playtest C3) The clock-advance floor (minutes). A turn whose
+/// action carries a strong multi-hour signal but whose clock moved less
+/// than this arms the teach-back — the observed failures advanced 0, 1,
+/// and ~40 minutes against 8-17-hour spans.
+pub(crate) const MULTIHOUR_MIN_ADVANCE_MINUTES: i64 = 120;
+
+/// (2026-08-27 playtest 2 polish) The FULL-DAY clock-advance floor. A
+/// fullday-signalled turn whose clock moved less than 6 hours arms the
+/// same teach-back — "work until the light goes" landing +240 was the
+/// observed miss. 6h (not 12) keeps honest short-day fictions (a winter
+/// day, a late start) un-coached.
+pub(crate) const FULDAY_MIN_ADVANCE_MINUTES: i64 = 360;
+
+/// (2026-08-27 playtest C3) The teach-back line itself. Must fit
+/// [`settings::TRACKER_EMIT_ERROR_LINE_CHARS`] (the distill cap truncates,
+/// but a truncated teaching line loses its payload — keep it short by
+/// construction). Positive-form: states the correct emission, never dwells
+/// on the failure (Prime Mandate).
+pub(crate) const MULTIHOUR_TIME_TEACHBACK: &str =
+    "clock: this turn spanned hours — emit [TIME Day N, HH:MM] for the moment the turn ENDS (24-hour, real elapsed time)";
+
+/// (2026-08-27 playtest C4) The money-miss teach-back — fired when the
+/// narrative window carries money-movement language but the tracker emitted
+/// no `[LEDGER]` (the playtest's 0-for-6: payments narrated, wealth frozen).
+/// Conditional phrasing: NPC-to-NPC coin in the prose must not mint phantom
+/// pocket changes.
+pub(crate) const MONEY_MISS_TEACHBACK: &str =
+    "coin moved in narration — when the player's pocket changed, emit [LEDGER wealth +N|-N] (N in base units, e.g. silver)";
+
 /// Tracker system prompt. The tracker reads the **agent** section of the
 /// authored `.prompt` file (its mechanical job), the live per-turn state
 /// blocks (assembled by `assemble_narrator_skeleton`), and the
@@ -16203,7 +16705,7 @@ fn build_narrator_system_prompt(
     // section. Every bracket FORM, key/slot list, bare-first-token note, the
     // kind=disguise hoist, and the quote rule are byte-preserved.)
     out.push_str("Track changes with these brackets (emit one per genuine change this turn — see <emit_order> for exactly when each fires):\n");
-    out.push_str("- [TIME Day N, HH:MM] — 24-hour clock; real elapsed time, never a placeholder.\n");
+    out.push_str("- [TIME Day N, HH:MM] — 24-hour clock (clock: renders 12-hour; never copy that form). Real elapsed time to the moment the turn ENDS: a sleep lands at waking, a journey at arrival, a task at its finish. Never a placeholder.\n");
     out.push_str("- [DATE <new calendar label>] — emit the NEW full label verbatim (e.g. \"4th of Harvest, Year 1247, Market Day\") — the whole label is rewritten, no arithmetic. Only when a `date:` anchor is in use.\n");
     out.push_str("- [REST] — a genuine sleep or long recuperation ended this turn (bare form, no payload).\n");
     out.push_str("- [WEATHER <condition>] — one word: fog, rain, snow, clear, overcast, storm, etc.\n");
@@ -18765,7 +19267,22 @@ async fn fable_send(
             msgs[track_start..end].to_vec(),
             settings::TRACKER_ASSISTANT_CHAR_CAP,
         );
-        (msgs[narr_start..end].to_vec(), tracker_window)
+        // (2026-08-27 playtest C1) Sanitize the NARRATOR window's assistant
+        // beats too: a leaked protocol-lookalike head bracket stored in a
+        // beat re-enters the API's 16-message history and GLM imitates its
+        // own leak — self-reinforcing over a campaign. cap_assistant_prose
+        // already heals the tracker window; this heals the narrator's.
+        let window = msgs[narr_start..end]
+            .iter()
+            .map(|m| {
+                let mut m = m.clone();
+                if m.role == session::Role::Assistant {
+                    m.content = stream_filter::strip_leading_bracket_run(&m.content);
+                }
+                m
+            })
+            .collect::<Vec<_>>();
+        (window, tracker_window)
     };
 
     // Variant↔schema binding (2026-08-11): capture the pre-turn base schema
@@ -19067,10 +19584,74 @@ async fn fable_send(
                     // model never learned an emission was illegal and
                     // repeated it every turn (the 2026-08-22 playtest's
                     // [NPC_ITEM player +coppers] loop).
-                    *state.tracker_emit_errors.lock().await =
-                        distill_tracker_emit_errors(&travel_rejects);
+                    // (2026-08-27 playtest C3) The assignment moved BELOW the
+                    // time apply so the multi-hour teach-back can fold in:
+                    // a strong sleep/journey/work signal whose clock delta
+                    // stayed under the floor (the 17-hour crossing that
+                    // advanced 1 minute; the afternoon that landed at 13:35)
+                    // pushes one corrective line through this same channel.
+                    let clock_before_min =
+                        state.fable_schema.lock().await.world_clock.current_minutes;
                     let (time_armed, time_event_directives, rest_notice) =
                         apply_time_command_and_maybe_tick(&tracker_parsed, &state).await;
+                    let clock_after_min =
+                        state.fable_schema.lock().await.world_clock.current_minutes;
+                    let mut emit_err_src = travel_rejects.clone();
+                    // (2026-08-27 playtest 2 polish) Full-day spans demand a
+                    // deeper advance before the teach-back stands down — the
+                    // observed "work until the light goes" landed +240 against
+                    // a ~12h fiction span and sailed over the 120-min floor.
+                    let min_advance_min = if action_carries_fullday_signal(&text) {
+                        FULDAY_MIN_ADVANCE_MINUTES
+                    } else {
+                        MULTIHOUR_MIN_ADVANCE_MINUTES
+                    };
+                    if action_carries_multihour_signal(&text)
+                        && (clock_after_min - clock_before_min) < min_advance_min
+                    {
+                        tracing::info!(
+                            advanced = clock_after_min - clock_before_min,
+                            floor = min_advance_min,
+                            "C3 teach-back: multi-hour action under-advanced the clock; queueing [TIME] corrective"
+                        );
+                        emit_err_src.push(MULTIHOUR_TIME_TEACHBACK.to_string());
+                    }
+                    // (2026-08-27 playtest C4) Money-language present but no
+                    // [LEDGER] emitted: the playtest went 0-for-6 on payments
+                    // (fisherman, stew, wages, bribes) while wealth sat at 0.
+                    // Same teach-back channel — the line is conditional so a
+                    // descriptive coin mention coaches nothing phantom.
+                    // (2026-08-27 playtest 2 polish) The gate binds to
+                    // COIN-MOVING ledger ops only: playtest 2's T2 emitted
+                    // `[LEDGER lifestyle]` while physically paying its gold as
+                    // item removals — the any-Ledger gate read that as "money
+                    // was tracked" and wrongly suppressed the wealth
+                    // teach-back. Lifestyle/job/prosperity are management
+                    // ops, not coin movement.
+                    let coin_ledger_emitted = tracker_parsed.commands.iter().any(
+                        |c| matches!(
+                            c,
+                            bracket_parser::BracketCommand::Ledger {
+                                op: bracket_parser::LedgerOp::Wealth
+                                    | bracket_parser::LedgerOp::Currency
+                                    | bracket_parser::LedgerOp::Found
+                                    | bracket_parser::LedgerOp::Buy
+                                    | bracket_parser::LedgerOp::Deposit
+                                    | bracket_parser::LedgerOp::Withdraw
+                                    | bracket_parser::LedgerOp::Invest,
+                                ..
+                            }
+                        ),
+                    );
+                    if !coin_ledger_emitted {
+                        let window_texts: Vec<&str> =
+                            tracker_window.iter().map(|m| m.content.as_str()).collect();
+                        if economy::narrative_carries_money_movement(&window_texts) {
+                            emit_err_src.push(MONEY_MISS_TEACHBACK.to_string());
+                        }
+                    }
+                    *state.tracker_emit_errors.lock().await =
+                        distill_tracker_emit_errors(&emit_err_src);
                     tick_armed = time_armed;
                     // (2026-08-23 hazard referees) The time-channel events
                     // (rest interruption, ≥6h time-skip) merge BEFORE the
@@ -19112,6 +19693,30 @@ async fn fable_send(
                     }
                 } else {
                     tracing::info!("fable_send: tracker produced no bracket commands");
+                    // (2026-08-27 playtest C3) ZERO emissions on a turn whose
+                    // action carries a multi-hour signal (the playtest's
+                    // "sleep through the night" — fiction woke at dawn, clock
+                    // stayed 19:20, world desynced for the rest of the
+                    // session). Push the corrective line through the same
+                    // `<emit_errors>` channel so the NEXT turn re-syncs.
+                    // (C4) Same for money language with nothing emitted.
+                    let mut teachback: Vec<String> = Vec::new();
+                    if action_carries_multihour_signal(&text) {
+                        teachback.push(MULTIHOUR_TIME_TEACHBACK.to_string());
+                    }
+                    {
+                        let window_texts: Vec<&str> =
+                            tracker_window.iter().map(|m| m.content.as_str()).collect();
+                        if economy::narrative_carries_money_movement(&window_texts) {
+                            teachback.push(MONEY_MISS_TEACHBACK.to_string());
+                        }
+                    }
+                    if !teachback.is_empty() {
+                        let mut errs = state.tracker_emit_errors.lock().await;
+                        errs.extend(teachback);
+                        let distilled = distill_tracker_emit_errors(&errs);
+                        *errs = distilled;
+                    }
                 }
             }
             // (2026-08-24 fix) Post-tracker invariant: a non-empty graph with
@@ -19702,6 +20307,13 @@ async fn fable_send(
     // used to re-leak verbatim into the stored/archived beat when `done`
     // replaced the live stream. Strip the same shapes here.
     parsed.prose = stream_filter::strip_bracket_shaped(&parsed.prose);
+    // (2026-08-27 playtest C1) Free-form protocol-lookalike brackets at the
+    // head of a beat (`[old_nettle mood: …]` — first word is an NPC id, not
+    // a taught verb) survive the verb-shaped strip. Narration never
+    // legitimately opens with a bracket, so strip the leading run BEFORE
+    // the repetition firewall sees the prose (a leaked bracket's contents
+    // could otherwise seed a false repetition loop cut position).
+    parsed.prose = stream_filter::strip_leading_bracket_run(&parsed.prose);
     parsed.prose = stream_filter::truncate_repetition(&parsed.prose);
     // (2026-08-15 audit fix) Narrator-stage brackets are STRIPPED-AND-
     // DROPPED, never applied — the slice-regen precedent. The tracker
@@ -20289,7 +20901,18 @@ async fn fable_regenerate_slice(
         };
         let fable_visible_window = settings::WINDOW_API_FABLE;
         let start = index.saturating_sub(fable_visible_window);
-        let window = msgs[start..index].to_vec();
+        // (2026-08-27 playtest C1) History heal: stored beats must not carry
+        // leaked head brackets into a slice-regen prompt either.
+        let window = msgs[start..index]
+            .iter()
+            .map(|m| {
+                let mut m = m.clone();
+                if m.role == session::Role::Assistant {
+                    m.content = stream_filter::strip_leading_bracket_run(&m.content);
+                }
+                m
+            })
+            .collect::<Vec<_>>();
         (prev_content, next_content, window, target_content)
     };
 
@@ -22431,9 +23054,19 @@ fn fable_codex_create_for_card(
         .ok_or_else(|| "no apps/fable/data/codex/ dir resolved".to_string())?;
     std::fs::create_dir_all(&codex_dir).map_err(|e| format!("mkdir codex library: {e}"))?;
     // The card's display folder name is the codex's library name.
-    let name = resolve_card_folder(&cards_root, &card_id)
+    // (2026-08-27 playtest LOW) The auto-name carries a " Lore" suffix (when
+    // not already present): the playtest themed its codex "Ashfall Reach
+    // Lore" and the mechanical name dropped the differentiator — in a
+    // library where a world + its codex share a name, the suffix tells
+    // them apart at a glance.
+    let folder_name = resolve_card_folder(&cards_root, &card_id)
         .and_then(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_owned))
         .unwrap_or_else(|| crate::safe_display_stem(&card_id, "Codex"));
+    let name = if folder_name.to_lowercase().ends_with(" lore") {
+        folder_name
+    } else {
+        format!("{folder_name} Lore")
+    };
     let path = codex_dir.join(format!("{}.codex", crate::safe_display_stem(&name, "Codex")));
     write_atomic(&path, text.as_bytes()).map_err(|e| format!("write codex: {e}"))?;
     // Auto-link (append when absent).
@@ -26001,7 +26634,11 @@ fn clean_and_splice_slice(pre: &str, regen_raw: &str, post: &str) -> Option<Stri
     // path: a parser-REJECTED bracket in the regen must not splice into the
     // stored beat (the "brackets are stripped" guarantee only held for valid
     // ones before).
-    let regen = stream_filter::strip_bracket_shaped(&parsed.prose).trim().to_string();
+    let regen = stream_filter::strip_bracket_shaped(&parsed.prose);
+    // (2026-08-27 playtest C1) Same free-form head-bracket heal as the full
+    // turn path — a slice regen must not splice protocol-lookalike residue
+    // back into a stored beat.
+    let regen = stream_filter::strip_leading_bracket_run(&regen).trim().to_string();
     if regen.is_empty() {
         return None;
     }
@@ -26180,16 +26817,19 @@ async fn spawn_reserved_autosave(app: &tauri::AppHandle, state: &AppState) {
     });
 }
 
-/// In-place edit for either a user or assistant message. The prose edit is
-/// applied + persisted; for ASSISTANT messages the edit is new information,
-/// so the turn's last track is undone + re-derived: `retrack_edited_
-/// assistant_message` reverts the live schema to the message's `base_schema`
-/// and re-runs the local tracker over the edited beat, storing the fresh
-/// post-track snapshot into the variant↔schema binding (2026-08-14, Chloe).
-/// User-beat edits stay pure prose swaps (the frontend routes user edits
-/// through `rewind_and_edit_user`'s full truncate-and-regen instead).
-/// schema_pop_count is 0 — the ring-buffer push happens inside the re-track
-/// (the swipe_variant precedent), so there is nothing for the caller to pop.
+/// In-place edit for ANY message, at ANY index (2026-08-27 Chloe ruling —
+/// the old trailing-assistant refusal is GONE). The prose edit is applied +
+/// persisted in every case; only the TRAILING assistant beat additionally
+/// re-tracks (the edit is new information about the world's newest turn):
+/// `retrack_edited_assistant_message` reverts the live schema to the
+/// message's `base_schema` and re-runs the local tracker over the edited
+/// beat, storing the fresh post-track snapshot into the variant↔schema
+/// binding (2026-08-14, Chloe). Every OTHER edit — user beats, mid-history
+/// assistant beats, the intro — is a pure prose swap: the tracked world
+/// already incorporates all later turns, so re-tracking one mid-history
+/// beat in isolation would discard them. schema_pop_count is 0 — the
+/// ring-buffer push happens inside the re-track (the swipe_variant
+/// precedent), so there is nothing for the caller to pop.
 #[tauri::command]
 async fn edit_message(
     index: usize,
@@ -26202,33 +26842,33 @@ async fn edit_message(
     // its edit first writes through to the card's `<intro>` variant (STRICT
     // — the session never drifts from the card it mirrors), then the session
     // edit applies, and NO schema re-track runs (the opening is not a
-    // tracked turn — nothing has happened in the world yet when it's
-    // editable; the trailing-beat guard makes mid-history unreachable).
-    let (is_assistant, is_intro, intro_active_idx) = {
+    // tracked turn — it carries no world but its variants stay swipeable
+    // while it trails).
+    let (is_intro, intro_active_idx, will_retrack) = {
         let gs = state.fable_session.lock().await;
-        {
-            let len = gs.messages.len();
-            if let Some(m) = gs.messages.get(index) {
-                if m.role == session::Role::Assistant && len > index + 1 {
-                    return Err(format!(
-                        "edit_message: index {index} is not the trailing assistant beat (len {len}) — an edit is new information; later turns' tracked world would diverge from their prose"
-                    ));
-                }
-            }
-        }
+        let len = gs.messages.len();
         gs.messages
             .get(index)
-            .map(|m| (m.role == session::Role::Assistant, m.is_intro, m.active_idx))
-            .ok_or_else(|| format!("edit_message: index {index} out of bounds (len {})", gs.messages.len()))?
+            .map(|m| {
+                (
+                    m.is_intro,
+                    m.active_idx,
+                    m.role == session::Role::Assistant
+                        && !m.is_intro
+                        && len == index + 1,
+                )
+            })
+            .ok_or_else(|| format!("edit_message: index {index} out of bounds (len {len})"))?
     };
     if is_intro {
         write_intro_variant_to_card(&app, &card_id, Some(intro_active_idx), &new_text)?;
     }
     // (2026-08-24) Arm the re-track window BEFORE the text mutates — the
     // marker (not the re-track's cancel token, minted much later) is what
-    // refuses a mid-window Save / narrator turn. Only assistant beats
-    // re-track; user + intro edits pair no schema.
-    let _retrack_armed = (is_assistant && !is_intro).then(|| RetrackArmedGuard::arm(&state));
+    // refuses a mid-window Save / narrator turn. Armed ONLY when a re-track
+    // will actually run (trailing assistant beat); prose-swap edits pair no
+    // schema and must not pointlessly block a Save.
+    let _retrack_armed = will_retrack.then(|| RetrackArmedGuard::arm(&state));
     {
         let mut gs = state.fable_session.lock().await;
         apply_edit(&mut gs, index, new_text)?;
@@ -26236,7 +26876,7 @@ async fn edit_message(
     // Edit re-track (best-effort: a tracker failure never fails the edit —
     // the prose stands, the pre-edit schema is restored, a warn is logged).
     // NEVER for the intro beat — authored openings carry no tracked world.
-    if is_assistant && !is_intro {
+    if will_retrack {
         retrack_edited_assistant_message(index, &state, &app).await;
     }
     let messages = {
@@ -26244,6 +26884,15 @@ async fn edit_message(
         project_messages(&gs)
     };
     persist_fable_session(&app, &state, &card_id).await?;
+    // Prose-swap edits must refresh the reserved autosave too (the rewind/
+    // cascade/retrack discipline): without it a crash before the next turn
+    // Continues from a checkpoint that silently reverts the edit. The
+    // re-track path autosaves at its own success tail instead — snapshotting
+    // here would pair the edited beat with the PRE-re-track schema (the
+    // exact window RetrackArmedGuard exists to bar).
+    if !will_retrack {
+        spawn_reserved_autosave(&app, &state).await;
+    }
     Ok(EditResponse { messages, schema_pop_count: 0 })
 }
 
@@ -26296,12 +26945,14 @@ async fn retrack_edited_assistant_message(
         if msg.role != session::Role::Assistant {
             return;
         }
-        // (2026-08-15 audit fix) Mid-history guard: re-tracking message i
-        // reverts the live schema to base(i) + re-applies only turn i —
-        // every LATER turn's referee injuries/brackets would be silently
-        // discarded while its prose stays visible. The hover toolrail only
-        // exposes edit on the trailing pair, so this is backend
-        // defense-in-depth (the chat tool path accepts any index).
+        // (2026-08-27 Chloe ruling) Trailing-only re-track — this guard IS
+        // the policy now, not defense-in-depth: a mid-history assistant edit
+        // is a PROSE-ONLY swap by design (the tracked world incorporates
+        // every later turn; re-tracking beat i on the live schema would
+        // revert to base(i) and silently discard all later turns' referee
+        // injuries/brackets while their prose stays visible). It also covers
+        // the race where a beat was trailing at edit time but a narrator
+        // turn appended before this pass fired.
         if gs.messages.len() > index + 1 {
             tracing::warn!(
                 index,
@@ -26830,7 +27481,14 @@ async fn guided_window(
                 session::Role::User => "user".into(),
                 session::Role::System => "system".into(),
             },
-            content: m.content.clone(),
+            // (2026-08-27 playtest C1) Same history heal as fable_send's
+            // narrator window: stored beats must not carry leaked head
+            // brackets back into any API prompt.
+            content: if m.role == session::Role::Assistant {
+                stream_filter::strip_leading_bracket_run(&m.content)
+            } else {
+                m.content.clone()
+            },
             raw_output: String::new(),
         })
         .collect()
@@ -26843,7 +27501,13 @@ async fn guided_window(
 fn clean_guided_reply(raw: &str) -> Option<String> {
     let cleaned = schema::extract_reply_channel(raw);
     let parsed = bracket_parser::parse(&cleaned);
-    let text = stream_filter::strip_bracket_shaped(&parsed.prose).trim().to_string();
+    // (2026-08-27 playtest C1) Same free-form head-bracket heal as the full
+    // turn path — guided one-shot replies ride the same finalize contract.
+    let text = stream_filter::strip_leading_bracket_run(
+        &stream_filter::strip_bracket_shaped(&parsed.prose),
+    )
+    .trim()
+    .to_string();
     if text.is_empty() { None } else { Some(text) }
 }
 
@@ -28698,6 +29362,50 @@ mod tests {
         );
     }
 
+    /// (2026-08-27 playtest C3) The multi-hour signal detector: the
+    /// playtest's canonical miss classes fire; short in-scene beats stay
+    /// quiet; both teach-back lines fit the distill char cap un-truncated.
+    #[test]
+    fn multihour_signal_detector_covers_playtest_misses() {
+        // T9: "sleep through the night" (zero-emission turn).
+        assert!(action_carries_multihour_signal("I sleep through the night and wake at dawn."));
+        // T18: the 17-hour crossing.
+        assert!(action_carries_multihour_signal("We make the crossing to Greymist, seventeen hours at sea."));
+        // T12: work through the afternoon.
+        assert!(action_carries_multihour_signal("I work through the afternoon until the light fails."));
+        // A short in-scene beat stays quiet.
+        assert!(!action_carries_multihour_signal("I ask the harbormaster about the tide schedule."));
+        // "asleep" word-bounded, not substring ("grass" never matches).
+        assert!(!action_carries_multihour_signal("I cut grass by the wall."));
+        // (2026-08-27 playtest 2 polish) Full-day spans: the T11 miss
+        // ("the whole afternoon ... until the light goes") and the generic
+        // markers arm BOTH the multihour signal and the stricter floor.
+        assert!(action_carries_multihour_signal(
+            "I spend the rest of the morning and the whole afternoon mending nets, until the light goes."
+        ));
+        assert!(action_carries_fullday_signal(
+            "I spend the rest of the morning and the whole afternoon mending nets, until the light goes."
+        ));
+        assert!(action_carries_fullday_signal("We work all day and turn in at dusk."));
+        assert!(action_carries_fullday_signal("The journey takes us from dawn to dusk."));
+        // A mere multi-hour span is NOT a full day (floor stays 120).
+        assert!(!action_carries_fullday_signal("I work through the afternoon until the light fails."));
+        assert!(!action_carries_fullday_signal("I sleep through the night and wake at dawn."));
+        assert_eq!(FULDAY_MIN_ADVANCE_MINUTES, 360);
+        // Both teach-back lines fit TRACKER_EMIT_ERROR_LINE_CHARS by
+        // construction (a truncated teaching line loses its payload).
+        assert!(
+            MULTIHOUR_TIME_TEACHBACK.chars().count() <= settings::TRACKER_EMIT_ERROR_LINE_CHARS,
+            "{}",
+            MULTIHOUR_TIME_TEACHBACK.chars().count()
+        );
+        assert!(
+            MONEY_MISS_TEACHBACK.chars().count() <= settings::TRACKER_EMIT_ERROR_LINE_CHARS,
+            "{}",
+            MONEY_MISS_TEACHBACK.chars().count()
+        );
+    }
+
     /// (2026-08-22 playtest audit) The [NPC_ITEM] player gate: literal
     /// "player" (any case) + the slugged player name; never a slug-less
     /// empty player, never an unrelated id.
@@ -28710,6 +29418,64 @@ mod tests {
         assert!(npc_item_targets_player("lacey!", "lacey"));
         assert!(!npc_item_targets_player("lacey", ""));
         assert!(!npc_item_targets_player("mara", "lacey"));
+    }
+
+    /// (2026-08-27 playtest H4) First-name-only addressing routes to the
+    /// player: "kira" against "Kira Vandel" was the playtest's ghost-NPC
+    /// mint. Word-subset in both directions, never a substring, never a
+    /// too-short fragment.
+    #[test]
+    fn player_name_fragment_matches_first_and_last_name() {
+        assert!(npc_item_targets_player("kira", "kira_vandel"));
+        assert!(npc_item_targets_player("Kira", "kira_vandel"));
+        assert!(npc_item_targets_player("vandel", "kira_vandel"));
+        assert!(npc_item_targets_player("kira vandel", "kira_vandel"));
+        // Not substrings, not near-misses, not tiny.
+        assert!(!npc_item_targets_player("kir", "kira_vandel"));
+        assert!(!npc_item_targets_player("kiras", "kira_vandel"));
+        assert!(!npc_item_targets_player("ki", "kira_vandel"));
+        assert!(!npc_item_targets_player("mara", "kira_vandel"));
+        assert!(!is_player_name_fragment("kira", ""));
+    }
+
+    /// (2026-08-27 playtest H1) The track-verb auto-registration: grounded
+    /// unknown ids mint Named stubs; the player, ungrounded ids, and
+    /// near-name twins of registered NPCs never do.
+    #[test]
+    fn track_verb_auto_registration_mints_grounded_stubs_only() {
+        let mut s = schema::WorldSchema::default();
+        s.npc_registry.upsert_entry(schema::NpcEntry {
+            id: "mara".into(),
+            name: "Mara".into(),
+            role: String::new(),
+            tier: None,
+            aliases: vec!["mara".into()],
+            prominence: schema::NpcProminence::Named,
+        });
+        let corpus = [
+            "Sable leans on the rail, watching the harbor chain.",
+            "Kyra Vandel checks the knots. Maro shouts from the stern.",
+        ];
+        // Grounded unknown id → Named stub, committed to the registry.
+        let (entry, pre) = try_auto_register_track_npc(&mut s, &corpus, "sable", "")
+            .expect("a grounded unknown id mints");
+        assert_eq!(entry.id, "sable");
+        assert_eq!(entry.prominence, schema::NpcProminence::Named);
+        assert!(s.npc_registry.find("sable").is_some(), "stub committed");
+        assert!(
+            !pre.npc_registry.find("sable").is_some(),
+            "the returned snapshot predates the mint"
+        );
+        // Ungrounded id → refuse (the anti-hallucination gate).
+        assert!(try_auto_register_track_npc(&mut s, &corpus, "rhazog", "").is_none());
+        // Player first-name fragment → refuse (the player is never an NPC).
+        assert!(try_auto_register_track_npc(&mut s, &corpus, "kyra", "kyra_vandel").is_none());
+        // Near-name twin of a registered NPC → refuse.
+        assert!(try_auto_register_track_npc(&mut s, &corpus, "maro", "").is_none());
+        assert!(
+            s.npc_registry.find("maro").is_none(),
+            "no ghost twin minted"
+        );
     }
 
     /// (2026-08-22 playtest, Chloe directive) The gear-mirror guard: an item

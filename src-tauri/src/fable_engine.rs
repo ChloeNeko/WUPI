@@ -152,20 +152,32 @@ const FABLE_MAX_TOKENS: i32 = 1024;
 /// sniper stays the primary stop, and the derived prompt budget shrinks in
 /// lockstep ((CTX_FABLE − 512) × 3.6 ≈ 27,648 — still ~1.3k above the pinned
 /// 26.3k worst-case composition).
-pub(crate) const TRACKER_MAX_TOKENS: i32 = 512;
+/// **Raised 512→1024 on 2026-08-27 (Chloe directive, playtest 2 follow-up):**
+/// playtest 2 ran 0/21 wall hits with clean emissions, but maxed-world turns
+/// (dense presences + full inventory churn + site ops) can still compose
+/// past 512. The raise is paid for by CTX_FABLE 8192→8704 (settings.rs) so
+/// the DERIVED prompt budget stays EXACTLY 27,648 — (8704 − 1024) × 3.6 —
+/// preserving the NO-DEGRADE contract + the maxed-world pin untouched. The
+/// parity law ("both local contexts exactly half the API narrator's 16384")
+/// is retired by the same ruling: the fable context is now sized by the
+/// tracker's generation reserve, not by the API's budget. Sniper stays the
+/// primary stop; wall-riding turns pay the extra decode time only when they
+/// actually need it.
+pub(crate) const TRACKER_MAX_TOKENS: i32 = 1024;
 
 /// (2026-08-22 re-track hardening) The token wall for the EDIT/REROLL
 /// re-track pass (`FableTurnMode::TrackerRetrack`). A live turn emits ONE
-/// turn's brackets (20-100 tokens, 512 is roomy), but a re-track re-derives
+/// turn's brackets (20-100 tokens, 1024 is roomy), but a re-track re-derives
 /// a whole beat — the model re-emits everything it sees moved (time, site,
 /// ledger, currency...) — and the 2026-08-22 playtest log caught the 256
 /// wall cutting it mid-bracket (`hit_max_tokens` inside an `[ASSET]` line,
 /// silently dropping the tail: clock, currency label, and a travel node all
-/// rolled back). Double the wall for the re-track ONLY; the sniper stays
-/// the primary stop, and the paired
-/// `settings::TRACKER_RETRACK_PROMPT_CHAR_BUDGET` keeps the prompt-side
-/// guard in lockstep (prompt + 512 generation must fit CTX_FABLE).
-pub(crate) const TRACKER_RETRACK_MAX_TOKENS: i32 = 512;
+/// rolled back). Kept in lockstep with the live wall (512→1024 on
+/// 2026-08-27, same ruling); the sniper stays the primary stop, and the
+/// paired `settings::TRACKER_RETRACK_PROMPT_CHAR_BUDGET` keeps the
+/// prompt-side guard in lockstep (prompt + 1024 generation must fit
+/// CTX_FABLE).
+pub(crate) const TRACKER_RETRACK_MAX_TOKENS: i32 = 1024;
 
 /// (2026-08-23 WS6) The token wall for the off-turn memory-consolidation
 /// extraction pass (`FableTurnMode::Consolidator`): one fenced JSON object

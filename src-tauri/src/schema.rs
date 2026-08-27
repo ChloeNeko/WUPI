@@ -841,20 +841,60 @@ pub fn resolve_or_mint_node(&mut self, raw: &str, narrative: &[&str]) -> Option<
         if !cleaned_src.is_empty() {
             name_src = cleaned_src;
         }
+        // (2026-08-27 playtest H3) Relational tails never belong to a minted
+        // name: the playtest minted node `greymist_through` from the emitted
+        // fragment "Greymist through the taproom window" (phrase mining
+        // failed → the raw rode through verbatim). Strip trailing
+        // function/preposition words BEFORE the id derivation.
+        let name_src = trim_trailing_relational_words(&name_src);
+        if name_src.trim().is_empty() {
+            return None;
+        }
+        // (2026-08-27 playtest H3) Generic connector-places never mint: the
+        // playtest minted node `path` from a capitalized sentence-initial
+        // "Path". A name whose EVERY word is a generic way/corridor word is
+        // movement, not a destination — reject so the caller's teach-back
+        // points at the real places instead.
+        if is_generic_place_name(&name_src) {
+            tracing::warn!(
+                raw = %raw_trimmed,
+                "[TRAVEL] destination rejected — a generic way/corridor word, not a place"
+            );
+            return None;
+        }
         let id = slugify(&name_src);
         if id.is_empty() {
             return None;
+        }
+        // (2026-08-27 playtest H3) The relational trim may have collapsed the
+        // name onto an EXISTING node ("greymist through" → "greymist" while
+        // greymist exists): resolve, never mint a twin (upsert would also
+        // wipe the existing node's neighbors).
+        if let Some(existing) = self.resolve_existing_node(&id) {
+            tracing::info!(
+                raw = %raw_trimmed,
+                resolved = %existing,
+                "[TRAVEL] post-trim id resolved to an existing node instead of minting"
+            );
+            return Some(existing);
         }
         let name = if name_src.chars().count() > 80 {
             name_src.chars().take(80).collect()
         } else {
             name_src
         };
+        // (2026-08-27 playtest H2) Infer the setting from the diegetic
+        // name — the JIT architect requires indoor|settlement|seeds|
+        // pressure, and a minted setting:"" node can never generate a
+        // site map (the playtest's whole site-map subsystem stayed dead
+        // for 30 turns this way).
+        let setting = infer_node_setting(&name).to_string();
         let node = Node {
             id: id.clone(),
             name,
             neighbors: Vec::new(),
-            setting: String::new(), ..Default::default()
+            setting,
+            ..Default::default()
         };
         if self.upsert_node(node) {
             tracing::info!(node_id = %id, "[TRAVEL] minted unknown destination as a new node");
@@ -865,6 +905,98 @@ pub fn resolve_or_mint_node(&mut self, raw: &str, narrative: &[&str]) -> Option<
             None
         }
     }
+}
+
+/// (2026-08-27 playtest H2) Infer a node's `setting` from its diegetic
+/// name. The JIT site architect fires only on `setting=indoor`,
+/// `setting=settlement`, seeds, or pending pressure; the playtest world
+/// seeded its `<location>` town with NO setting and minted every node
+/// with `""` — no interiors, no assets, no hidden truth for an entire
+/// campaign. Word-boundary token match (split on non-alphanumerics).
+/// Settlement-scale names (district maps) outrank indoor ones ("Harbor
+/// Inn" is a building in a port — but a node named for the building is
+/// the building; the settlement word wins only when the name IS
+/// place-scale). Returns "" (outdoor/unknown) as the no-signal default.
+pub fn infer_node_setting(name: &str) -> &'static str {
+    const SETTLEMENT_WORDS: &[&str] = &[
+        "town", "village", "city", "port", "harbor", "harbour", "docks",
+        "dockside", "hamlet", "borough", "quarter", "ward", "settlement",
+        "outpost", "market",
+    ];
+    const INDOOR_WORDS: &[&str] = &[
+        "tavern", "inn", "pub", "house", "home", "hall", "shop", "store",
+        "temple", "church", "chapel", "lighthouse", "warehouse", "forge",
+        "smithy", "bakery", "brewery", "mill", "prison", "jail", "keep",
+        "castle", "manor", "tower", "library", "guild", "bank", "stable",
+        "barn", "kitchen", "cellar", "cabin", "cottage", "hut", "brothel",
+        "bathhouse", "theater", "theatre", "office", "study", "workshop",
+        "archive", "observatory", "greenhouse", "boathouse", "mansion",
+        "palace", "hospital", "clinic", "school", "academy",
+    ];
+    let lower = name.to_lowercase();
+    let tokens: std::collections::HashSet<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.iter().any(|t| SETTLEMENT_WORDS.contains(t)) {
+        return "settlement";
+    }
+    if tokens.iter().any(|t| INDOOR_WORDS.contains(t)) {
+        return "indoor";
+    }
+    ""
+}
+
+/// (2026-08-27 playtest H3) Relational/function words stripped from the
+/// TAIL of a minted location name — "greymist through" → "greymist".
+/// Word-wise (split/trim on non-alphanumerics), case-insensitive, repeats
+/// until a non-relational word anchors the tail. Pure.
+pub fn trim_trailing_relational_words(name: &str) -> String {
+    const RELATIONAL: &[&str] = &[
+        "through", "across", "along", "past", "beyond", "via", "toward",
+        "towards", "into", "onto", "from", "to", "at", "in", "on", "of",
+        "by", "near", "under", "over", "and", "or", "the", "a", "an",
+        "then", "than", "as", "up", "down", "off", "out", "inside",
+        "outside", "around", "behind", "beside", "between", "against",
+    ];
+    let mut words: Vec<String> = name
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|w| !w.is_empty())
+        .collect();
+    while let Some(last) = words.last() {
+        if RELATIONAL.contains(&last.to_lowercase().as_str()) {
+            words.pop();
+        } else {
+            break;
+        }
+    }
+    words.join(" ")
+}
+
+/// (2026-08-27 playtest H3) Is EVERY word of this name a generic
+/// way/corridor word ("path", "road", "the old lane")? Such mints are
+/// movement phrasing, not destinations — the playtest minted node `path`
+/// from a capitalized sentence-initial "Path". A name with even one
+/// distinctive word ("North Road", "Iron Alley") mints normally. Pure.
+pub fn is_generic_place_name(name: &str) -> bool {
+    const GENERIC: &[&str] = &[
+        "the", "a", "an", "path", "road", "street", "way", "trail", "lane",
+        "alley", "route", "track", "passage", "hallway", "corridor",
+        "stairway", "stairs", "stair", "door", "doorway", "gate",
+        "entrance", "exit", "corner", "fork", "junction", "walkway",
+        "thoroughfare", "somewhere", "there", "here", "place", "spot",
+        "area",
+    ];
+    let words: Vec<String> = name
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|w| !w.is_empty())
+        .collect();
+    !words.is_empty()
+        && words
+            .iter()
+            .all(|w| GENERIC.contains(&w.to_lowercase().as_str()))
 }
 
 /// Normalized Levenshtein similarity in [0,1] (1 = identical). Chars-based
@@ -8866,5 +8998,37 @@ mod tests {
         let loaded = WorldSchema::load(&path).unwrap();
         assert_eq!(loaded.immutable_keys, schema.immutable_keys);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// (2026-08-27 playtest H2) The setting classifier — the architect gate
+    /// (indoor|settlement|seeds|pressure) must see a setting on minted +
+    /// seeded nodes.
+    #[test]
+    fn infer_node_setting_classifies_playtest_places() {
+        assert_eq!(infer_node_setting("Ashfall Reach"), "");
+        assert_eq!(infer_node_setting("Ashfall Reach Harbor"), "settlement");
+        assert_eq!(infer_node_setting("the Rusty Anchor Tavern"), "indoor");
+        assert_eq!(infer_node_setting("Sable's Lighthouse"), "indoor");
+        assert_eq!(infer_node_setting("Greymist"), "");
+        assert_eq!(infer_node_setting("Greymist Village"), "settlement");
+        // Word-boundary: "customs" never trips "docks"-class substrings.
+        assert_eq!(infer_node_setting("Customs Ledger"), "");
+    }
+
+    /// (2026-08-27 playtest H3) Mint-name hygiene: relational tails strip,
+    /// generic way-words reject, distinctive names pass.
+    #[test]
+    fn mint_name_hygiene_trims_and_gates() {
+        assert_eq!(trim_trailing_relational_words("greymist through"), "greymist");
+        assert_eq!(
+            trim_trailing_relational_words("Warehouse on the"),
+            "Warehouse"
+        );
+        assert_eq!(trim_trailing_relational_words("Old Gate Road"), "Old Gate Road");
+        assert!(is_generic_place_name("path"));
+        assert!(is_generic_place_name("The old lane"));
+        assert!(!is_generic_place_name("North Road"));
+        assert!(!is_generic_place_name("Iron Alley"));
+        assert!(!is_generic_place_name("Greymist"));
     }
 }

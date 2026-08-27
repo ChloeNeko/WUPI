@@ -778,10 +778,13 @@ async function renderWorld(body) {
 }
 
 // ── NPC tab (READ-ONLY) ─────────────────────────────────────────────────
-// fable_schema_get → the npc.* entities. Each NPC shown as a read-only name +
-// state card. The old inline-save path wrote a partial npc slice that risked
-// wiping npc_registry/relationships/presences — it's gone. Editing happens via
-// the ✎ raw editor (writes npc.json) or by talking to WUPI.
+// fable_schema_get → the npc_registry (the backend's REAL cast store) fused
+// with presences + npc_interior. (2026-08-27 playtest H8) The old render
+// filtered schema.entities for `npc.*` keys — a surface the current backend
+// never writes (the registry/interior own NPC state) — so the tab showed
+// "No NPCs tracked yet." forever while six NPCs were tracked. Legacy
+// `npc.*` entity values, when present, fold in as a details line. Editing
+// happens via the ✎ raw editor (writes npc.json) or by talking to WUPI.
 async function renderNpc(body) {
   let schema;
   try {
@@ -794,20 +797,53 @@ async function renderNpc(body) {
     body.innerHTML = emptyBox('No active game.');
     return;
   }
-  const npcs = Object.entries(schema.entities || {}).filter(([k]) => k.startsWith('npc.'));
-  if (!npcs.length) {
+  const entries = schema?.npc_registry?.entries || [];
+  const presences = Array.isArray(schema?.presences) ? schema.presences : [];
+  const interior = schema?.npc_interior || {};
+  // Legacy `npc.*` entity residue (pre-registry saves) — keyed by id suffix.
+  const legacy = {};
+  for (const [k, v] of Object.entries(schema.entities || {})) {
+    if (k.startsWith('npc.')) legacy[k.replace(/^npc\./, '')] = String(v ?? '').trim();
+  }
+  if (!entries.length) {
     body.innerHTML = emptyBox('No NPCs tracked yet.');
     return;
   }
-  body.innerHTML = `<div class="fable-npc-list">${npcs.map(([k, v]) => npcReadCard(k, v)).join('')}</div>`;
-}
-function npcReadCard(key, val) {
-  const name = prettifyNpcKey(key);
-  const state = nonEmpty(val) ? String(val).trim() : '';
-  return `<div class="fable-npc-card">
+  const presentIds = new Set(presences.map((p) => p?.npc_id).filter(Boolean));
+  const byId = new Map(presences.map((p) => [p?.npc_id, p]));
+  const cards = entries.map((e) => {
+    const id = String(e?.id ?? '');
+    const name = nonEmpty(e?.name) ? String(e.name) : prettySlug(id);
+    const p = byId.get(id);
+    const inner = interior[id] || {};
+    const lines = [];
+    if (presentIds.has(id)) lines.push(tag('On camera'));
+    if (e?.prominence === 'core') lines.push(tag('Cast'));
+    if (nonEmpty(e?.role)) lines.push(esc(String(e.role)));
+    if (nonEmpty(e?.tier)) lines.push(esc(String(e.tier)));
+    let state = lines.join(' · ');
+    if (p && nonEmpty(p.stance)) {
+      state += (state ? ' — ' : '') + esc(String(p.stance).trim());
+    }
+    const bodyLines = [];
+    if (nonEmpty(inner.mood)) bodyLines.push(`Mood: ${esc(String(inner.mood))}`);
+    if (nonEmpty(inner.intent)) bodyLines.push(`Intent: ${esc(String(inner.intent))}`);
+    const held = (inner.items || []).map((i) => `${i?.name ?? ''}${i?.qty > 1 ? ' ×' + i.qty : ''}`).filter(Boolean);
+    if (held.length) bodyLines.push(`Holding: ${held.map((h) => esc(h)).join(', ')}`);
+    const worn = (inner.worn || []).map((i) => `${i?.name ?? ''}${i?.qty > 1 ? ' ×' + i.qty : ''}`).filter(Boolean);
+    if (worn.length) bodyLines.push(`Wearing: ${worn.map((w) => esc(w)).join(', ')}`);
+    const leg = legacy[id];
+    if (leg) bodyLines.push(esc(leg));
+    return `<div class="fable-npc-card">
     <div class="fable-drop-title">${esc(name)}</div>
-    ${state ? `<div class="fable-drop-prose">${esc(state)}</div>` : ''}
+    ${state ? `<div class="fable-drop-prose">${state}</div>` : ''}
+    ${bodyLines.length ? `<div class="fable-drop-prose">${bodyLines.join('<br>')}</div>` : ''}
   </div>`;
+  });
+  body.innerHTML = `<div class="fable-npc-list">${cards.join('')}</div>`;
+}
+function tag(text) {
+  return `<span class="fable-npc-tag">${esc(text)}</span>`;
 }
 
 // Reset the rail to its beginning state: collapse the open dropdown + strip the

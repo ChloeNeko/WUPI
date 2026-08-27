@@ -6,7 +6,6 @@ import {
   variantCount,
   computeDrawerState,
   swipeNextAction,
-  canEditMessage,
   centeredPopupOpen,
   isTrailingAssistantBeat,
 } from '../src/fable/engine/drawer-logic.js';
@@ -110,23 +109,6 @@ test('swipeNext: active 0 of 3 → swipe to 1', () => {
   assert.deepEqual(swipeNextAction({ count: 3, active: 0 }), { kind: 'swipe', variantIdx: 1 });
 });
 
-// ── canEditMessage (P2b 2026-08-17: the ✎ mirrors the edit_message contract) ─
-test('canEdit: any USER beat is editable (mid-history included)', () => {
-  assert.equal(canEditMessage({ role: 'user', isLastAssistant: false }), true);
-  assert.equal(canEditMessage({ role: 'user', isLastAssistant: true }), true);
-});
-test('canEdit: the TRAILING assistant beat is editable', () => {
-  assert.equal(canEditMessage({ role: 'assistant', isLastAssistant: true }), true);
-});
-test('canEdit: a mid-history assistant beat is NOT editable (backend refuses)', () => {
-  // The playtest case: ✎ on beat 44 → edit_message refused "not the trailing
-  // assistant message" → the beat rendered blank until a rebuild.
-  assert.equal(canEditMessage({ role: 'assistant', isLastAssistant: false }), false);
-});
-test('canEdit: isLastAssistant is REQUIRED for assistant beats (no undefined ride)', () => {
-  assert.equal(canEditMessage({ role: 'assistant', isLastAssistant: undefined }), false);
-});
-
 // ── centeredPopupOpen (the stage keyboard gate over the centered popups) ────
 // A stub root whose querySelector matches exactly one selector string — the
 // predicate is a pure read, so the selector list is the contract under test.
@@ -149,10 +131,12 @@ test('centeredPopupOpen: unrelated selectors do not trip the gate', () => {
 });
 
 // ── isTrailingAssistantBeat (the DOM-side trailing derivation's pure core) ──
-// The swipe-lock contract: a beat is swipeable/editable only when it is the
-// feed's TRAILING MESSAGE — the last role-bearing (user/assistant) beat AND
-// an assistant. The old last-ASSISTANT-only check stayed enabled when a user
-// beat followed (the api_lost composer-restore / rewind shape) → a
+// The swipe-lock contract: a beat is swipeable (variant nav / reroll) only
+// when it is the feed's TRAILING MESSAGE — the last role-bearing
+// (user/assistant) beat AND an assistant. (2026-08-27 Chloe ruling: EDIT +
+// DELETE are ungated on every message; only VARIANT alteration stays
+// trailing-only.) The old last-ASSISTANT-only check stayed enabled when a
+// user beat followed (the api_lost composer-restore / rewind shape) → a
 // guaranteed backend "not the trailing beat" error.
 const roleBeat = (role) => ({ dataset: { role } });
 test('trailing: the last role beat when it is an assistant IS trailing', () => {

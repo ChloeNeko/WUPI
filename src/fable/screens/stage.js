@@ -52,11 +52,6 @@ import { isActionPopupOpen } from '../engine/inventory-panel.js';
 import { buildTabRail, renderActive, resetTabRail } from '../engine/tab-rail.js';
 import { buildPlayground, initPlayground, resetPlayground, isWandOn, togglePlayground } from '../engine/playground.js';
 import { buildRawEditor, onEsc as rawEditorEsc, resetRawEditor, isOpen as rawEditorOpen } from '../engine/raw-editor.js';
-// (2026-08-26) The edit-affordance refusal feedback: a ✎/dblclick on a
-// mid-history AI beat is refused by the backend contract — surfacing it as a
-// transient notice instead of a silent dead click (the "buttons don't work"
-// report). Unknown kinds render with the neutral chrome.
-import { showTurnNotice } from '../engine/turn-notices.js';
 import { invoke, convertFileSrc } from '@tauri-apps/api/core';
 // playFX + clearFX were the weather-render hooks pre-stripping; weather is
 // gone now (file header), so only initFX + clearAllFX remain used. The two
@@ -591,19 +586,11 @@ export async function wireStage(root, hooks) {
       beat = fresh;
     }
     if (act === 'edit') {
-      // (P2b) Click-time authority, mirroring the › gate: the ✎ must respect
-      // the backend edit_message contract — any USER beat, or the TRAILING
-      // assistant beat. A mid-history AI edit is refused server-side; the old
-      // optimistic editor left the beat blank on the failed save.
-      // (2026-08-26) The refusal is no longer SILENT — a dead-feeling click
-      // with no feedback read as "the edit button is broken".
-      if (!beats.canEditMessage({
-        role,
-        isLastAssistant: beats.isTrailingAssistant(beat),
-      })) {
-        showTurnNotice('hint', 'Only the latest AI beat can be edited — rewind or delete to change an earlier one.');
-        return;
-      }
+      // (2026-08-27 Chloe ruling) EVERY message is editable — user beats,
+      // mid-history AI beats, the intro. The backend decides the depth of
+      // the commit: trailing AI beat → edit + schema re-track; anything
+      // else → prose-only swap. (The P2b click-time refusal is gone along
+      // with the backend's trailing-assistant contract.)
       beats.enterEditMode(beat, {
         onSave: (text) => {
           // Player → rewind + branch + regen ("I changed what I did");
@@ -696,16 +683,9 @@ export async function wireStage(root, hooks) {
       const index = Number.parseInt(beat.dataset.index || '-1', 10);
       if (index < 0) return; // unindexed beat — not a backend message
       const isUser = beat.dataset.role === 'user';
-      // (P2b) The ✎-button gate applies to the dblclick path too — a
-      // mid-history AI beat must never open a doomed editor. (2026-08-26)
-      // Same non-silent refusal as the ✎ click: feedback, not a dead click.
-      if (!beats.canEditMessage({
-        role: isUser ? 'user' : 'assistant',
-        isLastAssistant: beats.isTrailingAssistant(beat),
-      })) {
-        showTurnNotice('hint', 'Only the latest AI beat can be edited — rewind or delete to change an earlier one.');
-        return;
-      }
+      // (2026-08-27 Chloe ruling) No edit gate on the dblclick path either —
+      // every message opens the editor; the backend picks prose-swap vs
+      // re-track by trailing-ness.
       beats.enterEditMode(beat, {
         onSave: (text) => {
           // Player → rewind + branch + regen ("I changed what I did"); AI
@@ -889,11 +869,32 @@ export async function wireStage(root, hooks) {
   // focusable + enabled during generation so the empty-Enter-to-stop works.
   const inputForm = root.querySelector('[data-input-form]');
   const input = root.querySelector('[data-input]');
+  // (2026-08-27 playtest 2 polish) One-shot brass pulse on the composer box
+  // when a send is suppressed mid-busy. During the post-turn world-tick
+  // window the typing indicator is already gone and the composer reads as
+  // idle — an Enter pressed exactly there used to vanish silently (the
+  // text stayed, but nothing told the player the turn had NOT queued; the
+  // playtest hit it 2-of-22 sends). Class removal is timer-based — no
+  // hover/pointer dependence, and the forced reflow lets rapid retries
+  // re-fire the animation.
+  let sendDeniedTimer = 0;
+  const flashSendDenied = () => {
+    inputForm.classList.remove('send-denied');
+    void inputForm.offsetWidth; // restart the CSS animation on rapid retries
+    inputForm.classList.add('send-denied');
+    clearTimeout(sendDeniedTimer);
+    sendDeniedTimer = setTimeout(() => inputForm.classList.remove('send-denied'), 950);
+  };
   on(inputForm, 'submit', async (e) => {
     e.preventDefault();
     const text = input.value.trim();
-    // Block new turns while a narrator turn is in flight.
-    if (!text || narrator.isGenerating()) return;
+    // Block new turns while a narrator turn is in flight — never silently:
+    // a non-empty send suppressed here flashes the box (the text stays put;
+    // Enter again once the turn fully lands).
+    if (!text || narrator.isGenerating()) {
+      if (text) flashSendDenied();
+      return;
+    }
     // Single-editor discipline: settle any open inline editor BEFORE the
     // turn starts — a save fired mid-generation would be dropped by
     // narrator's generating guard while its optimistic DOM update had
@@ -1250,24 +1251,28 @@ export async function wireStage(root, hooks) {
     // Focus the input after the un-hide frame so the user can type immediately.
     setTimeout(() => saveNameInput && saveNameInput.focus(), 30);
   });
-  // Quick Save (autosave slot, no name). The closed-modal guard eats
+  // Quick Save (2026-08-27 playtest H7): a MANUAL snapshot with the default
+  // label — the reserved autosave slot is engine-owned (written only at turn
+  // boundaries); a UI save that overwrites it left "no manual saves yet" as
+  // the permanent state of every session. The closed-modal guard eats
   // programmatic .click()s on a hidden overlay (Enter auto-repeat in the
   // name field re-fires the handler); doSave's in-flight latch coalesces
   // any remaining double-fire into one write.
   on(root.querySelector('[data-save-quick]'), 'click', () => {
     if (saveOverlay && saveOverlay.hidden) return;
-    doSave('autosave', 'Autosave', 'Quick saved.');
+    doSave(String(Date.now()), 'Quick Save', 'Quick saved.');
     closeSaveModal();
   });
-  // Named Save (timestamped slot with the typed name; falls back to autosave
-  // when the name is blank — same behavior as Quick Save in that case).
+  // Named Save (timestamped slot with the typed name; a blank name takes
+  // the Quick Save label — 2026-08-27 playtest H7: never the autosave
+  // slot, a manual save must always be reachable).
   on(root.querySelector('[data-save-named]'), 'click', () => {
     if (saveOverlay && saveOverlay.hidden) return;
     const name = saveNameInput.value.trim();
     if (name) {
       doSave(String(Date.now()), name, 'Saved "' + name + '".');
     } else {
-      doSave('autosave', 'Autosave', 'Quick saved.');
+      doSave(String(Date.now()), 'Quick Save', 'Quick saved.');
     }
     closeSaveModal();
   });
@@ -1597,6 +1602,13 @@ function typingLabel() {
 // cheap (classList.add + a label write), so firing per-chunk is fine.
 function showTypingIndicator() {
   if (!stageRoot) return;
+  // (2026-08-27 playtest M2) Never show OUTSIDE a live turn: a chunk
+  // arriving after the invoke resolved (the crossroads→send + edit→regen
+  // paths) re-showed the indicator over an idle composer and nothing hid
+  // it again — "Narrator is currently thinking…" stuck for minutes with
+  // the backend idle. isGenerating includes the deferred world-tick
+  // window, so the guard never fights a live turn.
+  if (!narrator.isGenerating()) return;
   const indicator = stageRoot.querySelector('[data-typing-indicator]');
   if (!indicator) return;
   const label = stageRoot.querySelector('[data-typing-text]');

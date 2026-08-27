@@ -1350,22 +1350,36 @@ fn hash_text(s: &str) -> u64 {
 /// the descriptor composes as a list item under the tooltip header and slots
 /// into the existing `injuries: <part> (<severity>): <desc>; <desc>` render
 /// without grammar surgery.
-fn roll_injury_descriptor(roller: &mut Roller, tier: AttackerTier, state: BodyPartState) -> String {
+fn roll_injury_descriptor(
+    roller: &mut Roller,
+    tier: AttackerTier,
+    state: BodyPartState,
+    exertion: bool,
+) -> String {
     // The base vocabulary per severity tier. Each row escalates: Minor is
     // surface damage, Medium cuts tissue, Heavy breaks structure, Critical
     // ruins it. Healthy never reaches here (no outcome for Healthy); Black
     // arrives from the severity roll's tuned tail (2026-08-20) and maps to
     // the "Severed" marker below.
-    let table: &[&str] = match state {
-        BodyPartState::Yellow => &["Scratch", "Bruise", "Minor scrape", "Abrasion", "Splinter"],
-        BodyPartState::Orange => &["Deep cut", "Gash", "Bad bruise", "Laceration", "Puncture"],
-        BodyPartState::Red => &["Deep gash", "Fracture", "Torn muscle", "Shattered bone", "Severe wound"],
-        BodyPartState::Purple => &["Mangled wound", "Shattered", "Ruptured tissue", "Crushed bone", "Gruesome gash"],
+    // (2026-08-27 playtest M3) EXERTION rows: a turn whose trigger text
+    // carries a transit verb (climb/sprint/leap…) rolls CONSEQUENCE
+    // vocabulary — sprains, wrenches, fractures — never violence wounds.
+    // The playtest's T14 climb ("she pushed a door") minted "Puncture,
+    // right upper leg": a descriptor class with zero narrative setup.
+    let table: &[&str] = match (state, exertion) {
+        (BodyPartState::Yellow, true) => &["Bruise", "Scrape", "Strain", "Twinge", "Abrasion"],
+        (BodyPartState::Orange, true) => &["Sprain", "Bad bruise", "Pulled muscle", "Torn ligament", "Wrench"],
+        (BodyPartState::Red, true) => &["Torn muscle", "Fracture", "Ruptured tendon", "Dislocation", "Severe sprain"],
+        (BodyPartState::Purple, true) => &["Shattered joint", "Torn ligament mass", "Crushed bone", "Ruptured tissue", "Gruesome tear"],
+        (BodyPartState::Yellow, false) => &["Scratch", "Bruise", "Minor scrape", "Abrasion", "Splinter"],
+        (BodyPartState::Orange, false) => &["Deep cut", "Gash", "Bad bruise", "Laceration", "Puncture"],
+        (BodyPartState::Red, false) => &["Deep gash", "Fracture", "Torn muscle", "Shattered bone", "Severe wound"],
+        (BodyPartState::Purple, false) => &["Mangled wound", "Shattered", "Ruptured tissue", "Crushed bone", "Gruesome gash"],
         // Healthy never produces a descriptor; Black carries the single
         // amputation marker (apply_outcome REPLACES the zone's wound list
         // with it). Fall back to the semantic label so the field is never
         // empty if an unexpected path reaches here.
-        BodyPartState::Healthy | BodyPartState::Black => &[],
+        (BodyPartState::Healthy, _) | (BodyPartState::Black, _) => &[],
     };
     if table.is_empty() {
         return match state {
@@ -1716,7 +1730,15 @@ pub fn referee_evaluate_with_tier(
     // Rolled from the ROLLED severity (the blow that actually landed), not
     // the kept tier — a light graze on a shattered arm records a Bruise, not
     // another "Shattered".
-    let injury_desc = roll_injury_descriptor(&mut roller, attacker_tier, rolled_state);
+    // (2026-08-27 playtest M3) A transit verb anywhere in the trigger picks
+    // the EXERTION vocabulary class — a climb/jump/leap turn's consequence
+    // reads as a strain or wrench, never "Puncture" with zero narrative
+    // setup.
+    let exertion_class = TRANSIT_VERBS
+        .iter()
+        .any(|kw| keyword_present(&lower, kw));
+    let injury_desc =
+        roll_injury_descriptor(&mut roller, attacker_tier, rolled_state, exertion_class);
 
     // Directive: only populated when lethal. The caller wraps as
     // `[DIRECTIVE: {directive}]` in `<world_state>`.
@@ -1809,6 +1831,14 @@ pub fn referee_evaluate_live(
     if defense >= REFEREE_AVOID_DC {
         // Dodged/parried clean: no wound, no drain, no directive. The turn
         // still narrates — the narrator just owes no injury this exchange.
+        // (2026-08-27 playtest M3) VISIBLE now: the playtest's T21 ("I
+        // attack… slash… stab" → no injury, no log line) was indistinguishable
+        // from the referee not firing at all.
+        tracing::info!(
+            defense,
+            stamina_mod,
+            "combat referee: avoidance slip — clean dodge, no wound this exchange"
+        );
         return None;
     }
     let mut outcome = referee_evaluate_with_tier(

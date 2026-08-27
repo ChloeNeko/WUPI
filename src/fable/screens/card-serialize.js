@@ -184,6 +184,12 @@ export function serializePlayer(draft) {
   const ears = opt(d.ears); if (ears) player.ears = ears;
   const tail = opt(d.tail); if (tail) player.tail = tail;
   const horn = opt(d.horn); if (horn) player.horn = horn;
+  // (2026-08-27 playtest LOW) The optional distinguishing marks + weakness
+  // the wizard's schema teaches were never serialized — a described
+  // scar/tattoo silently vanished from the identity round-trip (the Rust
+  // DTO + XML label have carried both all along).
+  const marks = opt(d.distinguishing_marks); if (marks) player.distinguishing_marks = marks;
+  const weakness = opt(d.weakness); if (weakness) player.weakness = weakness;
   // The opt-in persona block (2026-08-19): any of the offered fields, plus
   // the standalone backstory the wizard collects — all serialize as
   // `<persona>` lines server-side, omitted entirely when all absent.

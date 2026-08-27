@@ -398,10 +398,47 @@ pub struct SiteArea {
     #[serde(default)]
     pub knowledge: AreaKnowledge,
     /// ≤3 terse geometry/sensory lines, ≤120 chars each.
-    #[serde(default)]
+    /// (2026-08-27 playtest 2, H2 probe) The E4B architect emits this as a
+    /// BARE STRING about half the time (`"geometry": "Slick black pilings..."`
+    /// instead of an array) — serde's Vec<String> hard-failed the whole map
+    /// parse, both repair passes re-failed the identical shape, and the node
+    /// burned toward standdown on a type quirk. Accept string-or-array at
+    /// the model boundary: a lone string becomes a one-element vec (the
+    /// validator's caps still bind).
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub geometry: Vec<String>,
     #[serde(default)]
     pub connections: Vec<SiteConnection>,
+}
+
+/// String-or-`Vec<String>` coercion for model-facing wire fields — see
+/// [`SiteArea::geometry`]. Absent fields never reach here (`#[serde(default)]`
+/// supplies the empty vec); present-but-string becomes a one-element vec.
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct StringOrVec;
+    impl<'de> serde::de::Visitor<'de> for StringOrVec {
+        type Value = Vec<String>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a string or an array of strings")
+        }
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(vec![v.to_string()])
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+            while let Some(s) = seq.next_element::<String>()? {
+                out.push(s);
+            }
+            Ok(out)
+        }
+    }
+    deserializer.deserialize_any(StringOrVec)
 }
 
 /// One creature/trap/loot/object in the site.
@@ -3225,6 +3262,22 @@ mod tests {
         assert_eq!(map.entrance, "gatehouse");
         assert_eq!(map.threat, SiteThreat::High);
         assert!(validate(&map).is_ok(), "parsed map must validate");
+    }
+
+    /// (2026-08-27 playtest 2, H2 probe) The live architect round that
+    /// failed all passes: the E4B emitted pretty-printed fenced JSON with
+    /// `geometry` as a BARE STRING. The old Vec<String> deserialization
+    /// hard-failed the whole map — this exact shape must now parse,
+    /// coerce, and validate.
+    #[test]
+    fn from_model_output_coerces_bare_string_geometry() {
+        let raw = "```json\n{\n  \"threat\": \"moderate\",\n  \"entrance\": \"dock-landing\",\n  \"areas\": [\n    {\n      \"id\": \"dock-landing\",\n      \"name\": \"Main Landing & Wharf\",\n      \"knowledge\": \"visited\",\n      \"geometry\": \"Slick black pilings, tar and fishrot.\",\n      \"connections\": [\n        { \"to\": \"harbour-office\", \"state\": \"open\", \"detail\": \"steps\" },\n        { \"to\": \"net-shed\", \"state\": \"open\", \"detail\": \"boardwalk\" }\n      ]\n    },\n    {\n      \"id\": \"harbour-office\",\n      \"name\": \"Harbour Office\",\n      \"knowledge\": \"unrevealed\",\n      \"geometry\": \"Ledger smell and lamp oil.\",\n      \"connections\": [\n        { \"to\": \"dock-landing\", \"state\": \"open\", \"detail\": \"steps\" }\n      ]\n    },\n    {\n      \"id\": \"net-shed\",\n      \"name\": \"Net Shed\",\n      \"knowledge\": \"unrevealed\",\n      \"geometry\": [\"Twinch and hemp\"],\n      \"connections\": [\n        { \"to\": \"dock-landing\", \"state\": \"open\", \"detail\": \"boardwalk\" }\n      ]\n    }\n  ]\n}\n```";
+        let map = SiteMap::from_model_output(raw).expect("bare-string geometry parses");
+        assert_eq!(map.areas[0].geometry, vec!["Slick black pilings, tar and fishrot.".to_string()],
+            "a lone geometry string must coerce to a one-element vec");
+        assert_eq!(map.areas[2].geometry, vec!["Twinch and hemp".to_string()],
+            "array geometry must keep parsing unchanged");
+        assert!(validate(&map).is_ok(), "coerced map must validate");
     }
 
     #[test]

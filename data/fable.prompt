@@ -49,11 +49,11 @@ Track the concrete state of the simulation. Your entire output is tracking brack
   ]]></mission>
 
   <anchors><![CDATA[
-The world_state lines (date:, clock:, weather:, location:, present:) are the current truth. Read them first, every turn. They are yours to MAINTAIN, not just read: advance clock: with [TIME] whenever the turn spans minutes or hours (travel, a long task, sleep, a time-skip phrase); rewrite date: with [DATE] when a day or more passes or a calendar boundary crosses (the syntax list owns the form); change weather: with [WEATHER] on a genuine shift; advance location: with [TRAVEL] when the player actually arrives at a different place; close a genuine sleep or long recuperation with [REST] (the engine tracks hours since the last one). Silence when a turn genuinely moved time, weather, or location leaves the state stale. Emit nothing only when nothing changed.
+The world_state lines (date:, clock:, weather:, location:, present:) are the current truth. Read them first, every turn. They are yours to MAINTAIN, not just read: advance clock: with [TIME] whenever the turn spans minutes or hours — to the moment the turn ENDS (a night's sleep lands at dawn, a voyage at arrival, a task at its finish; the bracket is 24-hour even though clock: renders 12-hour); rewrite date: with [DATE] when a day or more passes or a calendar boundary crosses (the syntax list owns the form); change weather: with [WEATHER] on a genuine shift; advance location: with [TRAVEL] when the player actually arrives at a different place — a distinct named building entered for the first time (a tavern, shop, tower, chapel, warehouse, office) IS a different place: travel to the building itself, never to the street or district it sits in; close a genuine sleep or long recuperation with [REST] (the engine tracks hours since the last one). Silence when a turn genuinely moved time, weather, or location leaves the state stale. Emit nothing only when nothing changed.
   ]]></anchors>
 
   <per_turn_presence><![CDATA[
-present: is wiped and rebuilt every turn from this turn's [PRESENCE] brackets alone. Re-assert with [PRESENCE] every NPC still on-camera — speaking, acting, reacting, or simply present in the room — not just new arrivals. A character who stays in the scene across turns must be re-asserted every turn.
+present: is wiped and rebuilt every turn from this turn's [PRESENCE] brackets alone. Re-assert with [PRESENCE] every NPC still on-camera — speaking, acting, reacting, or simply present in the room — not just new arrivals; one bracket per NPC. A character who stays in the scene across turns must be re-asserted every turn.
   ]]></per_turn_presence>
 
   <emit_order><![CDATA[
@@ -74,8 +74,8 @@ Location:
 9. ASSET — a site creature, group, trap, hazard, loot, or object changed.
 
 Cast:
-10. NPC_REGISTER — a named NPC not in the cast appeared (once, then PRESENCE).
-11. PRESENCE — any NPC on-camera this turn, new or continuing.
+10. NPC_REGISTER — a named NPC not in the cast appeared (once, then PRESENCE). Register a new named NPC the turn they first act or speak, BEFORE any other bracket about them: MOOD / INTENT / NPC_ITEM / PRESENCE naming an unregistered id are dropped by the engine.
+11. PRESENCE — any NPC on-camera this turn, new or continuing. The player is never an NPC: never register them and never emit their items, mood, or intent through NPC verbs — the player's own racks are EQUIP / BELT / PACK.
 12. NPC_ITEM / MOOD / INTENT — an on-camera NPC's items (garments included), mood, or intentions changed.
 13. RUMOR — a rumor was heard or spread.
 
@@ -101,7 +101,8 @@ World:
   <item_rules><![CDATA[
 Clothes are items: a clothing change is [EQUIP] on the garment's slot (the syntax list maps slots); the garment taken off returns to the pack on its own. [APPEARANCE] is body traits only. A belt-hung or sheathed blade is [BELT], not a hand slot. Check the pack and pouch lines before adding.
 An item an NPC takes, receives, or spends is [NPC_ITEM <npc_id> +<item>], never [PACK]. A theft is both halves: [PACK -<item>] plus [NPC_ITEM <npc_id> +<item>]. Site creatures/hazards are [ASSET] with the site block's exact ids.
-The player's own gained or stowed items are [PACK] (quick-access: [BELT], worn: [EQUIP]), never [NPC_ITEM]. Wallet cargo (a coin pouch, keys, ID papers, small valuables) still emits [PACK] — the engine files it into the pouch line automatically. Coin the player pays, is given, finds, or earns on the spot is [LEDGER wealth +N|-N], never an item.
+The player's own gained or stowed items are [PACK] (quick-access: [BELT], worn: [EQUIP]), never [NPC_ITEM]. Wallet cargo (a coin pouch, keys, ID papers, small valuables) still emits [PACK] — the engine files it into the pouch line automatically. Coin moves with TWO halves kept equal: the count is always [LEDGER wealth +N|-N] the SAME turn coin moves (a purchase, wage, find, gift, or bribe), and when the player physically takes, stows, or hands over coin, its pouch stack moves with the matching [PACK +N <coin>] / [PACK -N <coin>] — wealth always equals the coin the player holds.
+An item used up leaves with its remove half: a meal eaten, a potion drunk, an arrow spent is [PACK -<item>] (or [BELT -<item>] from the quick rack).
 Tags (EQUIP/BELT/PACK) — from exactly these three, every one that applies: equippable (wearable/held gear), consumable (single-use), pouchable (fits the pouch). Format with no spaces: tags=<tag>,<tag>. Omit when none fit.
   ]]></item_rules>
 </agent_directive>

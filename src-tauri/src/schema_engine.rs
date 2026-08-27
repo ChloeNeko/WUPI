@@ -1978,7 +1978,8 @@ Rules:
 - entities: a null value means DELETE the key. A non-null string means SET/overwrite.
 - Keep the delta minimal: a few keys at most per turn.
 - summary: only emit when the narrative arc meaningfully shifts, not every turn.
-- recent_events: append only genuinely new salient events.\n";
+- recent_events: append only genuinely new salient events.
+- (2026-08-27 playtest M5) Strict JSON mechanics — ~20% of first-pass deltas were malformed: every key and string value is double-quoted on ONE line (escape inner quotes as \\\"), a colon separates each key from its value, commas separate entries, and the final entry carries NO trailing comma.\n";
 
 /// System instruction for the World Progression pass (Seam #4, 2026-07-27).
 /// Distinct from the delta pass: this fires on a TIME tick, not a chat

@@ -147,10 +147,20 @@ pub fn options_task() -> String {
 
 /// The task message for the expand draw: the chosen fork, written out in
 /// full as the text the player will send.
+/// (2026-08-27 playtest M7) When the fork declared an inline skill DC, the
+/// expansion must NAME the skilled act in the skill's own words: the
+/// skill-check referee keys on the skill verb, and the playtest's "Sneak
+/// Aboard" expansion ("I slip low along...") evaded the very check the
+/// option priced, burning the pinned DC unused.
 pub fn expand_task(category: CrossroadsCategory, option: &CrossroadsOption) -> String {
+    let dc_clause = if option.summary.contains("DC ") {
+        "The choice declares a bracketed skill and DC: write the player visibly performing that exact skilled act, using the skill's own word (a declared Stealth DC reads as sneaking, moving unseen; a Lockpicking DC reads as picking the lock).\n"
+    } else {
+        ""
+    };
     format!(
-        "The player chose one fork. Write its full text: the message the player will send.\n<choice>\n{} {}\n{}\n</choice>\n{}\nOne to three paragraphs. Output only the text itself.",
-        option.emoji, option.title, option.summary, category.framing()
+        "The player chose one fork. Write its full text: the message the player will send.\n<choice>\n{} {}\n{}\n</choice>\n{}\n{}One to three paragraphs. Output only the text itself.",
+        option.emoji, option.title, option.summary, category.framing(), dc_clause
     )
 }
 
@@ -388,6 +398,32 @@ mod tests {
         assert!(world.contains("Introduce no new characters"));
         let npc = options_system_prompt(CrossroadsCategory::Npc);
         assert!(npc.contains("NEW character"));
+    }
+
+    /// (2026-08-27 playtest M7) A DC-declaring fork's expansion task demands
+    /// the skill's own verb; a DC-less fork carries no such clause.
+    #[test]
+    fn expand_task_carries_the_skill_verb_clause_only_for_dc_forks() {
+        let with_dc = CrossroadsOption {
+            emoji: "🌊".into(),
+            title: "Sneak Aboard".into(),
+            summary: "Slip aboard the customs cutter. — [Stealth DC 16]".into(),
+        };
+        let task = expand_task(CrossroadsCategory::Player, &with_dc);
+        assert!(
+            task.contains("using the skill's own word"),
+            "skill-verb clause missing: {task}"
+        );
+        let without_dc = CrossroadsOption {
+            emoji: "🗝️".into(),
+            title: "The Locked Door".into(),
+            summary: "A door no key has opened.".into(),
+        };
+        let task = expand_task(CrossroadsCategory::Player, &without_dc);
+        assert!(
+            !task.contains("using the skill's own word"),
+            "clause leaked into a DC-less fork: {task}"
+        );
     }
 
     /// (2026-08-22 living-world) The GROUNDING LAW: every category's options

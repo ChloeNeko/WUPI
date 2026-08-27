@@ -51,27 +51,16 @@ export function swipeNextAction({ count, active }) {
   return { kind: 'reroll' };
 }
 
-// (P2b, 2026-08-17 E4B shakedown) Mirror of the backend `edit_message`
-// contract: ANY user beat is editable; an assistant beat only when it is the
-// TRAILING one (the backend refuses a mid-history AI edit — "index N is not
-// the trailing assistant message" — installing an older turn's schema would
-// discard later turns' world state while their prose stays). The ✎ affordance
-// used to open regardless: the failed save left the beat blank until a feed
-// rebuild. Re-derived at CLICK TIME like canNext (#84 pattern — the stamped
-// state is advisory).
-export function canEditMessage({ role, isLastAssistant }) {
-  return role === 'user' || !!isLastAssistant;
-}
-
 // True iff `beat` is the TRAILING MESSAGE of the feed (and an assistant).
 // `roleBeats` is the feed's ordered list of role-bearing beats (user +
 // assistant — system/error beats are DOM-only, never backend messages).
-// The backend swipe/edit contracts refuse any beat with a LATER message
-// (`swipe_variant`: "index N is not the trailing beat (len M)"), so the
-// trailing test runs over user+assistant beats TOGETHER: the last ASSISTANT
-// alone is not enough when a user beat follows it (the composer restore
-// after api_lost / a rewind leaves exactly that shape — its ‹/› must stay
-// dead, not error).
+// The backend VARIANT contract (swipe/reroll) still refuses any beat with a
+// LATER message (`swipe_variant`: "index N is not the trailing beat (len
+// M)") — 2026-08-27 Chloe ruling: variant alteration is trailing-only while
+// edit/delete are free — so the trailing test runs over user+assistant
+// beats TOGETHER: the last ASSISTANT alone is not enough when a user beat
+// follows it (the composer restore after api_lost / a rewind leaves exactly
+// that shape — its ‹/› must stay dead, not error).
 export function isTrailingAssistantBeat(beat, roleBeats) {
   if (!Array.isArray(roleBeats) || roleBeats.length === 0) return false;
   const last = roleBeats[roleBeats.length - 1];

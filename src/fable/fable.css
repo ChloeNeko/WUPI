@@ -1304,6 +1304,23 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     50%      { opacity: 1; }
 }
 
+/* Send-denied pulse (2026-08-27 playtest 2 polish). An Enter pressed while
+   a turn is still finishing — the post-turn world-tick window reads as idle
+   because the typing indicator is already gone — used to vanish silently.
+   Two quick brass pulses on the composer box: "heard, not sent yet" (the
+   text stays; Enter again once the turn lands). Class is added/removed by
+   the stage's submit gate; warm brass, deliberately distinct from the red
+   API-lost lock. */
+.fable-input-row.send-denied .fable-input-box {
+    animation: fable-send-denied 0.45s ease-in-out 2;
+}
+@keyframes fable-send-denied {
+    50% {
+        box-shadow: 0 0 16px rgba(212, 169, 78, 0.55);
+        border-color: rgba(212, 169, 78, 0.85);
+    }
+}
+
 /* ============================================================= */
 /* COMPOSER TURN AIDS — Ghost Writer + Crossroads (2026-08-22).    */
 /* Two small icons directly right of the input text: the ghost     */
@@ -4217,6 +4234,17 @@ body.fable-active.fable-chrome-peek .top-bar { transform: translateY(0); pointer
     border: 1px solid var(--fable-glass-line); border-left: 3px solid var(--fable-brass);
     border-radius: 6px;
     text-align: left;
+}
+/* (2026-08-27 playtest H8) The registry-read NPC tab's inline status chips —
+   "On camera" / "Cast" — small brass tags inline in the state line. */
+.fable-npc-tag {
+    display: inline-block;
+    padding: 0 5px; margin-right: 2px;
+    font-size: 9.5px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--fable-brass);
+    border: 1px solid var(--fable-brass-dim);
+    border-radius: 4px;
+    vertical-align: 1px;
 }
 
 /* --- Codex tab LINK MANAGER (2026-08-22 codex decoupling) -------------------

@@ -474,6 +474,29 @@ pub trait Tool: Send + Sync {
     fn execute(&self, args: &serde_json::Value, ctx: &ToolCtx) -> Result<String, ToolError>;
 }
 
+/// (2026-08-27 playtest M8) Cap a tool RESULT before it renders into the
+/// dispatch prompt. The playtest's `file_read` on a live session_file
+/// returned ~1.07M chars (277k tokens) into the 8192-token dispatch
+/// context, then the engine's truncator amputated it to 2,440 tokens
+/// AFTER the render — the copilot then honestly reported "the read came
+/// back truncated" and fumbled two follow-ups. Head-biased cut (the
+/// session JSON's indexes live at the head) with a marker naming the
+/// real size, so the model knows to narrow instead of re-reading.
+/// Chars, not bytes (anti-pattern #6). Applied at the ONE execute
+/// chokepoint in `chat_send`'s agent loop — every tool result is bounded.
+pub const TOOL_RESULT_CHAR_CAP: usize = 16_000;
+
+pub fn cap_tool_result(output: String) -> String {
+    let total = output.chars().count();
+    if total <= TOOL_RESULT_CHAR_CAP {
+        return output;
+    }
+    let head: String = output.chars().take(TOOL_RESULT_CHAR_CAP).collect();
+    format!(
+        "{head}\n…[tool result truncated: first {TOOL_RESULT_CHAR_CAP} of {total} chars — narrow the read or query a smaller file]"
+    )
+}
+
 /// The full registry of tools Wupi may call. Built once at setup; cloned cheaply
 /// (Arc internals where needed). Ships the 7 tools below.
 pub fn registry() -> Vec<Box<dyn Tool>> {
@@ -589,7 +612,7 @@ pub fn fable_state_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "fable_message_edit".into(),
-            description: "Edit one message in the ACTIVE Fable session by its 0-based array index. Args: {\"index\": 3, \"content\": \"new text\"}. Find the index first via file_read on the session_file path in the <active_card> block (the messages array). Editing the trailing beat re-tracks world state against the new text; mid-history assistant edits are refused (rewind the timeline first). No-op on system messages.".to_string(),
+            description: "Edit one message in the ACTIVE Fable session by its 0-based array index. Args: {\"index\": 3, \"content\": \"new text\"}. Find the index first via file_read on the session_file path in the <active_card> block (the messages array). Editing the trailing AI beat re-tracks world state against the new text; editing any other message changes the displayed prose only (world state is not re-tracked). No-op on system messages.".to_string(),
         },
         ToolSpec {
             name: "fable_message_delete".into(),
