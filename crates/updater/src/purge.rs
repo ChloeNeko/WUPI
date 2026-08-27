@@ -96,6 +96,78 @@ pub fn purge_legacy(target: &Path) -> usize {
     removed
 }
 
+/// The legacy root `spellcheck/` folder (retired 2026-08-27): the pre-bin
+/// home of the spellchecker word lists. The live home is `bin/` — the two
+/// `.txt` lists ship there loose with the runtime DLLs (source
+/// `public/bin/`, staged flat by release.cjs) — and `SOURCES.md` ships no
+/// more at all (Chloe ruling, same day).
+///
+/// NOT a [`LEGACY_PATHS`] entry because it is not a pure delete: the two
+/// word lists are RESCUED into `bin/` first (same-volume rename). The
+/// update zip delivers fresh copies into `bin/` at `copy_into_target` —
+/// `bin/` is engine content, never preserved — so the rescue normally
+/// SKIPS (dst exists); it only carries weight when `bin/` is somehow
+/// missing a list, and then the old copy is the ONLY copy — which is why
+/// a failed rescue must skip the folder delete rather than orphan it (the
+/// next update re-runs the whole retire, idempotently).
+///
+/// Best-effort by design, like [`purge_legacy`]: a missing `spellcheck/`
+/// (fresh installs, already-migrated) is the one-stat steady state, and a
+/// locked leftover logs + defers to the next update. Returns the number
+/// of actions taken (rescues + the folder removal).
+pub fn retire_legacy_spellcheck(target: &Path) -> usize {
+    let old_dir = target.join("spellcheck");
+    if !old_dir.is_dir() {
+        return 0;
+    }
+    let mut actions = 0usize;
+    let bin = target.join("bin");
+    let mut rescue_blocked = false;
+    for name in ["dict-en.txt", "common-en.txt"] {
+        let src = old_dir.join(name);
+        let dst = bin.join(name);
+        if !src.is_file() || dst.is_file() {
+            continue;
+        }
+        match std::fs::create_dir_all(&bin).and_then(|_| std::fs::rename(&src, &dst)) {
+            Ok(()) => {
+                crate::log(format!("rescued legacy spellcheck/{name} → bin/{name}"));
+                actions += 1;
+            }
+            Err(e) => {
+                crate::log(format!(
+                    "legacy spellcheck/{name} rescue failed ({e}) — bin/ has no copy; leaving the folder for the next update"
+                ));
+                rescue_blocked = true;
+            }
+        }
+    }
+    if rescue_blocked {
+        return actions;
+    }
+    // Subsumes SOURCES.md + any redundant old copies the rescue skipped.
+    // The plain-file fallthrough mirrors purge_legacy: a stray FILE at the
+    // folder path errors NotADirectory out of remove_dir_all.
+    match std::fs::remove_dir_all(&old_dir) {
+        Ok(()) => {
+            crate::log(format!("purged legacy path {}", old_dir.display()));
+            actions += 1;
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => match std::fs::remove_file(&old_dir) {
+            Ok(()) => {
+                crate::log(format!("purged legacy file {}", old_dir.display()));
+                actions += 1;
+            }
+            Err(e2) => crate::log(format!(
+                "legacy path {} not removable ({e} / {e2}) — leaving it",
+                old_dir.display()
+            )),
+        },
+    }
+    actions
+}
+
 /// Completely remove `data/_update` — the download-staging folder wupi.exe's
 /// `perform_update` creates (`portable.zip` / `portable.zip.part` + anything
 /// else inside). Returns `true` when the folder is gone (or never existed).
@@ -191,6 +263,43 @@ mod tests {
         assert_eq!(purge_legacy(tmp.path()), 1);
         // Second run on the now-clean tree: zero removals, no error.
         assert_eq!(purge_legacy(tmp.path()), 0);
+    }
+
+    #[test]
+    fn spellcheck_retire_rescues_lists_and_deletes_the_folder() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path();
+        std::fs::create_dir_all(target.join("spellcheck")).unwrap();
+        std::fs::write(target.join("spellcheck/dict-en.txt"), b"DICT").unwrap();
+        std::fs::write(target.join("spellcheck/common-en.txt"), b"COMMON").unwrap();
+        std::fs::write(target.join("spellcheck/SOURCES.md"), b"# sources").unwrap();
+        // No bin/ at all (no zip delivery in this test) — the rescue must
+        // create it.
+        assert!(retire_legacy_spellcheck(target) >= 3);
+        assert!(!target.join("spellcheck").exists());
+        assert_eq!(std::fs::read(target.join("bin/dict-en.txt")).unwrap(), b"DICT".to_vec());
+        assert_eq!(std::fs::read(target.join("bin/common-en.txt")).unwrap(), b"COMMON".to_vec());
+    }
+
+    #[test]
+    fn spellcheck_retire_prefers_zip_delivered_bin_copies() {
+        let tmp = TempDir::new().unwrap();
+        let target = tmp.path();
+        std::fs::create_dir_all(target.join("spellcheck")).unwrap();
+        std::fs::create_dir_all(target.join("bin")).unwrap();
+        std::fs::write(target.join("spellcheck/dict-en.txt"), b"OLD").unwrap();
+        std::fs::write(target.join("bin/dict-en.txt"), b"NEW").unwrap();
+        // The rescue skips (dst exists) and the folder delete is the only
+        // action; the fresh bin copy is never touched by the old one.
+        assert_eq!(retire_legacy_spellcheck(target), 1);
+        assert!(!target.join("spellcheck").exists());
+        assert_eq!(std::fs::read(target.join("bin/dict-en.txt")).unwrap(), b"NEW".to_vec());
+    }
+
+    #[test]
+    fn spellcheck_retire_is_a_no_op_without_the_folder() {
+        let tmp = TempDir::new().unwrap();
+        assert_eq!(retire_legacy_spellcheck(tmp.path()), 0);
     }
 
     #[test]

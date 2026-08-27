@@ -272,6 +272,15 @@ fn run(args: &Args) -> Result<(), RunError> {
         log(format!("purged {purged} legacy path(s)"));
     }
 
+    // 3.5b. Retire the legacy root `spellcheck/` folder (2026-08-27 layout
+    //       move: the word lists ship in `bin/` with the runtime DLLs,
+    //       SOURCES.md ships no more). Rescue-then-delete, idempotent,
+    //       best-effort — see purge.rs::retire_legacy_spellcheck.
+    let retired = purge::retire_legacy_spellcheck(&args.target_dir);
+    if retired > 0 {
+        log(format!("retired legacy spellcheck/ folder ({retired} action(s))"));
+    }
+
     // 3.6. Rename retired USER-FILE names (§8C `USER_FILE_RENAMES`). A pure
     //     same-volume rename — the file's content (API profiles) rides along
     //     byte-identical; no read, no rewrite, no working file (any updater
