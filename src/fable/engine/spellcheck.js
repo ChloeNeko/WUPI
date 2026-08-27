@@ -16,7 +16,7 @@
 //
 //   • A dictionary spellchecker (SCOWL 80 — the curated spellchecker
 //     word list, ~284k lowercase entries + a curated British-variant
-//     pass — shipped unbundled at public/spellcheck/ + lazy-fetched on
+//     pass — shipped unbundled at public/bin/ + lazy-fetched on
 //     first focus so boot pays nothing) underlines misspelled words
 //     while you type. ON by default; per Chloe's spec the checker
 //     judges WORDS ONLY — punctuation, capitalization, acronyms,
@@ -225,10 +225,12 @@ function persistEnabled(on) {
 
 // ── Dictionary (browser, lazy) ───────────────────────────────────────
 
-// The word list ships UNBUNDLED in public/spellcheck/ (Vite copies
-// public/ verbatim to dist/), so the 4MB list never enters the JS
-// bundle and boot never touches it: the fetch fires on the first input
-// focus inside Fable, once per process. CRLF-split tolerant.
+// The word list ships UNBUNDLED in public/bin/ (Vite copies public/
+// verbatim to dist/, which release.cjs stages flat into the zip — so at
+// runtime the lists live in the install's bin/ alongside the CUDA DLLs).
+// The 4MB list never enters the JS bundle and boot never touches it: the
+// fetch fires on the first input focus inside Fable, once per process.
+// CRLF-split tolerant.
 let dictPromise = null;
 let dictState = null;   // the resolved { set, commonRank } (null until loaded)
 
@@ -356,8 +358,8 @@ export function ensureDictionary() {
   if (dictPromise) return dictPromise;
   const base = typeof document !== 'undefined' ? document.baseURI : '.';
   dictPromise = Promise.all([
-    fetchWordList(new URL('spellcheck/dict-en.txt', base)),
-    fetchWordList(new URL('spellcheck/common-en.txt', base)).catch(() => []),
+    fetchWordList(new URL('bin/dict-en.txt', base)),
+    fetchWordList(new URL('bin/common-en.txt', base)).catch(() => []),
   ]).then(([dictLines, commonLines]) => {
     dictState = buildDictionary(dictLines, commonLines);
     return dictState;

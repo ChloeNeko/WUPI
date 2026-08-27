@@ -8,7 +8,7 @@
 // punctuation, no capitalization, no acronyms/digit-glue/accented
 // words), the suggestion search + ranking, and the replacement math.
 // It also verifies the SHIPPED dictionary files exist + parse, so a
-// cleanup pass can't silently delete public/spellcheck/.
+// cleanup pass can't silently delete them from public/bin/.
 import { strict as assert } from 'node:assert';
 import { readFileSync } from 'node:fs';
 import {
@@ -225,13 +225,14 @@ test('the US→UK transform derives real British twins (colour, realise, centre�
 });
 
 // ── the shipped dictionary files ───────────────────────────────────────
-// The checker is only as good as the two files in public/spellcheck/
-// (Vite copies them to dist/ unbundled). This pins their presence +
-// basic shape so a cleanup can't silently strip them.
-test('public/spellcheck/ files build a sane writer dictionary', () => {
-  const dictLines = readFileSync(new URL('../public/spellcheck/dict-en.txt', import.meta.url), 'utf8')
+// The checker is only as good as the two files in public/bin/ (Vite
+// copies them to dist/ unbundled → they ship in the install's bin/).
+// This pins their presence + basic shape so a cleanup can't silently
+// strip them.
+test('public/bin/ dictionary files build a sane writer dictionary', () => {
+  const dictLines = readFileSync(new URL('../public/bin/dict-en.txt', import.meta.url), 'utf8')
     .split(/\r?\n/);
-  const commonLines = readFileSync(new URL('../public/spellcheck/common-en.txt', import.meta.url), 'utf8')
+  const commonLines = readFileSync(new URL('../public/bin/common-en.txt', import.meta.url), 'utf8')
     .split(/\r?\n/);
   assert.ok(dictLines.length > 200000, `dictionary suspiciously small: ${dictLines.length}`);
   assert.ok(commonLines.length >= 9000, `common list suspiciously small: ${commonLines.length}`);

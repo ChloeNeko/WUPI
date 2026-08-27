@@ -506,6 +506,10 @@ if (!dryRun) {
 //   │                              so the loader finds them in bin/ on first
 //   │                              call. See the DLL block below for the full
 //   │                              rationale.)
+//   bin/dict-en.txt,               (from dist/ — the spellcheck word lists
+//   bin/common-en.txt               ride the wholesale dist/→zip-root copy
+//                                   below into bin/, keeping the install
+//                                   root free of a spellcheck/ folder.)
 //   data/                         (engine-shipped identity content; the
 //   │                              whole repo data/ dir is cpSync'd below)
 //   ├── wupi.sim                  (Wupi's ACTIVE persona, lowercase w,
