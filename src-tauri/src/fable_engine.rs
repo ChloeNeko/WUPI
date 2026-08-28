@@ -163,21 +163,29 @@ const FABLE_MAX_TOKENS: i32 = 1024;
 /// tracker's generation reserve, not by the API's budget. Sniper stays the
 /// primary stop; wall-riding turns pay the extra decode time only when they
 /// actually need it.
-pub(crate) const TRACKER_MAX_TOKENS: i32 = 1024;
+/// **Settled at 512 on 2026-08-27 (evening, final Chloe ruling):** the
+/// morning's 1024 raise was prophylactic headroom for maxed-world emissions
+/// that playtest 2 never produced (0/21 wall hits at 512); the evening's
+/// brief 384 was re-raised to 512 in the same session — 512 is the number.
+/// The sniper remains the PRIMARY stop (the typical bracket set is ~100
+/// tokens ≈ 3s); the wall exists so a runaway decode can never run long.
+/// The paired `settings::TRACKER_PROMPT_CHAR_BUDGET` derivation closes
+/// exactly at the permanent CTX_FABLE 8192: (8192 − 512) × 3.6 = 27,648 —
+/// the long-standing pin.
+pub(crate) const TRACKER_MAX_TOKENS: i32 = 512;
 
 /// (2026-08-22 re-track hardening) The token wall for the EDIT/REROLL
 /// re-track pass (`FableTurnMode::TrackerRetrack`). A live turn emits ONE
-/// turn's brackets (20-100 tokens, 1024 is roomy), but a re-track re-derives
-/// a whole beat — the model re-emits everything it sees moved (time, site,
-/// ledger, currency...) — and the 2026-08-22 playtest log caught the 256
-/// wall cutting it mid-bracket (`hit_max_tokens` inside an `[ASSET]` line,
-/// silently dropping the tail: clock, currency label, and a travel node all
-/// rolled back). Kept in lockstep with the live wall (512→1024 on
-/// 2026-08-27, same ruling); the sniper stays the primary stop, and the
-/// paired `settings::TRACKER_RETRACK_PROMPT_CHAR_BUDGET` keeps the
-/// prompt-side guard in lockstep (prompt + 1024 generation must fit
-/// CTX_FABLE).
-pub(crate) const TRACKER_RETRACK_MAX_TOKENS: i32 = 1024;
+/// turn's brackets (20-100 tokens), but a re-track re-derives a whole beat —
+/// the model re-emits everything it sees moved (time, site, ledger,
+/// currency...) — and the 2026-08-22 playtest log caught the 256 wall cutting
+/// it mid-bracket (`hit_max_tokens` inside an `[ASSET]` line, silently
+/// dropping the tail: clock, currency label, and a travel node all rolled
+/// back). **512, in LOCKSTEP with the live wall (2026-08-27 evening, final):**
+/// both walls share the number, and both prompt budgets derive to the SAME
+/// 27,648 at the permanent CTX_FABLE 8192. The fence-aware sniper stays the
+/// primary stop.
+pub(crate) const TRACKER_RETRACK_MAX_TOKENS: i32 = 512;
 
 /// (2026-08-23 WS6) The token wall for the off-turn memory-consolidation
 /// extraction pass (`FableTurnMode::Consolidator`): one fenced JSON object
@@ -220,7 +228,7 @@ pub(crate) const CONSOLIDATOR_MAX_TOKENS: i32 = 512;
 // decapitation" previously blamed on the 150-token wall was this). The fix
 // is an `inside_bracket` toggle: prose counts ONLY outside brackets.
 //
-// The sniper is the PRIMARY stop. TRACKER_MAX_TOKENS (512) is the wall behind
+// The sniper is the PRIMARY stop. TRACKER_MAX_TOKENS is the wall behind
 // it. Together they guarantee a tracker turn ends in seconds, not minutes.
 
 /// How many non-whitespace, non-bracket chars of prose may follow a closed
@@ -815,10 +823,11 @@ impl FableRuntime {
         // 3072-256 = 2816 — the prompt fits, the bracket protocol survives,
         // the tracker sees its syntax.
         // Reserve is MODE-AWARE (2026-08-10 fix + 2026-08-19 Architect): the
-        // tracker needs only TRACKER_MAX_TOKENS (512) of generation reserve,
-        // the architect SITE_ARCHITECT_MAX_TOKENS (1024 — one fenced site
-        // JSON object; raised from 512 on 2026-08-24, real settlement maps
-        // overflowed the old wall), the narrator FABLE_MAX_TOKENS (1024).
+        // tracker needs only TRACKER_MAX_TOKENS (512 — the 2026-08-27 evening
+        // final wall) of generation reserve, the architect
+        // SITE_ARCHITECT_MAX_TOKENS (384 — same evening ruling; terse plain-
+        // named maps + the Rust normalizer made 1024's verbosity budget a
+        // latency liability), the narrator FABLE_MAX_TOKENS (1024).
         let reserve = match req.mode {
             FableTurnMode::Tracker => TRACKER_MAX_TOKENS,
             FableTurnMode::TrackerRetrack => TRACKER_RETRACK_MAX_TOKENS,

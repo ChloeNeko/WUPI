@@ -866,15 +866,21 @@ pub fn run() {
             } else {
                 "wupi.html"
             };
-            let fable_entry = is_fable_entry();
-            // fable.exe: build the window HIDDEN. The WebView2 native surface
-            // flashes a system-tinted/purple cast for the first frame(s) before
-            // any HTML renders, and no HTML/CSS can beat that (it's pre-paint).
-            // A hidden window shows nothing while the frontend paints its F-logo
-            // entry splash; the frontend then calls `fable_reveal_window` once
-            // the splash is rendered → the first VISIBLE frame is already the
-            // splash, never the native surface. wupi.exe stays visible (its boot
-            // paw animation must be seen immediately).
+            // BOTH launchers: build the window HIDDEN. The WebView2 native
+            // surface renders OPAQUE WHITE for its first frames — before any
+            // HTML composites, and before the window's per-pixel transparency
+            // applies (captured 2026-08-27: solid #FFFFFF frame(s) at
+            // ~120-360ms post-launch; longest on cold boots after the cache
+            // bust). No HTML/CSS can beat that (it's pre-paint). A hidden
+            // window shows nothing until the frontend has real pixels, then
+            // calls `fable_reveal_window`:
+            //   • fable.exe — once its F-logo entry splash is composited;
+            //   • wupi.exe — when the boot paw entry animation starts
+            //     (script.js startEntryAndHops) or when the first-run download
+            //     overlay paints. The paw animation itself is untouched — only
+            //     the pre-paint native frames (the launch white flash / top
+            //     strip) are never shown; the surface reads as permanently
+            //     transparent (2026-08-27 Chloe request).
             let main_window =
                 tauri::WebviewWindowBuilder::new(app, "main", tauri::WebviewUrl::App(entry_url.into()))
                     .title("WUPI")
@@ -883,31 +889,39 @@ pub fn run() {
                     .fullscreen(true)
                     .decorations(false)
                     .transparent(true)
-                    .visible(!fable_entry)
+                    .visible(false)
                     .build()?;
-            // fable.exe: set the running window's taskbar icon to the F too. The
-            // exe FILE icon is already the F (via the build.rs resource, ID 1 <
-            // tauri-build's 32512); without this the live window could fall back
-            // to the paw. Best-effort + non-fatal — a decode or set_icon failure
-            // just leaves the default icon (the window always builds above).
-            // include_bytes! resolves relative to this file (src/), so ../icons.
-            if is_fable_entry() {
-                if let Ok(img) = tauri::image::Image::from_bytes(include_bytes!("../icons/fable.png")) {
-                    let _ = main_window.set_icon(img);
-                }
-                // Safety net: fable.exe starts with the window hidden (above) so
-                // the WebView2 init flash never shows. The frontend calls
-                // fable_reveal_window once its splash is painted. If the bundle
-                // ever fails to load/parse (catastrophic), that call never fires
-                // → the window would strand hidden. This fallback shows it after
-                // 5s no matter what, so fable.exe never leaves the user staring
-                // at nothing. show() is a no-op if the frontend already revealed.
-                let fallback_win = main_window.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                    let _ = fallback_win.show();
-                });
+            // Taskbar/Alt-Tab icon: set the LIVE window icon EXPLICITLY on both
+            // entries. The exe FILE icons are already right (fable.exe's F via
+            // the build.rs resource, ID 1 < tauri-build's 32512; wupi.exe's
+            // paw); pinning the live window icon keeps the Alt-Tab/Task-View
+            // thumbnail identity on the launcher's own logo even in the early
+            // unpainted frames, where auto-derived attribution can fall back to
+            // the WebView2 runtime's "Microsoft Edge WebView2" + Edge icon
+            // (2026-08-27). Best-effort + non-fatal — a decode or set_icon
+            // failure just leaves the default icon (the window always builds
+            // above). include_bytes! resolves relative to this file (src/), so
+            // ../icons.
+            let icon_bytes: &[u8] = if is_fable_entry() {
+                include_bytes!("../icons/fable.png").as_slice()
+            } else {
+                include_bytes!("../icons/icon.png").as_slice()
+            };
+            if let Ok(img) = tauri::image::Image::from_bytes(icon_bytes) {
+                let _ = main_window.set_icon(img);
             }
+            // Safety net (BOTH launchers): every entry starts hidden (above) and
+            // relies on a frontend `fable_reveal_window` call (fable splash /
+            // wupi paw entry / first-run download overlay). If the bundle ever
+            // fails to load/parse (catastrophic), that call never fires → the
+            // window would strand hidden. This fallback shows it after 5s no
+            // matter what, so neither launcher leaves the user staring at
+            // nothing. show() is a no-op if the frontend already revealed.
+            let fallback_win = main_window.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let _ = fallback_win.show();
+            });
             // (The `*.old` remnant sweep lived here — RETIRED with the rename-
             // dance updater. The temp-staged updater.exe overwrites files
             // directly after wupi.exe exits; no `.old` files are ever produced.
@@ -1600,13 +1614,17 @@ fn app_ready(state: tauri::State<'_, AppState>) -> String {
     "ready · no model (echo mode)".to_string()
 }
 
-/// fable.exe entry: reveal the (hidden) main window. The main window is built
-/// with `.visible(false)` for the fable launcher (lib.rs setup) to hide the
-/// WebView2 native-surface flash during init — the frontend paints its F-logo
-/// entry splash offscreen, then calls this once the splash is rendered, so the
-/// first VISIBLE frame is already the splash (never the native surface).
-/// `show()` is idempotent + safe to call for wupi.exe too (a no-op there since
-/// the window is already visible + this IPC is only invoked on the fable path).
+/// Reveal the (hidden) main window — the SHARED boot reveal for BOTH
+/// launchers. The main window is built with `.visible(false)` (lib.rs setup)
+/// so the WebView2 native surface's pre-paint frames (opaque white flash /
+/// momentary caption strip — worst under Alt+Tab recomposition during the
+/// intro) are never on screen. The frontend calls this once real pixels are
+/// composited: the fable.exe F-logo entry splash, the wupi.exe boot paw entry
+/// animation (script.js startEntryAndHops), or the first-run download overlay.
+/// The first VISIBLE frame is therefore always app content, never the native
+/// surface. `show()` is idempotent + safe on every path (repeat calls are
+/// no-ops); a Rust-side 5s fallback show backstops a bundle that never fires
+/// any reveal.
 #[tauri::command]
 fn fable_reveal_window<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
     if let Some(win) = app.get_webview_window("main") {
@@ -11231,7 +11249,6 @@ fn narrative_grounded(corpus: &[&str], surface: &str, id: &str, name: &str) -> b
 struct SiteBrief {
     node_id: String,
     node_name: String,
-    tone: String,
     elapsed_days: i64,
     seeds: Vec<String>,
     /// (2026-08-22 multihog WS3) The node's pending pressure lines — the
@@ -11287,15 +11304,17 @@ Schema (enum values lowercase snake_case; ids are kebab-case):
 }
 
 Hard rules:
-- 3 to 8 areas — prefer 4-6 (the whole output must fit one ~1024-token JSON object). Every connection is RECIPROCAL (both areas list it with the same state + detail).
+- Names: the plain common word for the space, 1-4 words. A name states what the space is.
+- 3 to 8 areas — prefer 4-6 (a modest home is 3-5). The whole output must fit one ~400-token JSON object; smaller is better.
+- Every connection is RECIPROCAL (both areas list it with the same state + detail).
 - Every area is reachable from the entrance; locked and blocked routes still count as connections.
 - The entrance is the only 'visited' area; everything else is 'unrevealed' (the player just walked in).
-- Geometry: exactly 1 terse line per area (at most 3 lines of 120 chars, and only when the space truly demands it).
+- Geometry: exactly 1 terse line per area (at most 120 chars).
 - Details at most 12 words. Terse, concrete, sensory.
 - At most 2 assets per area — density lives in the map shape, not the inventory.
 - Unseen creatures are 'unrevealed' — their truth is fixed now, discovered later.
 - A group carries count 1-99; every other kind uses count 0.
-- Locked/blocked doors guard real things. Honor the seeds and the tone.
+- Locked/blocked doors guard real things. Honor the seeds.
 - Output ONLY the fenced ```json object. No prose before or after.";
 
 /// (2026-08-23 hosted interiors) The DISTRICT scale addendum — appended to
@@ -11353,9 +11372,10 @@ pub(crate) fn render_site_architect_prompt(b: &SiteBrief) -> String {
         out.push_str("Design the hidden interior the player just entered.\n");
         out.push_str(&format!("Place: {}\n", b.node_name));
     }
-    if !b.tone.trim().is_empty() {
-        out.push_str(&format!("Tone: {}\n", b.tone.trim()));
-    }
+    // (2026-08-27 evening Chloe ruling) NO TONE, ever: the architect is a
+    // local tracker-family pass — it sees the place, the seeds, and the
+    // arrival scene, never the card's/story's tone or any persona material
+    // (the comedy-tone names came straight from the old "Tone:" line).
     out.push_str(&format!(
         "In-world time since this place was last known to change: ~{} day(s).\n",
         b.elapsed_days
@@ -11401,8 +11421,8 @@ fn render_site_architect_repair(prior_raw: &str, errors: &[String]) -> String {
     // direct the correction at SMALLER, not just fixed.
     out.push_str(
         "Size law: 3-8 areas (prefer 4-6), at most 2 assets per area, details at most \
-         12 words, geometry exactly 1 line — the whole object must fit one ~1024-token \
-         emit.\n",
+         12 words, geometry exactly 1 line, names are the plain common word for the \
+         space — the whole object must fit one ~400-token emit.\n",
     );
     if errors.iter().any(|e| e.starts_with("JSON parse:")) {
         out.push_str(
@@ -11516,7 +11536,6 @@ async fn maybe_run_site_architect(
         Some(SiteBrief {
             node_id: cur,
             node_name,
-            tone: s.tone.clone().unwrap_or_default(),
             elapsed_days,
             seeds,
             pressure,
@@ -11628,10 +11647,18 @@ async fn decode_site_map_with_repair(
         let raw = reply.raw_output;
         let parsed = match crate::site_map::SiteMap::from_model_output(&raw) {
             Err(e) => Err(vec![e]),
-            Ok(m) => match crate::site_map::validate(&m) {
-                Ok(()) => Ok(m),
-                Err(errs) => Err(errs),
-            },
+            // (2026-08-27 evening) MECHANICAL REPAIR before validation: the
+            // structural failure classes (one-sided connections, state/detail
+            // disagreements, orphans, unknown targets, over-cap counts) are
+            // fixed in deterministic Rust here — the model's repair passes
+            // are reserved for genuinely unparseable (truncated) output.
+            Ok(mut m) => {
+                crate::site_map::normalize_generated(&mut m);
+                match crate::site_map::validate(&m) {
+                    Ok(()) => Ok(m),
+                    Err(errs) => Err(errs),
+                }
+            }
         };
         match parsed {
             Ok(m) => return Some(m),
@@ -11759,7 +11786,6 @@ async fn maybe_run_hosted_interior_architect(
             SiteBrief {
                 node_id: node.clone(),
                 node_name: asset.name.clone(),
-                tone: s.tone.clone().unwrap_or_default(),
                 elapsed_days: 0,
                 seeds: Vec::new(),
                 pressure: Vec::new(),
@@ -17331,7 +17357,27 @@ fn render_fable_world_state(
     reveal_beneath: bool,
     gm_hidden: bool,
 ) -> String {
-    let mut rendered = s.render_for_prompt_with_beneath(reveal_beneath);
+    render_fable_world_state_opts(s, turn_directives, reveal_beneath, gm_hidden, false)
+}
+
+/// (2026-08-27 evening Chloe ruling) `local_diet = true` renders the world
+/// state for a LOCAL tracker-family consumer: the schema render routes
+/// through `render_for_prompt_local` (the `tone:` line NEVER appears — tone
+/// is API-narrator flavor, and it was the comedy-map-name engine). The only
+/// production caller on the diet is `render_tracker_world_state`; every
+/// narrator/aids path stays tone-inclusive.
+fn render_fable_world_state_opts(
+    s: &schema::WorldSchema,
+    turn_directives: &[String],
+    reveal_beneath: bool,
+    gm_hidden: bool,
+    local_diet: bool,
+) -> String {
+    let mut rendered = if local_diet {
+        s.render_for_prompt_local()
+    } else {
+        s.render_for_prompt_with_beneath(reveal_beneath)
+    };
 
     // (2026-08-22 multihog WS2) The GM hidden-contents block — HER eyes
     // only. Appended directly after the standard `site:` slice (never
@@ -17616,7 +17662,10 @@ const STAGE2: LeanCaps = LeanCaps {
 const WS_BUDGET: usize = 18_000;
 
 fn render_tracker_world_state(s: &schema::WorldSchema) -> String {
-    let mut rich = render_fable_world_state(s, &[], false, false);
+    // (2026-08-27 evening) LOCAL DIET: the tracker's world render carries NO
+    // tone (see render_fable_world_state_opts). Everything else about the
+    // lean pipeline is unchanged.
+    let mut rich = render_fable_world_state_opts(s, &[], false, false, true);
     // (2026-08-19 Hidden site maps) The TRACKER gets the compact id-bearing
     // site slice, not the narrator prose: swap the multi-line `site:` block
     // for the single-line ids + doors (a door's TARGET id is exactly how an
@@ -18259,6 +18308,339 @@ async fn acquire_fable_engine_leased(
 /// (card-scoped) and fire the schema delta (card-scoped). Mirrors `chat_send`
 /// shape but routes to the FableEngine + uses the narrator system prompt.
 #[tauri::command]
+/// (2026-08-27 evening Chloe ruling — THE TURN INVERSION) The post-beat
+/// tracker stage: the local E4B decode + bracket apply + JIT architects,
+/// relocated from their old PRE-API position. The caller runs this AFTER the
+/// API narrator's beat is finalized + guard-checked — the tracker's ONLY job
+/// is to parse the player's message + the AI's message and emit the state
+/// delta. Lock contract: the caller holds the local-model turn lock + the
+/// Fable lease + engine across this whole call (the uniform lock→lease order
+/// re-acquired post-beat) and releases all three immediately after.
+///
+/// The body is the old Stage-1 apply pipeline verbatim — scene_events,
+/// reject directives, the C3/C4 teach-backs, buffered notices, skill toasts,
+/// the ghost-graph invariant check, then the node + hosted-interior
+/// architects. Returns `true` when the decode was CANCELLED mid-flight (the
+/// caller takes the soft-cancel full revert — the turn never happened).
+#[allow(clippy::too_many_arguments)]
+async fn apply_post_beat_tracking(
+    state: &tauri::State<'_, AppState>,
+    on_event: &tauri::ipc::Channel<serde_json::Value>,
+    engine: &Arc<fable_engine::FableEngine>,
+    cancel: &llm::CancelToken,
+    system_prompt: &str,
+    tracker_window: &[session::Message],
+    player_text: &str,
+    skills_before: &[(String, serde_json::Value)],
+    turn_notices: &mut Vec<(&'static str, String)>,
+    turn_directives: &mut Vec<String>,
+    tick_armed: &mut bool,
+) -> bool {
+    // (2026-08-16 tracker-budget fix) Bounded render: over-budget → drop
+    // the preceding assistant beat + re-render once; STILL over → skip the
+    // tracker pass entirely with a hard error (never decode a headless
+    // prompt — the front-drain's silent bracket-protocol chop hid for 19
+    // turns last time).
+    let tracker_prompt_opt: Option<String> =
+        match build_tracker_prompt_bounded(system_prompt, tracker_window, settings::TRACKER_PROMPT_CHAR_BUDGET) {
+            Ok(p) => Some(p),
+            Err(rendered) => {
+                // (2026-08-21 Chloe ruling: NO degrade tier) The core-tier
+                // teaching strip + the mini world-state rung are GONE — a
+                // tracker render either carries the FULL teaching + FULL
+                // lean world-state or the pass fails LOUDLY (skip + in-game
+                // warning), never a silent degradation.
+                tracing::error!(
+                    budget = settings::TRACKER_PROMPT_CHAR_BUDGET,
+                    rendered,
+                    "⚠ TRACKER PROMPT OVER BUDGET even after the tail-drop re-render — \
+                     SKIPPING the tracker pass (brackets skipped this turn; the beat \
+                     commits un-tracked). This is a prompt-bloat regression: shrink the \
+                     prompt per the Prime Directive, never raise the context."
+                );
+                // Surface it in-game (2026-08-21): the playtest ran a whole
+                // session with tracking silently dead — the log was the only
+                // witness. The frontend shows a warning once per session
+                // (narrator.js de-dupes).
+                let _ = on_event.send(serde_json::json!({
+                    "type": "tracker_skipped"
+                }));
+                None
+            }
+        };
+    tracing::info!("fable_send: post-beat tracker stage (local) starting");
+    // The tracker's prose is discarded (we keep only parsed.commands); the
+    // no-op on_chunk ensures it never reaches the frontend.
+    let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
+    let tracker_reply_opt: Option<fable_engine::FableReply> = match tracker_prompt_opt {
+        Some(tracker_prompt) => {
+            match engine.request_turn(
+                tracker_prompt,
+                noop_chunk.clone(),
+                cancel.clone(),
+                fable_engine::FableTurnMode::Tracker,
+            ) {
+                Ok(reply_rx) => {
+                    match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
+                        Ok(Ok(r)) => {
+                            if r.cancelled {
+                                return true;
+                            }
+                            Some(r)
+                        }
+                        Ok(Err(e)) => {
+                            tracing::warn!(error = %e, "fable_send: tracker channel recv failed; skipping tracker stage");
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, "fable_send: tracker join failed; skipping tracker stage");
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "fable_send: tracker request_turn failed; skipping tracker stage");
+                    None
+                }
+            }
+        }
+        // Over-budget render: the tracker pass was already failed loudly
+        // above — the beat commits un-tracked.
+        None => None,
+    };
+
+    // Apply the tracker's brackets to fable_schema (if it produced any).
+    // Reuses the existing apply pipeline verbatim — zero new apply code.
+    if let Some(tracker_reply) = &tracker_reply_opt {
+        // (2026-08-25 scope fix) The parse is hoisted to an Option at this
+        // level so the post-apply invariant warn below — which must also
+        // fire on the errored-reply path, where no parse ran — can name
+        // the turn's brackets without a per-turn clone.
+        let tracker_parsed_opt: Option<bracket_parser::ParsedNarration> =
+            if tracker_reply.error.is_empty() {
+                let cleaned_tracker = schema::extract_reply_channel(&tracker_reply.raw_output);
+                Some(bracket_parser::parse(&cleaned_tracker))
+            } else {
+                tracing::warn!(
+                    error = %tracker_reply.error,
+                    "fable_send: tracker stage errored; the beat commits un-tracked"
+                );
+                None
+            };
+        if let Some(tracker_parsed) = tracker_parsed_opt.as_ref() {
+            if !tracker_parsed.commands.is_empty() {
+                tracing::info!(
+                    cmd_count = tracker_parsed.commands.len(),
+                    "fable_send: tracker emitted bracket commands; applying"
+                );
+                // Emit the tracker's SCHEMA-TRACKING scene_events to the
+                // frontend (Time / Effect / Milestone / Task — these are
+                // state changes the UI may want to surface as
+                // notifications: "Time advanced to day 3", "Berserk Rage
+                // fades"). The UI-EFFECT-ONLY commands (CharacterTurn /
+                // Object / Fx) are deliberately DROPPED here in API mode:
+                // the API narrator produces its own — and VASTLY better —
+                // NPC dialogue + scene description in prose, so emitting
+                // the tracker's CharacterTurn would either (a) duplicate
+                // the narrator's dialogue or (b) leak the local model's
+                // malformed bracket arguments straight to the user (the
+                // §11.43.A bug, found 2026-07-28). The apply_phase3 helpers
+                // still run on ALL commands below — only the frontend
+                // notification is gated.
+                for cmd in &tracker_parsed.commands {
+                    let is_ui_only = matches!(
+                        cmd,
+                        bracket_parser::BracketCommand::CharacterTurn { .. }
+                            | bracket_parser::BracketCommand::Object { .. }
+                            | bracket_parser::BracketCommand::Fx { .. }
+                    );
+                    if is_ui_only {
+                        continue;
+                    }
+                    let _ = on_event.send(serde_json::json!({
+                        "type": "scene_event",
+                        "command": cmd,
+                        "source": "tracker",
+                    }));
+                }
+                // Capture the reject directives (Component 3, 2026-07-28):
+                // e.g. "[TRAVEL] rejected — non-adjacent". Post-inversion
+                // these can no longer reach THIS turn's narrator (the beat
+                // already streamed) — they land in the tracker's own
+                // <emit_errors> feedback channel (the tracker corrects next
+                // turn) + stay in turn_directives for any diagnostic
+                // consumer.
+                let (_, travel_rejects, bracket_event_directives) =
+                    apply_phase3_bracket_commands(tracker_parsed, state, true, tracker_window, turn_notices)
+                        .await;
+                // (2026-08-22) The apply's auto-inventory notices (equips,
+                // stows, spills) COLLECT into `turn_notices` — they flush at
+                // turn COMMIT (see the flush site at the session install),
+                // never here: a cancelled turn reverts these very mutations.
+                turn_directives.extend(travel_rejects.clone());
+                // (2026-08-23 hazard referees) The bracket-time hazard
+                // events (road/city) join the same block AFTER the rejects —
+                // legal referee outcomes, never distilled into tracker
+                // emit-errors.
+                turn_directives.extend(bracket_event_directives);
+                // (2026-08-22 tracker feedback loop) The tracker sees its
+                // own rejects NEXT turn (distilled + capped). Before this
+                // the local model never learned an emission was illegal and
+                // repeated it every turn (the 2026-08-22 playtest's
+                // [NPC_ITEM player +coppers] loop).
+                // (2026-08-27 playtest C3) The assignment sits BELOW the
+                // time apply so the multi-hour teach-back can fold in.
+                let clock_before_min =
+                    state.fable_schema.lock().await.world_clock.current_minutes;
+                let (time_armed, time_event_directives, rest_notice) =
+                    apply_time_command_and_maybe_tick(tracker_parsed, state).await;
+                let clock_after_min =
+                    state.fable_schema.lock().await.world_clock.current_minutes;
+                let mut emit_err_src = travel_rejects.clone();
+                // (2026-08-27 playtest 2 polish) Full-day spans demand a
+                // deeper advance before the teach-back stands down.
+                let min_advance_min = if action_carries_fullday_signal(player_text) {
+                    FULDAY_MIN_ADVANCE_MINUTES
+                } else {
+                    MULTIHOUR_MIN_ADVANCE_MINUTES
+                };
+                if action_carries_multihour_signal(player_text)
+                    && (clock_after_min - clock_before_min) < min_advance_min
+                {
+                    tracing::info!(
+                        advanced = clock_after_min - clock_before_min,
+                        floor = min_advance_min,
+                        "C3 teach-back: multi-hour action under-advanced the clock; queueing [TIME] corrective"
+                    );
+                    emit_err_src.push(MULTIHOUR_TIME_TEACHBACK.to_string());
+                }
+                // (2026-08-27 playtest C4) Money-language present but no
+                // [LEDGER] emitted. The gate binds to COIN-MOVING ledger ops
+                // only: lifestyle/job/prosperity are management ops, not
+                // coin movement. Post-inversion the corpus is the player's
+                // action + the FRESH beat — the narrator's prose describing
+                // a payment is exactly the money-language signal.
+                let coin_ledger_emitted = tracker_parsed.commands.iter().any(
+                    |c| matches!(
+                        c,
+                        bracket_parser::BracketCommand::Ledger {
+                            op: bracket_parser::LedgerOp::Wealth
+                                | bracket_parser::LedgerOp::Currency
+                                | bracket_parser::LedgerOp::Found
+                                | bracket_parser::LedgerOp::Buy
+                                | bracket_parser::LedgerOp::Deposit
+                                | bracket_parser::LedgerOp::Withdraw
+                                | bracket_parser::LedgerOp::Invest,
+                            ..
+                        }
+                    ),
+                );
+                if !coin_ledger_emitted {
+                    let window_texts: Vec<&str> =
+                        tracker_window.iter().map(|m| m.content.as_str()).collect();
+                    if economy::narrative_carries_money_movement(&window_texts) {
+                        emit_err_src.push(MONEY_MISS_TEACHBACK.to_string());
+                    }
+                }
+                *state.tracker_emit_errors.lock().await =
+                    distill_tracker_emit_errors(&emit_err_src);
+                *tick_armed = time_armed;
+                // (2026-08-23 hazard referees) The time-channel events (rest
+                // interruption, ≥6h time-skip) + the rest bubble ride the
+                // commit-flush channels.
+                turn_directives.extend(time_event_directives);
+                if let Some(notice) = rest_notice {
+                    turn_notices.push(("rest", notice));
+                }
+                // (2026-08-24 Part II B8) RANK-ADVANCE TOAST — diff the
+                // pre/post `skill_*` ranks around the tracker apply and push
+                // ONE buffered notice per deepened skill (flushed at turn
+                // commit with every other notice — a cancelled turn reverts
+                // these very writes, so it shows nothing).
+                {
+                    let s = state.fable_schema.lock().await;
+                    for (skill, old_rank, _new) in
+                        player_state::detect_skill_advances(
+                            &skills_before
+                                .iter()
+                                .cloned()
+                                .collect::<std::collections::BTreeMap<_, _>>(),
+                            &s.entities,
+                        )
+                    {
+                        if old_rank == 0 {
+                            turn_notices.push((
+                                "skill",
+                                format!("{skill} — a knack takes root."),
+                            ));
+                        } else {
+                            turn_notices.push(("skill", format!("{skill} mastery deepens.")));
+                        }
+                    }
+                }
+            } else {
+                tracing::info!("fable_send: tracker produced no bracket commands");
+                // (2026-08-27 playtest C3) ZERO emissions on a turn whose
+                // action carries a multi-hour signal (the playtest's "sleep
+                // through the night" — fiction woke at dawn, clock stayed
+                // 19:20, world desynced for the rest of the session). Push
+                // the corrective line through the same `<emit_errors>`
+                // channel so the NEXT turn re-syncs. (C4) Same for money
+                // language with nothing emitted.
+                let mut teachback: Vec<String> = Vec::new();
+                if action_carries_multihour_signal(player_text) {
+                    teachback.push(MULTIHOUR_TIME_TEACHBACK.to_string());
+                }
+                {
+                    let window_texts: Vec<&str> =
+                        tracker_window.iter().map(|m| m.content.as_str()).collect();
+                    if economy::narrative_carries_money_movement(&window_texts) {
+                        teachback.push(MONEY_MISS_TEACHBACK.to_string());
+                    }
+                }
+                if !teachback.is_empty() {
+                    let mut errs = state.tracker_emit_errors.lock().await;
+                    errs.extend(teachback);
+                    let distilled = distill_tracker_emit_errors(&errs);
+                    *errs = distilled;
+                }
+            }
+        }
+        // (2026-08-24 fix) Post-tracker invariant: a non-empty graph with no
+        // current_node is a ghost state. Every TRAVEL/DISCOVER arm now
+        // assigns or rejects explicitly, so this firing means an arm
+        // diverged — loud, with the turn's bracket list, so a live repro
+        // names the culprit immediately instead of a silent ghost.
+        {
+            let s = state.fable_schema.lock().await;
+            if s.travel_graph.is_set() && s.travel_graph.current_node.is_none() {
+                tracing::warn!(
+                    brackets = ?tracker_parsed_opt.as_ref().map(|p| &p.commands),
+                    nodes = s.travel_graph.nodes.len(),
+                    "INVARIANT: travel graph non-empty but current_node is None after the tracker apply"
+                );
+            }
+        }
+    }
+
+    // (2026-08-19 Hidden site maps) JIT ARCHITECT — runs in the window where
+    // the engine Arc, the Fable lease, AND the turn lock are all still held
+    // (the caller's post-beat window; a second request_turn on the same
+    // engine is a fresh prefill, the documented dev-narrator precedent).
+    // Arrival trigger, idempotent under the schema lock; on any failure it
+    // skips silently (the node re-architects next arrival until standdown).
+    // (2026-08-27 evening) Post-beat placement: the map misses THIS turn's
+    // narrator slice (the beat already streamed map-less) and serves the
+    // NEXT turn's `site:` block + this turn's late [ROOM] brackets.
+    maybe_run_site_architect(state, engine, cancel, tracker_window).await;
+    // (2026-08-23 hosted interiors) The BUILDING-child architect — same
+    // window, same lock shape. Runs AFTER the bracket apply above (a `[ROOM]`
+    // enter set `current_building` this turn) and AFTER the node architect.
+    maybe_run_hosted_interior_architect(state, engine, cancel, tracker_window).await;
+
+    false
+}
+
 async fn fable_send(
     text: String,
     on_event: tauri::ipc::Channel<serde_json::Value>,
@@ -18415,34 +18797,24 @@ async fn fable_send(
         }
     }
 
-    // v0.6.4 VRAM swap-lock: acquire the Fable lease + spawn-or-reuse the
-    // engine under it. Extracted into `acquire_fable_engine_leased` (2026-08-
-    // 14) so the edit-retrack path (edit_message) reaches the local tracker
-    // through the SAME lease — every local-model Fable consumer routes
-    // through the lease (the §2C boot-bypass lesson).
+    // (2026-08-27 evening Chloe ruling — THE TURN INVERSION) The API narrator
+    // streams FIRST; the local tracker runs AFTER the beat lands. NOTHING
+    // local is acquired or decoded before the HTTP stream opens — no turn
+    // lock, no Fable lease, no engine spawn. The pre-API section is pure
+    // Rust (referee block under the schema lock, ms-scale) + one HTTP wait,
+    // so the player sees first prose at the provider's TTFT (~2-3s), never
+    // queued behind a local decode. The tracker + JIT architects re-acquire
+    // the turn lock → Fable lease → engine in the POST-BEAT stage below (the
+    // same uniform lock→lease order), hold them across their decodes, and
+    // drop them before the commit tail. A cancel during the API stream takes
+    // the existing full-revert branches; a cancel during the post-beat
+    // tracker aborts the decode and takes the same full revert (the turn
+    // never happened — the frontend discards the streamed beat).
     //
-    // **Local-model turn lock BEFORE the lease (2026-08-15, #29/#23):** the
-    // lock is taken FIRST and held across Stage 1 (tracker decode + bracket
-    // application), dropped before Stage 2 — the uniform lock→lease order
-    // chat/schema/SD already use. The old lease→lock order left a window
-    // where a chat turn or an SD swap cycle could acquire the lease and evict
-    // the fable role while this frame still held an engine clone (its
-    // teardown's Arc::try_unwrap then failed → the ~70MB fable context
-    // orphaned in VRAM alongside the new role's context; for the SD path,
-    // unload_shared_model could free the weights under the still-live
-    // LlamaContext — memory-unsafe). Holding the turn lock from before the
-    // lease acquire closes the window: every lease taker is also a turn-lock
-    // holder, so eviction can only happen between turns.
-    let _tracker_model_guard = state.local_model_lock.lock().await;
-    let (lease, engine) = acquire_fable_engine_leased(&state, &app).await?;
-    // Stage-2 droppables: the API narrator needs NEITHER the engine NOR the
-    // lease, so both become Options the API arm drops before its HTTP wait
-    // (see the Stage-2 block). The dev-only local-narrator arm keeps them.
-    let mut lease_opt = Some(lease);
-    let mut engine_opt = Some(engine);
-    // Armed by apply_time_command_and_maybe_tick when the [TIME] gate
-    // crosses the progression interval; fired ONLY at the very end of this
-    // fn, after `engine` + `lease` are dropped (see fire_world_progression_tick).
+    // Lock-discipline history this preserves: the turn-lock-BEFORE-lease
+    // order (2026-08-15, #29/#23) still binds at the post-beat acquisition —
+    // every lease taker is also a turn-lock holder, so cross-role eviction
+    // can only happen between turns, never under a live engine clone.
     let mut tick_armed = false;
     // Context size for the API narrator path (the local FableEngine ignores it:
     // it clears KV per turn on its own fixed context). CTX_API directly — the
@@ -19232,19 +19604,16 @@ async fn fable_send(
         push_fable_history_snapshot(&state, snap).await;
     }
 
-    // Build windowed prompts. Two windows are needed (2026-08-08):
+    // Build the windowed API history. (2026-08-27 evening inversion) Only the
+    // NARRATOR window is built here — the API narrates FROM history + the
+    // player's action. The tracker's window is built POST-BEAT below
+    // ([player action, fresh beat] — the tracker's whole job per the ruling:
+    // parse the user's message + the AI's message, emit the state delta).
     //   • `window` (WINDOW_API_FABLE = 16) — the API narrator sees the full
     //     narrative history (it has the 16k context budget for it).
-    //   • `tracker_window` (WINDOW_TRACKER = 2) — the local tracker sees only
-    //     the last 1 turn (player action + preceding narrator response). It
-    //     does NOT re-read history: it relies on the schema delta (incremental
-    //     state) + Rust state as the authority. Keeping its window to 1 turn
-    //     (the AGENT directive's "this turn") keeps the prompt lean so the
-    //     bracket protocol survives the truncation guard.
-    // Same Gemma4 `<|turn>` protocol the chat path uses (assistant → "model").
-    // Single-shot prefill (FableEngine clears KV every turn), so cleaned
-    // content is fine (no cache-coherent raw_output re-render needed).
-    let (window, tracker_window): (Vec<session::Message>, Vec<session::Message>) = {
+    //   • `exposure_window` (WINDOW_TRACKER = 2) — the pre-API 2-message tail
+    //     (preceding beat + this action), the corpus the exposure gate reads.
+    let (window, exposure_window): (Vec<session::Message>, Vec<session::Message>) = {
         let gs = state.fable_session.lock().await;
         let msgs = &gs.messages;
         // Reroll: the trailing assistant message's prose is superseded by the
@@ -19260,10 +19629,10 @@ async fn fable_send(
         };
         let narr_start = end.saturating_sub(fable_visible_window);
         let track_start = end.saturating_sub(settings::WINDOW_TRACKER);
-        // Cap assistant-message prose in the TRACKER window (2026-08-10, T52
+        // Cap assistant-message prose in the exposure window (2026-08-10, T52
         // overflow fix). See `cap_assistant_prose` + `TRACKER_ASSISTANT_CHAR_CAP`.
         // The narrator window (16k API budget) is uncapped.
-        let tracker_window = cap_assistant_prose(
+        let exposure_window = cap_assistant_prose(
             msgs[track_start..end].to_vec(),
             settings::TRACKER_ASSISTANT_CHAR_CAP,
         );
@@ -19271,7 +19640,7 @@ async fn fable_send(
         // beats too: a leaked protocol-lookalike head bracket stored in a
         // beat re-enters the API's 16-message history and GLM imitates its
         // own leak — self-reinforcing over a campaign. cap_assistant_prose
-        // already heals the tracker window; this heals the narrator's.
+        // already heals the exposure window; this heals the narrator's.
         let window = msgs[narr_start..end]
             .iter()
             .map(|m| {
@@ -19282,7 +19651,7 @@ async fn fable_send(
                 m
             })
             .collect::<Vec<_>>();
-        (window, tracker_window)
+        (window, exposure_window)
     };
 
     // Variant↔schema binding (2026-08-11): capture the pre-turn base schema
@@ -19404,399 +19773,36 @@ async fn fable_send(
     // does), so the final bracket parse is a no-op for state (the tracker
     // already applied them) but still cleans/strips the prose.
     let reply: fable_engine::FableReply = {
-        // ---- Stage 1: TRACKER (local model, hidden) ----
-        // The tracker gets the Tracker prompt (build_narrator_system_prompt —
-        // narration + brackets), but with the PRE-tracker world_state (the
-        // authoritative state before this turn's brackets land). Its prose is
-        // discarded; only its brackets are
-        // applied. The no-op on_chunk ensures the tracker's prose/bracket
-        // output never reaches the frontend.
-        //
-        // **Local-model turn lock (2026-08-08; hoisted above the lease
-        // acquire 2026-08-15):** the tracker decode + bracket application run
-        // under the process-wide `local_model_lock` (`_tracker_model_guard`,
-        // taken before acquire_fable_engine_leased) so they never overlap a
-        // concurrent `chat_send`, schema-delta, or SD-swap decode on the local
-        // model / shared VRAM. Whichever consumer acquires first runs to
-        // completion; the others queue. The guard drops at the end of this
-        // block — BEFORE Stage 2 (the API narrator never takes it).
-        let noop_chunk: llm::ChunkFn = Arc::new(|_: &str| {});
-        // The tracker uses the tight 1-turn window (WINDOW_TRACKER = 2), NOT
-        // the narrator's 16-message window. It relies on the schema delta +
-        // Rust state, not re-read history (2026-08-10).
-        //
-        // (2026-08-16 tracker-budget fix) Bounded render: over-budget → drop
-        // the preceding assistant beat + re-render once; STILL over → skip
-        // the tracker pass entirely with a hard error (never decode a
-        // headless prompt — the front-drain's silent bracket-protocol chop
-        // hid for 19 turns last time).
-        let tracker_prompt_opt: Option<String> =
-            match build_tracker_prompt_bounded(&system_prompt, &tracker_window, settings::TRACKER_PROMPT_CHAR_BUDGET) {
-                Ok(p) => Some(p),
-                Err(rendered) => {
-                    // (2026-08-21 Chloe ruling: NO degrade tier) The
-                    // core-tier teaching strip + the mini world-state rung
-                    // are GONE — a tracker render either carries the FULL
-                    // teaching + FULL lean world-state or the pass fails
-                    // LOUDLY (skip + in-game warning), never a silent
-                    // degradation. With CTX_FABLE = 8192 + the derived
-                    // budget this is unreachable for any real campaign; the
-                    // maxed-world pin guards the composition.
-                    tracing::error!(
-                        budget = settings::TRACKER_PROMPT_CHAR_BUDGET,
-                        rendered,
-                        "⚠ TRACKER PROMPT OVER BUDGET even after the tail-drop re-render — \
-                         SKIPPING the tracker pass (brackets skipped this turn; the narrator \
-                         still runs on pre-tracker state). This is a prompt-bloat regression: \
-                         shrink the prompt per the Prime Directive, never raise the context."
-                    );
-                    // Surface it in-game (2026-08-21): the playtest ran a
-                    // whole session with tracking silently dead — the log
-                    // was the only witness. The frontend shows a warning
-                    // once per session (narrator.js de-dupes).
-                    let _ = on_event.send(serde_json::json!({
-                        "type": "tracker_skipped"
-                    }));
-                    None
-                }
-            };
-        tracing::info!("fable_send: API mode — tracker stage (local) starting");
-        let engine = engine_opt
-            .as_ref()
-            .expect("tracker engine alive (dropped only in the API arm, post-tracker)");
-        let tracker_reply_opt: Option<fable_engine::FableReply> = match tracker_prompt_opt {
-            Some(tracker_prompt) => {
-                match engine.request_turn(
-                    tracker_prompt,
-                    noop_chunk.clone(),
-                    cancel.clone(),
-                    fable_engine::FableTurnMode::Tracker,
-                ) {
-                    Ok(reply_rx) => {
-                        match tokio::task::spawn_blocking(move || reply_rx.recv()).await {
-                            Ok(Ok(r)) => Some(r),
-                            Ok(Err(e)) => {
-                                tracing::warn!(error = %e, "fable_send: tracker channel recv failed; skipping tracker stage");
-                                None
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "fable_send: tracker join failed; skipping tracker stage");
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %format!("{e:#}"), "fable_send: tracker request_turn failed; skipping tracker stage");
-                        None
-                    }
-                }
-            }
-            // Over-budget render: the tracker pass was already failed loudly
-            // above — proceed to the API narrator with pre-tracker state.
-            None => None,
-        };
-
-        // Apply the tracker's brackets to fable_schema (if it produced any).
-        // Reuses the existing apply pipeline verbatim — zero new apply code.
-        // The tracker's prose is discarded (we keep only parsed.commands).
-        if let Some(tracker_reply) = &tracker_reply_opt {
-            // (2026-08-25 scope fix) The parse is hoisted to an Option at this
-            // level so the post-apply invariant warn below — which must also
-            // fire on the errored-reply path, where no parse ran — can name
-            // the turn's brackets without a per-turn clone.
-            let tracker_parsed_opt: Option<bracket_parser::ParsedNarration> =
-                if tracker_reply.error.is_empty() {
-                    let cleaned_tracker = schema::extract_reply_channel(&tracker_reply.raw_output);
-                    Some(bracket_parser::parse(&cleaned_tracker))
-                } else {
-                    tracing::warn!(
-                        error = %tracker_reply.error,
-                        "fable_send: tracker stage errored; proceeding to API narrator with pre-tracker state"
-                    );
-                    None
-                };
-            if let Some(tracker_parsed) = tracker_parsed_opt.as_ref() {
-                if !tracker_parsed.commands.is_empty() {
-                    tracing::info!(
-                        cmd_count = tracker_parsed.commands.len(),
-                        "fable_send: tracker emitted bracket commands; applying"
-                    );
-                    // Emit the tracker's SCHEMA-TRACKING scene_events to the
-                    // frontend (Time / Effect / Milestone / Task — these are
-                    // state changes the UI may want to surface as
-                    // notifications: "Time advanced to day 3", "Berserk Rage
-                    // fades"). The UI-EFFECT-ONLY commands (CharacterTurn /
-                    // Object / Fx) are deliberately DROPPED here in API mode:
-                    // the API narrator (stage 2, below) produces its own
-                    // — and VASTLY better — NPC dialogue + scene description
-                    // in prose, so emitting the tracker's CharacterTurn
-                    // would either (a) duplicate the narrator's dialogue
-                    // or (b) leak the local model's malformed bracket
-                    // arguments straight to the user (the §11.43.A bug,
-                    // found 2026-07-28: the local 12B (pre-E4B) loops on `(player)`
-                    // template-placeholder syntax inside character_turn
-                    // lines, producing garbage like "the (player) is
-                    // (player) at the (player)"). The apply_phase3 helpers
-                    // still run on ALL commands below — only the frontend
-                    // notification is gated.
-                    for cmd in &tracker_parsed.commands {
-                        let is_ui_only = matches!(
-                            cmd,
-                            bracket_parser::BracketCommand::CharacterTurn { .. }
-                                | bracket_parser::BracketCommand::Object { .. }
-                                | bracket_parser::BracketCommand::Fx { .. }
-                        );
-                        if is_ui_only {
-                            continue;
-                        }
-                        let _ = on_event.send(serde_json::json!({
-                            "type": "scene_event",
-                            "command": cmd,
-                            "source": "tracker",
-                        }));
-                    }
-                    // Capture the reject directives (Component 3, 2026-07-28):
-                    // e.g. "[TRAVEL] rejected — non-adjacent". Merge into
-                    // turn_directives so the API narrator (stage 2) sees them
-                    // in its `<directives>` block + obeys ("the move is not
-                    // possible from here; <exits>"). Listed LAST in the block
-                    // (after lethality / disguise / skill / tick directives)
-                    // — a rejected travel is the least consequential of the
-                    // hard facts, and the narrator has already seen the legal
-                    // `location:` line + exits in `<world_state>`.
-                    let (_, travel_rejects, bracket_event_directives) =
-                        apply_phase3_bracket_commands(&tracker_parsed, &state, true, &tracker_window, &mut turn_notices)
-                            .await;
-                    // (2026-08-22) The apply's auto-inventory notices (equips,
-                    // stows, spills) COLLECT into the fn-scoped
-                    // `turn_notices` — they flush at turn COMMIT (see the
-                    // flush site at the session install), never here: a
-                    // cancelled turn reverts these very mutations.
-                    turn_directives.extend(travel_rejects.clone());
-                    // (2026-08-23 hazard referees) The bracket-time hazard
-                    // events (road/city) join the same block AFTER the
-                    // rejects — legal referee outcomes, never distilled
-                    // into tracker emit-errors.
-                    turn_directives.extend(bracket_event_directives);
-                    // (2026-08-22 tracker feedback loop) The tracker sees its
-                    // own rejects NEXT turn (distilled + capped) — the
-                    // narrator keeps its copies above. Before this the local
-                    // model never learned an emission was illegal and
-                    // repeated it every turn (the 2026-08-22 playtest's
-                    // [NPC_ITEM player +coppers] loop).
-                    // (2026-08-27 playtest C3) The assignment moved BELOW the
-                    // time apply so the multi-hour teach-back can fold in:
-                    // a strong sleep/journey/work signal whose clock delta
-                    // stayed under the floor (the 17-hour crossing that
-                    // advanced 1 minute; the afternoon that landed at 13:35)
-                    // pushes one corrective line through this same channel.
-                    let clock_before_min =
-                        state.fable_schema.lock().await.world_clock.current_minutes;
-                    let (time_armed, time_event_directives, rest_notice) =
-                        apply_time_command_and_maybe_tick(&tracker_parsed, &state).await;
-                    let clock_after_min =
-                        state.fable_schema.lock().await.world_clock.current_minutes;
-                    let mut emit_err_src = travel_rejects.clone();
-                    // (2026-08-27 playtest 2 polish) Full-day spans demand a
-                    // deeper advance before the teach-back stands down — the
-                    // observed "work until the light goes" landed +240 against
-                    // a ~12h fiction span and sailed over the 120-min floor.
-                    let min_advance_min = if action_carries_fullday_signal(&text) {
-                        FULDAY_MIN_ADVANCE_MINUTES
-                    } else {
-                        MULTIHOUR_MIN_ADVANCE_MINUTES
-                    };
-                    if action_carries_multihour_signal(&text)
-                        && (clock_after_min - clock_before_min) < min_advance_min
-                    {
-                        tracing::info!(
-                            advanced = clock_after_min - clock_before_min,
-                            floor = min_advance_min,
-                            "C3 teach-back: multi-hour action under-advanced the clock; queueing [TIME] corrective"
-                        );
-                        emit_err_src.push(MULTIHOUR_TIME_TEACHBACK.to_string());
-                    }
-                    // (2026-08-27 playtest C4) Money-language present but no
-                    // [LEDGER] emitted: the playtest went 0-for-6 on payments
-                    // (fisherman, stew, wages, bribes) while wealth sat at 0.
-                    // Same teach-back channel — the line is conditional so a
-                    // descriptive coin mention coaches nothing phantom.
-                    // (2026-08-27 playtest 2 polish) The gate binds to
-                    // COIN-MOVING ledger ops only: playtest 2's T2 emitted
-                    // `[LEDGER lifestyle]` while physically paying its gold as
-                    // item removals — the any-Ledger gate read that as "money
-                    // was tracked" and wrongly suppressed the wealth
-                    // teach-back. Lifestyle/job/prosperity are management
-                    // ops, not coin movement.
-                    let coin_ledger_emitted = tracker_parsed.commands.iter().any(
-                        |c| matches!(
-                            c,
-                            bracket_parser::BracketCommand::Ledger {
-                                op: bracket_parser::LedgerOp::Wealth
-                                    | bracket_parser::LedgerOp::Currency
-                                    | bracket_parser::LedgerOp::Found
-                                    | bracket_parser::LedgerOp::Buy
-                                    | bracket_parser::LedgerOp::Deposit
-                                    | bracket_parser::LedgerOp::Withdraw
-                                    | bracket_parser::LedgerOp::Invest,
-                                ..
-                            }
-                        ),
-                    );
-                    if !coin_ledger_emitted {
-                        let window_texts: Vec<&str> =
-                            tracker_window.iter().map(|m| m.content.as_str()).collect();
-                        if economy::narrative_carries_money_movement(&window_texts) {
-                            emit_err_src.push(MONEY_MISS_TEACHBACK.to_string());
-                        }
-                    }
-                    *state.tracker_emit_errors.lock().await =
-                        distill_tracker_emit_errors(&emit_err_src);
-                    tick_armed = time_armed;
-                    // (2026-08-23 hazard referees) The time-channel events
-                    // (rest interruption, ≥6h time-skip) merge BEFORE the
-                    // narrator re-render below — bracket-time + time-channel
-                    // events reach the SAME turn's narrator. The rest
-                    // interruption's bubble rides the commit-flush channel
-                    // (a cancelled turn never shows it).
-                    turn_directives.extend(time_event_directives);
-                    if let Some(notice) = rest_notice {
-                        turn_notices.push(("rest", notice));
-                    }
-                    // (2026-08-24 Part II B8) RANK-ADVANCE TOAST — diff the
-                    // pre/post `skill_*` ranks around the tracker apply and
-                    // push ONE buffered notice per deepened skill (flushed at
-                    // turn commit with every other notice — a cancelled turn
-                    // reverts these very writes, so it shows nothing). The
-                    // level-up system is dead by ruling; this subtle toast is
-                    // its entire surviving surface.
-                    {
-                        let s = state.fable_schema.lock().await;
-                        for (skill, old_rank, _new) in
-                            player_state::detect_skill_advances(
-                                &skills_before
-                                    .iter()
-                                    .cloned()
-                                    .collect::<std::collections::BTreeMap<_, _>>(),
-                                &s.entities,
-                            )
-                        {
-                            if old_rank == 0 {
-                                turn_notices.push((
-                                    "skill",
-                                    format!("{skill} — a knack takes root."),
-                                ));
-                            } else {
-                                turn_notices.push(("skill", format!("{skill} mastery deepens.")));
-                            }
-                        }
-                    }
-                } else {
-                    tracing::info!("fable_send: tracker produced no bracket commands");
-                    // (2026-08-27 playtest C3) ZERO emissions on a turn whose
-                    // action carries a multi-hour signal (the playtest's
-                    // "sleep through the night" — fiction woke at dawn, clock
-                    // stayed 19:20, world desynced for the rest of the
-                    // session). Push the corrective line through the same
-                    // `<emit_errors>` channel so the NEXT turn re-syncs.
-                    // (C4) Same for money language with nothing emitted.
-                    let mut teachback: Vec<String> = Vec::new();
-                    if action_carries_multihour_signal(&text) {
-                        teachback.push(MULTIHOUR_TIME_TEACHBACK.to_string());
-                    }
-                    {
-                        let window_texts: Vec<&str> =
-                            tracker_window.iter().map(|m| m.content.as_str()).collect();
-                        if economy::narrative_carries_money_movement(&window_texts) {
-                            teachback.push(MONEY_MISS_TEACHBACK.to_string());
-                        }
-                    }
-                    if !teachback.is_empty() {
-                        let mut errs = state.tracker_emit_errors.lock().await;
-                        errs.extend(teachback);
-                        let distilled = distill_tracker_emit_errors(&errs);
-                        *errs = distilled;
-                    }
-                }
-            }
-            // (2026-08-24 fix) Post-tracker invariant: a non-empty graph with
-            // no current_node is a ghost state. Every TRAVEL/DISCOVER arm now
-            // assigns or rejects explicitly, so this firing means an arm
-            // diverged — loud, with the turn's bracket list, so a live repro
-            // names the culprit immediately instead of a silent ghost.
-            {
-                let s = state.fable_schema.lock().await;
-                if s.travel_graph.is_set() && s.travel_graph.current_node.is_none() {
-                    tracing::warn!(
-                        brackets = ?tracker_parsed_opt.as_ref().map(|p| &p.commands),
-                        nodes = s.travel_graph.nodes.len(),
-                        "INVARIANT: travel graph non-empty but current_node is None after the tracker apply"
-                    );
-                }
-            }
-        }
-
-        // (2026-08-19 Hidden site maps) JIT ARCHITECT — runs in the window
-        // where the engine Arc, the Fable lease, AND the turn lock are all
-        // still held (zero lock changes: a second request_turn on the same
-        // engine is a fresh prefill, the documented dev-narrator precedent).
-        // Arrival trigger, idempotent under the schema lock; on any failure
-        // it skips silently (the narrator proceeds map-less — today's
-        // behavior — and the next turn re-architects).
-        maybe_run_site_architect(&state, engine, &cancel, &tracker_window).await;
-        // (2026-08-23 hosted interiors) The BUILDING-child architect — same
-        // window, same lock shape. Runs AFTER the bracket apply above (a
-        // `[ROOM]` enter set `current_building` this turn) and AFTER the
-        // node architect (entering a building in a just-arrived settlement
-        // needs the district map first).
-        maybe_run_hosted_interior_architect(&state, engine, &cancel, &tracker_window).await;
-
-        // The tracker's local-model work is done — release the local-model
-        // turn lock NOW so a concurrent chat_send / schema-delta can use the
-        // local model while Stage 2 (the API narrator, below) streams over
-        // HTTP. The API never touches the local model, so holding the lock
-        // across it would needlessly block every Wupi-drawer message for the
-        // entire narrator generation.
-        //
-        // (2026-08-16 bug 10) For the API arm the engine Arc + Fable lease
-        // are dead weight from here — drop them BEFORE releasing the turn
-        // lock. The old order (lock released here, engine/lease only at the
-        // Stage-2 HTTP block ~150 lines later) left a window where a chat/SD
-        // cycle queued on the turn lock could wake, cross-role acquire, and
-        // run the swap-lock's eviction teardown with this frame's engine
-        // clone still alive — `Arc::try_unwrap` fails and context_swap
-        // PROCEEDS ANYWAY, allocating the new context while the ~70 MB
-        // fable context is still resident (the exact VRAM-eviction window
-        // the turn-lock-before-lease invariant exists to close; memory-
-        // unsafe for the SD unload path). The dev-only local-narrator arm
-        // keeps both (its Stage-2 decode needs the engine) and re-takes the
-        // turn lock for that decode. The narrator prompt build below needs
-        // neither the engine nor the lease.
+        // ---- Stage 2 FIRST (2026-08-27 evening Chloe ruling — the turn
+        // inversion): the API narrator streams BEFORE any local decode. The
+        // tracker + JIT architects run POST-BEAT, after the guards below
+        // this block have committed the reply (see
+        // `apply_post_beat_tracking`). Nothing local is held across the HTTP
+        // wait; the player sees first prose at the provider's TTFT. ----
         let profile = {
             let cfg = state.api_config.lock().unwrap_or_else(|e| e.into_inner());
             cfg.active_profile().cloned()
         };
         let dev_local_narrator = cfg!(debug_assertions) && profile.is_none();
-        if !dev_local_narrator {
-            drop(engine_opt.take());
-            drop(lease_opt.take());
-        }
-        drop(_tracker_model_guard);
 
-        // Re-render the authoritative world-state for the API narrator. This
-        // reflects the tracker's bracket mutations (time advanced, buffs
-        // added, milestones recorded, tasks queued). The SAME turn_directives
-        // (combat lethality + skill checks + tick directives — assembled
-        // pre-tracker, Referees run once) ride this render so the narrator
-        // sees one coherent block of hard facts.
+        // Render the authoritative world-state for the API narrator's turn
+        // tail. (2026-08-27 evening inversion) This is the PRE-BEAT render:
+        // last turn's tracking + THIS turn's pure-Rust referee mutations.
+        // The tracker's brackets for this turn land AFTER the beat (the
+        // post-beat stage below) and reach the narrator on the NEXT turn —
+        // the explicit trade of the inversion: first prose in ~2-3s, state
+        // one turn behind the action. The SAME turn_directives (combat
+        // lethality + skill checks + tick directives — assembled in the
+        // referee block, Referees run once) ride this render so the
+        // narrator sees one coherent block of hard facts.
         // (2026-08-19 exposure gate, the upskirt ruling) The reveal flag is
-        // computed from the SAME 2-message window the tracker read (the
-        // player's action + the preceding beat): when that window involves
+        // computed from the 2-message pre-turn window (the player's action +
+        // the preceding beat): when that window involves
         // exposure, the player_state block gains one `beneath:` line naming
         // the concealed wear — the narrator narrates the real garment, never
         // an improvised contradiction. Every other turn renders identically
         // (the flag is false and costs nothing).
-        let exposure_corpus: Vec<&str> = tracker_window
+        let exposure_corpus: Vec<&str> = exposure_window
             .iter()
             .map(|m| m.content.as_str())
             .chain(player_action.as_deref())
@@ -19902,13 +19908,28 @@ async fn fable_send(
                 .unwrap_or_default();
             let dev_system = format!("{narrator_system_prompt}\n\n{mem_section}{narrator_turn_tail}");
             let narrator_prompt = build_narrator_prompt(&dev_system, &window);
-            // Re-take the turn lock for this decode (2026-08-15, #44): the
-            // Stage-1 guard was dropped above, and a local decode outside the
-            // lock could overlap a concurrent chat/schema decode in dev.
+            // (2026-08-27 evening inversion) The dev arm acquires the whole
+            // local stack for its narrator decode — turn lock → Fable lease →
+            // engine, the uniform order (there is no pre-API acquisition
+            // anymore). Released at this block's end, before the post-beat
+            // tracker stage re-acquires it below.
             let _dev_model_guard = state.local_model_lock.lock().await;
-            let engine = engine_opt
-                .as_ref()
-                .expect("dev narrator engine alive (dropped only in the API arm)");
+            let (_dev_lease, engine) = match acquire_fable_engine_leased(&state, &app).await {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, "fable_send: DEV narrator engine unavailable");
+                    restore_tick_directives(&state, &directives_at_turn_start).await;
+                    return emit_fable_api_lost(
+                        &on_event, &app, &state,
+                        "Dev local narrator engine unavailable.",
+                        !regenerate && !reroll,
+                        if reroll { Some(base_schema_snapshot.clone()) } else { Some(pre_referee_schema.clone()) },
+                        player_action.clone(),
+                        history_depth_at_turn_start,
+                    )
+                    .await;
+                }
+            };
             let dev_reply: fable_engine::FableReply = match engine.request_turn(
                 narrator_prompt,
                 on_chunk.clone(),
@@ -19977,12 +19998,11 @@ async fn fable_send(
                 history_depth_at_turn_start,
                 ).await;
             };
-            // (2026-08-16 bug 10) The engine Arc + lease drops for the WHOLE
-            // Stage-2 HTTP wait (2026-08-15, #29) moved UP — they now
-            // accompany the turn-lock release right after the tracker stage
-            // (see the bug-10 block there). `engine_opt`/`lease_opt` are
-            // already `None` in this arm; the Option wrappers keep the fn-end
-            // drops in `fable_send`'s tail meaningful for the dev arm.
+            // (2026-08-27 evening inversion) NOTHING local is held across
+            // this HTTP wait — no engine, no lease, no turn lock (the
+            // acquisition moved to the post-beat tracker stage below). A
+            // concurrent chat/schema/SD local decode runs freely while the
+            // narrator streams.
             // Re-render the windowed history as flat ApiMessages for the HTTP
             // path, in the 2026-08-19 Chloe cache order:
             //   [system: narrative prompt + <player> + <sim_card>]
@@ -20369,6 +20389,128 @@ async fn fable_send(
         .await;
     }
 
+    // ---- Stage 1 TRACKER — POST-BEAT (2026-08-27 evening Chloe ruling) ----
+    // The tracker's ONLY job: parse the player's message + the AI's fresh
+    // beat and emit the state delta. Its window is exactly those two
+    // messages (WINDOW_TRACKER = 2 shape, rebuilt around the beat that just
+    // landed — a reroll/regenerate turn reads its action from the session's
+    // user tail since `text` is empty there). The local stack (turn lock →
+    // Fable lease → engine) is acquired HERE, held across the decode + the
+    // architects, and released before the commit tail — a concurrent Wupi
+    // chat turn ran freely during the whole API stream above.
+    let tracker_window: Vec<session::Message> = {
+        let user_text = if !text.trim().is_empty() {
+            text.clone()
+        } else {
+            let gs = state.fable_session.lock().await;
+            gs.messages
+                .iter()
+                .rev()
+                .find(|m| m.role == session::Role::User)
+                .map(|m| m.content.clone())
+                .unwrap_or_default()
+        };
+        let synth = |role: session::Role, content: String| session::Message {
+            id: String::new(),
+            role,
+            content,
+            reasoning: String::new(),
+            raw_output: String::new(),
+            timestamp: 0,
+            variants: Vec::new(),
+            raw_outputs: Vec::new(),
+            active_idx: 0,
+            base_schema: None,
+            variant_schemas: Vec::new(),
+            base_schema_ref: None,
+            variant_schema_refs: Vec::new(),
+            is_intro: false,
+        };
+        cap_assistant_prose(
+            vec![
+                synth(session::Role::User, user_text),
+                synth(session::Role::Assistant, parsed.prose.clone()),
+            ],
+            settings::TRACKER_ASSISTANT_CHAR_CAP,
+        )
+    };
+    let tracker_cancelled = {
+        let _tracker_model_guard = state.local_model_lock.lock().await;
+        let tracker_stack = match acquire_fable_engine_leased(&state, &app).await {
+            Ok(stack) => Some(stack),
+            Err(e) => {
+                // Acquire failure skips tracking (the beat commits
+                // un-tracked — the tracker-skip degradation, never a dropped
+                // beat; the next turn's tracker re-reads the beat from the
+                // exposure window if the state drifts).
+                tracing::warn!(error = %e, "fable_send: post-beat tracker stage skipped — Fable engine unavailable");
+                None
+            }
+        };
+        if let Some((_fable_lease, tracker_engine)) = tracker_stack {
+            let cancelled = apply_post_beat_tracking(
+                &state,
+                &on_event,
+                &tracker_engine,
+                &cancel,
+                &system_prompt,
+                &tracker_window,
+                &text,
+                &skills_before,
+                &mut turn_notices,
+                &mut turn_directives,
+                &mut tick_armed,
+            )
+            .await;
+            // Explicit drops BEFORE the turn lock releases (the uniform
+            // order in reverse): a queued chat/SD cycle waking on the turn
+            // lock must find no live engine Arc when the swap-lock's
+            // eviction teardown joins the fable thread.
+            drop(tracker_engine);
+            drop(_fable_lease);
+            cancelled
+        } else {
+            false
+        }
+    };
+    // (2026-08-27 evening) A stop that landed during the post-beat tracker
+    // decode takes the SAME full-revert contract as a stop during the API
+    // stream: the turn never happened — the beat is discarded, the schema
+    // (including any already-applied brackets) reverts, the buffered
+    // notices die, and `done{cancelled:true, final_text:""}` tells the
+    // frontend to drop the streamed prose it showed.
+    if tracker_cancelled || cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        tracing::info!("fable_send: post-beat tracker cancelled — reverting the turn");
+        restore_tick_directives(&state, &directives_at_turn_start).await;
+        *state.fable_schema.lock().await = if reroll {
+            base_schema_snapshot.clone()
+        } else {
+            pre_referee_schema.clone()
+        };
+        truncate_fable_history_to_depth(&state, history_depth_at_turn_start).await;
+        state
+            .pending_rest
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        if let Some(pa) = &player_action {
+            *state.pending_player_action.lock().await = Some(pa.clone());
+        }
+        if !regenerate && !reroll {
+            let mut gs = state.fable_session.lock().await;
+            if gs.messages.last().map(|m| m.role == session::Role::User).unwrap_or(false) {
+                gs.messages.pop();
+            }
+        }
+        on_event
+            .send(serde_json::json!({
+                "type": "done",
+                "final_text": "",
+                "reasoning": "",
+                "cancelled": true,
+            }))
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
     // Clear the cancel slot now that the turn is done — identity-checked
     // (#46): only our own token, never a newer overlapping turn's.
     // (2026-08-16 bug 9) This clear used to sit ABOVE the abort / dev-error /
@@ -20578,13 +20720,13 @@ async fn fable_send(
     }
 
     // Deferred world-progression tick (P0 fix): fire only NOW — after the
-    // `done` event, with this frame's engine Arc + Fable lease dropped. The
-    // schema lease acquire inside evicts the resident fable context; its
-    // teardown joins the engine thread via Arc::try_unwrap, which requires
-    // our clone gone (otherwise the context orphans in VRAM). Firing any
-    // earlier self-deadlocks the non-reentrant local-model turn lock.
-    drop(engine_opt);
-    drop(lease_opt);
+    // `done` event, with this frame's engine Arc + Fable lease + turn lock
+    // long dropped (the post-beat tracker stage released all three before
+    // the commit tail). The schema lease acquire inside evicts the resident
+    // fable context; its teardown joins the engine thread via
+    // Arc::try_unwrap, which requires our clone gone (otherwise the context
+    // orphans in VRAM). Firing any earlier self-deadlocks the non-reentrant
+    // local-model turn lock.
     if tick_armed {
         // (audit #4) The tick carries this turn's card identity + session
         // generation (bug 8) — it runs after the cancel slot is cleared, so
@@ -31481,12 +31623,13 @@ mod tests {
 
     /// (2026-08-19) The architect prompt carries the JSON contract + the
     /// full site brief (protocol-shaped: `<|turn>` open/close).
+    /// (2026-08-27 evening) TONE IS GONE — the brief has no tone field and
+    /// the prompt must never render one (the comedy-map-name engine).
     #[test]
     fn site_architect_prompt_carries_contract_and_brief() {
         let b = SiteBrief {
             node_id: "warren".into(),
             node_name: "The Rotting Warren".into(),
-            tone: "grim".into(),
             elapsed_days: 12,
             seeds: vec!["goblin warband moved in".into()],
             pressure: vec![],
@@ -31499,9 +31642,21 @@ mod tests {
         assert!(p.ends_with("<|turn>model\n"));
         assert!(p.contains("dungeon architect"));
         assert!(p.contains("RECIPROCAL"), "the reciprocity rule is load-bearing");
+        assert!(
+            p.contains("the plain common word for the space"),
+            "the positive name law rides the contract"
+        );
+        assert!(
+            !p.contains("Kitchen") && !p.contains("Guest Bathroom") && !p.contains("East Hallway"),
+            "the name law carries NO verbatim examples to copy (Prime Mandate anti-pattern #4)"
+        );
         assert!(p.contains("The Rotting Warren"));
         assert!(p.contains("goblin warband moved in"), "seeds ride the brief");
         assert!(p.contains("~12 day(s)"), "watermark age rides the brief");
+        assert!(
+            !p.to_lowercase().contains("tone"),
+            "the architect NEVER sees a tone line"
+        );
         assert!(
             !p.contains("DISTRICT scale"),
             "room-scale briefs carry no settlement law"

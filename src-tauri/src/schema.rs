@@ -2996,7 +2996,7 @@ impl WorldSchema {
     }
 
     pub fn render_for_prompt(&self) -> String {
-        self.render_for_prompt_with_beneath(false)
+        self.render_for_prompt_opts(false, true)
     }
 
     /// The exposure-gated variant (2026-08-19): passes the reveal flag down
@@ -3006,6 +3006,23 @@ impl WorldSchema {
     /// tail render; the tracker skeleton + every other consumer stay on the
     /// ungated `render_for_prompt`.
     pub fn render_for_prompt_with_beneath(&self, reveal_beneath: bool) -> String {
+        self.render_for_prompt_opts(reveal_beneath, true)
+    }
+
+    /// (2026-08-27 evening Chloe ruling) The LOCAL-tracker render: identical
+    /// to the standard render except the `tone:` line NEVER appears. Tone is
+    /// card/story flavor — it belongs to the API narrator's prose and to
+    /// nothing local. The tracker (and its architect sibling) is a state
+    /// ledger that parses the user's message + the AI's beat and emits a
+    /// state delta; feeding it the tone is how comedy-flavored map names
+    /// ("The Awkward Greeting Zone") got minted. This is the hard gate —
+    /// every local Fable prompt surface renders through here, never through
+    /// the tone-inclusive variants.
+    pub fn render_for_prompt_local(&self) -> String {
+        self.render_for_prompt_opts(false, false)
+    }
+
+    fn render_for_prompt_opts(&self, reveal_beneath: bool, include_tone: bool) -> String {
         let empty = self.summary.trim().is_empty()
             && self.recent_events.is_empty()
             && self.player_state.is_default()
@@ -3014,7 +3031,10 @@ impl WorldSchema {
             // (2026-08-23 audit fix) `tone` renders + `currency_label` wakes
             // the economy anchor — a schema whose ONLY live field is either
             // used to early-return empty here, suppressing both.
-            && !self.tone.as_deref().is_some_and(|s| !s.trim().is_empty())
+            // (2026-08-27 evening) A tone-suppressed render doesn't count the
+            // tone toward non-emptiness — the tracker variant of a
+            // tone-only schema is legitimately empty.
+            && (!include_tone || !self.tone.as_deref().is_some_and(|s| !s.trim().is_empty()))
             && self.currency_label.trim().is_empty()
             && !self.travel_graph.is_set()
             && self.rumors.is_empty()
@@ -3096,12 +3116,17 @@ impl WorldSchema {
         // weather — live world state the tracker owns, seeded from the card's
         // `<world>` sibling, not static prompt text (the card cache block
         // carries identity only). None → no line (dormant).
-        if let Some(tone) = self.tone.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            out.push_str("tone: ");
-            // (2026-08-24 review P2) flatten_inline — same gate as the other
-            // anchor lines (hand-edited saves).
-            out.push_str(&Self::flatten_inline(&tone.chars().take(120).collect::<String>()));
-            out.push('\n');
+        // (2026-08-27 evening Chloe ruling) GATED on `include_tone`: the
+        // local-tracker render (`render_for_prompt_local`) NEVER emits it —
+        // tone is narrator-only flavor, and it was the comedy-map-name engine.
+        if include_tone {
+            if let Some(tone) = self.tone.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                out.push_str("tone: ");
+                // (2026-08-24 review P2) flatten_inline — same gate as the other
+                // anchor lines (hand-edited saves).
+                out.push_str(&Self::flatten_inline(&tone.chars().take(120).collect::<String>()));
+                out.push('\n');
+            }
         }
         // (2026-08-22 living-world) The rested anchor's read — how long the
         // player has gone without genuine rest, + the fatigue band once it

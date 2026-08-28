@@ -77,14 +77,17 @@ pub const MAX_SITE_MAPS: usize = 24;
 pub const NODE_SEEDS_MAX: usize = 2;
 /// Char cap for one seed hook (the `clean_free_text` discipline).
 pub const SITE_SEED_CHAR_MAX: usize = 140;
-/// The architect decode's generation reserve (a full site JSON fits well
-/// under 1024 tokens; the sniper is the primary stop, this is the wall).
-/// (2026-08-24 Chloe sign-off, 512 → 1024: the v0.30.0 live test showed
-/// real settlement maps genuinely overflow 512 — every pass truncated at
-/// exactly the wall, failed, and the idempotence gate re-architected the
-/// same node EVERY turn (~41s/turn). The sniper still stops a well-formed
-/// map at its closing fence; the wall only bites unclosed rambles.)
-pub const SITE_ARCHITECT_MAX_TOKENS: i32 = 1024;
+/// The architect decode's generation reserve. **(2026-08-27 evening Chloe
+/// ruling, tone-diet + speed): 1024 → 384.** The 1024 wall (2026-08-24) paid
+/// for verbose maps with verbose names — the Liam's House round ran THREE
+/// full 1024-token passes (~26s each at ~40 tok/s), every one truncating
+/// mid-JSON, before standing down. The fix is upstream of the wall: the
+/// architect prompt lost the card's `tone` (the comedy-name engine) + gained
+/// the PLAIN-NAME law, and `normalize_generated` now repairs connection
+/// structure in Rust so a structurally sloppy map passes on decode 1. A
+/// terse 3-8-area map with 1-line geometry + plain names fits well under
+/// 384; the fence-aware sniper stops a well-formed map at its closing fence.
+pub const SITE_ARCHITECT_MAX_TOKENS: i32 = 384;
 /// Char cap for area/asset ids (kebab ids are short by construction).
 pub const SITE_ID_CHAR_MAX: usize = 64;
 /// (2026-08-22 living-world) Re-entry digest bounds — the "changed since
@@ -101,11 +104,15 @@ pub const DIGEST_LINE_CHARS: usize = 160;
 /// (Feature 4's dead-asset pruning: 5 dead bandits become 5 bodies).
 pub const DEAD_ASSET_COLLAPSE_MINUTES: i64 = 1440;
 /// (2026-08-22 multihog WS2) The JIT architect's CORRECTION passes after
-/// the initial generation (total runs = 1 + this). Raised from 1: a
-/// reciprocal-connection or reachability slip on pass 1 used to be the
-/// whole budget, and the site silently re-architected every turn instead
-/// of converging.
-pub const SITE_ARCHITECT_REPAIR_PASSES: u8 = 2;
+/// the initial generation (total runs = 1 + this). **Lowered 2 → 1 on
+/// 2026-08-27 (evening):** `normalize_generated` now mechanically repairs
+/// reciprocity, orphans, unknown targets, and over-cap counts in Rust
+/// BEFORE validation — the failure classes that used to burn the repair
+/// budget are structurally impossible now. The remaining repair case is a
+/// truncated JSON body (a token-wall hit), which the repair prompt answers
+/// with a smaller map. One correction pass = at most 2 decodes per round,
+/// ≤ ~19s worst case post-beat.
+pub const SITE_ARCHITECT_REPAIR_PASSES: u8 = 1;
 /// (2026-08-24 stall fix) After this many failed FULL rounds (each round =
 /// 1 + `SITE_ARCHITECT_REPAIR_PASSES` decodes), both architects stand down
 /// on that node — it stays deliberately map-less instead of re-burning the
@@ -1063,6 +1070,159 @@ pub fn validate(map: &SiteMap) -> Result<(), Vec<String>> {
     } else {
         Err(errs)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Mechanical repair of a freshly-generated map (2026-08-27 evening ruling)
+// ---------------------------------------------------------------------------
+
+/// Deterministic Rust-side repair of an architect emission, run BEFORE
+/// [`validate`] at the decode boundary. The 2026-08-27 Liam's House round
+/// burned all three passes (then stood the node down) on failures Rust can
+/// fix without the model: one-sided connections, state/detail disagreements
+/// between the two halves of a pair, orphaned areas, edges into unknown
+/// areas, and over-cap area/asset counts. The LLM draws the map; RUST owns
+/// the map's structure — a structurally sloppy drawing is normalized, never
+/// bounced back for a re-draw.
+///
+/// Determinism contract: the FIRST declaration of a connection (area order,
+/// then declaration order) is the truth; its mirror is created verbatim and
+/// a disagreeing reverse declaration is overwritten. An area left with no
+/// connections is opened onto the entrance (the model's own contract says
+/// every area is reachable — the rescue fabricates only the one edge that
+/// contract implies). Pure + unit-tested; no clock, no RNG.
+pub fn normalize_generated(map: &mut SiteMap) {
+    // 0. Entrance sanity: an unknown/missing entrance falls back to the
+    //    first area; the entrance is forced Visited and every OTHER Visited
+    //    area demotes to Unrevealed (a fresh map's knowledge starts at the
+    //    door — the validator's own law).
+    if !map.areas.iter().any(|a| a.id == map.entrance) {
+        if let Some(first) = map.areas.first() {
+            map.entrance = first.id.clone();
+        }
+    }
+    for a in map.areas.iter_mut() {
+        if a.id == map.entrance {
+            a.knowledge = AreaKnowledge::Visited;
+        } else if a.knowledge == AreaKnowledge::Visited {
+            a.knowledge = AreaKnowledge::Unrevealed;
+        }
+    }
+
+    // 1. Area cap: keep the entrance + the first others (MAX_SITE_AREAS).
+    if map.areas.len() > MAX_SITE_AREAS {
+        let entrance = map.entrance.clone();
+        let (entrance_areas, others): (Vec<SiteArea>, Vec<SiteArea>) = map
+            .areas
+            .drain(..)
+            .partition(|a| a.id == entrance);
+        let mut kept: Vec<SiteArea> = Vec::with_capacity(MAX_SITE_AREAS);
+        kept.extend(entrance_areas.into_iter());
+        kept.extend(others.into_iter().take(MAX_SITE_AREAS - kept.len()));
+        map.areas = kept;
+    }
+    let known: std::collections::HashSet<&str> =
+        map.areas.iter().map(|a| a.id.as_str()).collect();
+
+    // 2. Drop edges into unknown areas (targets removed by the cap, or ids
+    //    the model hallucinated).
+    for a in map.areas.iter_mut() {
+        a.connections.retain(|c| known.contains(c.to.as_str()));
+    }
+
+    // 3. Collect surviving declarations in deterministic order, first
+    //    declaration per unordered pair wins.
+    let mut decls: Vec<(String, String, ConnState, String)> = Vec::new();
+    let mut claimed: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    for a in map.areas.iter() {
+        for c in a.connections.iter() {
+            let fwd = (a.id.clone(), c.to.clone());
+            let rev = (c.to.clone(), a.id.clone());
+            if claimed.contains(&fwd) || claimed.contains(&rev) {
+                continue;
+            }
+            claimed.insert(fwd);
+            decls.push((a.id.clone(), c.to.clone(), c.state, c.detail.clone()));
+        }
+    }
+
+    // 4. Rebuild every area's connection list from the winning declarations
+    //    + their verbatim mirrors (reciprocity by construction), capped per
+    //    area (declared direction first). ATOMIC PAIRS: an edge is installed
+    //    only when BOTH halves fit their area's cap — dropping just the
+    //    mirror would mint exactly the one-sided edge the validator rejects,
+    //    so an over-connected hub loses whole edges instead.
+    let mut by_area: Vec<Vec<SiteConnection>> = vec![Vec::new(); map.areas.len()];
+    for (from, to, state, detail) in decls {
+        let Some(from_slot) = map.areas.iter().position(|a| a.id == from) else {
+            continue;
+        };
+        let Some(to_slot) = map.areas.iter().position(|a| a.id == to) else {
+            continue;
+        };
+        if from_slot == to_slot {
+            continue; // a self-loop is nonsense; drop it whole
+        }
+        if by_area[from_slot].len() >= MAX_SITE_CONNECTIONS_PER_AREA
+            || by_area[to_slot].len() >= MAX_SITE_CONNECTIONS_PER_AREA
+        {
+            continue;
+        }
+        by_area[from_slot].push(SiteConnection {
+            to: to.clone(),
+            state,
+            detail: detail.clone(),
+        });
+        by_area[to_slot].push(SiteConnection { to: from, state, detail });
+    }
+    for (a, conns) in map.areas.iter_mut().zip(by_area.into_iter()) {
+        a.connections = conns;
+    }
+
+    // 5. Orphan rescue: an area with no connections opens onto the entrance
+    //    (both directions, open). The rescue is ATOMIC — if the entrance has
+    //    no connection slot left, the orphan is REMOVED instead (a half-
+    //    rescue would mint exactly the one-sided edge the validator rejects).
+    let entrance = map.entrance.clone();
+    let orphans: Vec<String> = map
+        .areas
+        .iter()
+        .filter(|a| a.id != entrance && a.connections.is_empty())
+        .map(|a| a.id.clone())
+        .collect();
+    for orphan in orphans {
+        let entrance_has_room = map
+            .areas
+            .iter()
+            .find(|a| a.id == entrance)
+            .map(|e| {
+                e.connections.len() < MAX_SITE_CONNECTIONS_PER_AREA
+                    && !e.connections.iter().any(|c| c.to == orphan)
+            })
+            .unwrap_or(false);
+        if !entrance_has_room {
+            map.areas.retain(|a| a.id != orphan);
+            continue;
+        }
+        if let Some(a) = map.areas.iter_mut().find(|a| a.id == orphan) {
+            a.connections.push(SiteConnection {
+                to: entrance.clone(),
+                state: ConnState::Open,
+                detail: String::new(),
+            });
+        }
+        if let Some(e) = map.areas.iter_mut().find(|a| a.id == entrance) {
+            e.connections.push(SiteConnection {
+                to: orphan,
+                state: ConnState::Open,
+                detail: String::new(),
+            });
+        }
+    }
+
+    // 6. Assets: drop ones located in unknown areas, then cap the total.
+    map.assets.retain(|a| known.contains(a.location.as_str()));
+    map.assets.truncate(MAX_SITE_ASSETS);
 }
 
 // ---------------------------------------------------------------------------
@@ -3167,6 +3327,130 @@ mod tests {
     #[test]
     fn validate_accepts_demo_map() {
         assert_eq!(validate(&demo_map()), Ok(()), "demo map must validate");
+    }
+
+    // (2026-08-27 evening) The mechanical-repair contract: every structurally
+    // sloppy emission the 2026-08-27 Liam's House round burned three passes
+    // on is fixed by `normalize_generated` alone — the repair passes are for
+    // truncated JSON, not topology.
+
+    #[test]
+    fn normalize_repairs_one_sided_connection() {
+        let mut m = demo_map();
+        // hall declares gatehouse, but gatehouse's reverse edge is GONE.
+        if let Some(gatehouse) = m.areas.iter_mut().find(|a| a.id == "gatehouse") {
+            gatehouse.connections.clear();
+        }
+        normalize_generated(&mut m);
+        assert_eq!(validate(&m), Ok(()), "one-sided connection must be mirrored");
+    }
+
+    #[test]
+    fn normalize_repairs_state_detail_mismatch() {
+        let mut m = demo_map();
+        // vault's reverse declaration disagrees (open stairs vs the locked
+        // iron-bound door). The FIRST declaration (hall's, area order) wins.
+        if let Some(vault) = m.areas.iter_mut().find(|a| a.id == "vault") {
+            vault.connections[0].state = ConnState::Open;
+            vault.connections[0].detail = "open stairs".into();
+        }
+        normalize_generated(&mut m);
+        assert_eq!(validate(&m), Ok(()), "state/detail mismatch must be normalized");
+        let vault = m.areas.iter().find(|a| a.id == "vault").unwrap();
+        assert_eq!(vault.connections[0].state, ConnState::Locked);
+        assert_eq!(vault.connections[0].detail, "iron-bound door");
+    }
+
+    #[test]
+    fn normalize_rescues_orphan_onto_entrance() {
+        let mut m = demo_map();
+        m.areas.push(SiteArea {
+            id: "cellar".into(),
+            name: "Cellar".into(),
+            knowledge: AreaKnowledge::Unrevealed,
+            geometry: vec![],
+            connections: vec![], // orphan
+        });
+        normalize_generated(&mut m);
+        assert_eq!(validate(&m), Ok(()), "orphan must be opened onto the entrance");
+        let cellar = m.areas.iter().find(|a| a.id == "cellar").unwrap();
+        assert!(
+            cellar.connections.iter().any(|c| c.to == "gatehouse"),
+            "cellar must connect to the entrance"
+        );
+    }
+
+    #[test]
+    fn normalize_drops_unknown_edges_and_stray_assets() {
+        let mut m = demo_map();
+        if let Some(hall) = m.areas.iter_mut().find(|a| a.id == "hall") {
+            hall.connections.push(SiteConnection {
+                to: "nowhere".into(),
+                state: ConnState::Open,
+                detail: String::new(),
+            });
+        }
+        m.assets.push(SiteAsset {
+            id: "ghost".into(),
+            name: "Ghost".into(),
+            kind: AssetKind::Creature,
+            location: "nowhere".into(),
+            state: AssetState::Active,
+            knowledge: AssetKnowledge::Unrevealed,
+            count: 0,
+            detail: String::new(),
+            tier: None,
+            origin: AssetOrigin::InitialMap,
+            changed_at_minutes: 0,
+            cause: String::new(),
+            actor: String::new(),
+            expires_at_minutes: None,
+        });
+        normalize_generated(&mut m);
+        assert_eq!(validate(&m), Ok(()));
+        assert!(m.assets.iter().all(|a| a.id != "ghost"), "asset in unknown area drops");
+    }
+
+    #[test]
+    fn normalize_fixes_entrance_and_demotes_extra_visited() {
+        let mut m = demo_map();
+        m.entrance = "does-not-exist".into();
+        if let Some(hall) = m.areas.iter_mut().find(|a| a.id == "hall") {
+            hall.knowledge = AreaKnowledge::Visited; // a second visited area
+        }
+        normalize_generated(&mut m);
+        // Fallback entrance = the first area; every other area demotes.
+        assert_eq!(m.entrance, "gatehouse");
+        let hall = m.areas.iter().find(|a| a.id == "hall").unwrap();
+        assert_eq!(hall.knowledge, AreaKnowledge::Unrevealed);
+        assert_eq!(validate(&m), Ok(()));
+    }
+
+    #[test]
+    fn normalize_caps_areas_keeping_entrance() {
+        let mut m = demo_map();
+        for i in 0..10 {
+            let id = format!("extra-{i}");
+            m.areas.push(SiteArea {
+                id: id.clone(),
+                name: format!("Extra {i}"),
+                knowledge: AreaKnowledge::Unrevealed,
+                geometry: vec![],
+                connections: vec![SiteConnection {
+                    to: "gatehouse".into(),
+                    state: ConnState::Open,
+                    detail: String::new(),
+                }],
+            });
+        }
+        normalize_generated(&mut m);
+        assert!(m.areas.len() <= MAX_SITE_AREAS, "area cap enforced");
+        assert!(
+            m.areas.iter().any(|a| a.id == "gatehouse"),
+            "entrance survives the cap"
+        );
+        // Unknown-area edge sweep AFTER the cap must leave no dangling refs.
+        assert_eq!(validate(&m), Ok(()));
     }
 
     #[test]

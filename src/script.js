@@ -844,6 +844,16 @@ function spawnLaunchSparkles(parent, count = 18) {
   // through). The overlay's CSS fade-in (0.8s) gives a soft reveal.
   overlay.classList.add('show');
 
+  // First-run runs with the main window still hidden (Rust builds it
+  // .visible(false) — see lib.rs setup). Reveal it only once the overlay has
+  // actually composited a frame (double rAF), so the first VISIBLE frame is
+  // the overlay fade-in — never the WebView2 pre-paint native surface (white
+  // flash / caption strip). The 5s Rust-side fallback show backstops a
+  // failed/rejected call.
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    invoke('fable_reveal_window').catch(() => { /* non-fatal */ });
+  }));
+
   // Size hint for the idle subtitle, derived from WHAT is missing: a fresh
   // install pulls everything (~12 GB); a 0.21 → 0.22 update already has both
   // GGUFs and only fetches the PRISM SD set (~6 GB). Honest copy either way.
@@ -1061,6 +1071,10 @@ function spawnLaunchSparkles(parent, count = 18) {
     document.getElementById('boot-loading')?.remove();
     document.body.classList.remove('booting', 'loading');
     bootDone = true;
+    // Dev preview bails before any paw/download reveal path — reveal here so a
+    // Tauri-hosted preview doesn't strand on the hidden window (lib.rs builds
+    // it .visible(false)); rejects harmlessly when previewed in a browser.
+    invoke('fable_reveal_window').catch(() => { /* browser preview: no-op */ });
     return;
   }
 
@@ -1453,6 +1467,19 @@ function spawnLaunchSparkles(parent, count = 18) {
   //    hops; #boot-paw's translate/scale are reserved for the entry darts +
   //    the later flight.
   function startEntryAndHops() {
+    // Reveal the (hidden) main window FIRST — above the paw guard below, so
+    // EVERY path through here shows the window. Rust builds it .visible(false)
+    // (lib.rs setup): the WebView2 native surface renders opaque-white (and
+    // can carry a momentary caption strip) for its pre-paint frames, worst
+    // when Alt+Tab forces DWM to recompose the unpainted intro window. At this
+    // moment the composited frame is the transparent boot body over the
+    // desktop, so the first VISIBLE frame is the paw's world — never the
+    // native surface. (fable_reveal_window is the SHARED reveal IPC — show() +
+    // set_focus on "main", idempotent; the name is historical, the fable entry
+    // splash was its first caller. A 5s Rust-side fallback show backstops us.)
+    invoke('fable_reveal_window').catch((e) =>
+      console.warn('[Wupi] boot: fable_reveal_window failed', e),
+    );
     if (!bootPaw || !bootPawImg) { hopsDone = true; maybeFly(); return; }
 
     // Reveal the paw. CSS defaults it to opacity:0 (avoids a top-left flash

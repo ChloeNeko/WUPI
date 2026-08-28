@@ -1,7 +1,9 @@
 //! Windows-only boot preflight, shared by BOTH launcher binaries
 //! (`wupi.exe` via `src/main.rs` and `fable.exe` via `src/bin/fable.rs`).
 //!
-//! Two steps, both MUST run before `wupi_lib::run()` initializes anything:
+//! Three steps, all MUST run before `wupi_lib::run()` initializes anything:
+//!   0. Explicit process AppUserModelID — anchors the Windows shell's app
+//!      identity (taskbar grouping, Alt-Tab/Task-View attribution) to WUPI.
 //!   1. `<exe_dir>\bin` DLL search-directory hook — the portable layout keeps
 //!      all CUDA/VC++ runtime DLLs in a sibling `bin/`; `SetDllDirectoryW`
 //!      adds it to the loader path so the /DELAYLOAD + LoadLibrary paths
@@ -14,10 +16,39 @@
 //! identical preflight (it loads the same CUDA DLLs + shares the same WebView2
 //! identifier `com.wupi.desktop`). No-op on non-Windows.
 
-/// Run the Windows boot preflight (DLL hook + WebView2 cache bust). Called by
-/// every launcher binary's `main()` before `wupi_lib::run()`.
+/// Run the Windows boot preflight (AUMID + DLL hook + WebView2 cache bust).
+/// Called by every launcher binary's `main()` before `wupi_lib::run()`.
 #[cfg(windows)]
 pub fn windows_preflight() {
+    // ── 0. Explicit process AppUserModelID ─────────────────────────────
+    // With no explicit AUMID, Windows derives the app identity from the
+    // process — and while the main window is still unpainted (its surface
+    // owned by the WebView2 child), that derivation can attribute the
+    // Alt-Tab/Task-View entry to the WebView2 RUNTIME ("Microsoft Edge
+    // WebView2" + Edge logo) instead of wupi.exe/fable.exe (2026-08-27
+    // report). Setting it explicitly anchors the identity to WUPI; the live
+    // window set_icon (lib.rs setup) carries the logo. Must run before any
+    // window + before the tray icon exist — this preflight is the only
+    // guaranteed-before-run() slot. Same identifier as tauri.conf.json.
+    {
+        // SAFETY: SetCurrentProcessExplicitAppUserModelID is a shell32
+        // function exported since Win7. Its only side effect is setting the
+        // process-wide AUMID string; a NUL-terminated wide string is the
+        // documented contract. Failure is non-fatal (return ignored).
+        use std::os::windows::ffi::OsStrExt;
+        let app_id: Vec<u16> = std::ffi::OsStr::new("com.wupi.desktop")
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            #[link(name = "shell32")]
+            extern "system" {
+                fn SetCurrentProcessExplicitAppUserModelID(appuserid: *const u16) -> i32;
+            }
+            let _ = SetCurrentProcessExplicitAppUserModelID(app_id.as_ptr());
+        }
+    }
+
     // ── 1. DLL search-directory hook ───────────────────────────────────
     // As of v0.3.7 the portable layout moved ALL shipped runtime DLLs (CUDA
     // cublas/cudart/etc. + VC++ msvcp140/vcomp140) into a sibling `bin/`

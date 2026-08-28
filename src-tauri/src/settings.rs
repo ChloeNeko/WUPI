@@ -103,29 +103,39 @@ pub const CTX_API: u32 = 16384;
 pub const CTX_LOCAL_WITH_API: u32 = 8192;
 
 /// Fable engine context (the tracker pass). **2026-08-08: 3072. 2026-08-21
-/// Chloe ruling: 8192 (E4B; same-day interims at 4096). 2026-08-27 Chloe
-/// ruling: 8704** — the tracker decode wall rose 512→1024 (fable_engine.rs,
-/// same directive), and the DERIVED prompt budget
-/// `(CTX_FABLE − TRACKER_MAX_TOKENS) × 3.6` must stay ≥ the pinned 26.3k
-/// worst-case composition: at 8192 the 1024 wall would have cut it to
-/// ~25.8k — UNDER the pin, breaking the NO-DEGRADE contract. 8704 restores
-/// the budget to EXACTLY its long-standing 27,648 ((8704 − 1024) × 3.6).
+/// Chloe ruling: 8192 (E4B; same-day interims at 4096). 2026-08-27 morning:
+/// briefly 8704 — the ONLY reason it existed was to pay for the
+/// same-ruling 1024-token tracker wall; with that wall gone the context
+/// had no pressure of its own. 2026-08-27 EVENING FINAL ruling: back to
+/// 8192, and 8192 is the PERMANENT MAX — the fable context is never raised
+/// above it again. The arithmetic closes exactly: tracker wall 512 +
+/// retrack wall 512 → derived budget (8192 − 512) × 3.6 = **27,648 chars**,
+/// the long-standing pin, ≥ the 26.3k worst-case composition with the same
+/// ~1.35k margin the 8192 era always carried. (For the record — why the
+/// limit was ever "remotely hit": the tracker's EMISSION never touched it.
+/// A bracket set is ~100 tokens. What fills the context is the PROMPT —
+/// fixed teaching ~7.6k chars + the WS_BUDGET 18k lean world-state + the
+/// capped window ≈ 26.3k chars ≈ 7.3k tokens at 3.6 chars/token — a
+/// composition only a maxed-world campaign approaches; the observed live
+/// prompt of the 2026-08-27 session was 3,723 tokens, 45% of budget. If
+/// the pin ever strains again the fix is a smaller prompt, never a bigger
+/// context.)
 /// This retires the "exactly half the API narrator's 16384" parity law —
 /// the fable context is now sized by the tracker's generation reserve, not
-/// the API's budget. KV cost: ~+10 MiB Q8_0 over 8192 (sublinear — the
-/// E4B's 512-token SWA layers don't grow; read the exact MiB off the boot
-/// telemetry). The local
+/// the API's budget. KV cost at 8192: ~187 MiB Q8_0 worst-case linear
+/// (sublinear in practice — the E4B's 512-token SWA layers don't grow; read
+/// the exact MiB off the boot telemetry). The local
 /// model's Fable role is TRACKING ONLY (bracket commands + schema state) —
 /// the API narrates. The tracker window is 2 messages (1 turn) — it relies
 /// on the schema delta + Rust state, not re-read history. 8192 + the raised
 /// world-state visibility caps (STAGE0 + WS_BUDGET, lib.rs) were one ruling:
 /// track MORE stuff, and extremely long roleplays must never approach the
 /// ceiling — the worst realistic composition (fixed teaching ~7.6k + WS
-/// ≤17k + maxed window) lands ~90% of the derived budget, and a REAL
+/// ≤17k + maxed window) lands ~95% of the derived budget, and a REAL
 /// campaign world state (~1-3k) never approaches it.
 /// `TRACKER_PROMPT_CHAR_BUDGET` is DERIVED from this (see
 /// below): raising this constant automatically raises the budget.
-pub const CTX_FABLE: u32 = 8704;
+pub const CTX_FABLE: u32 = 8192;
 
 /// Schema-delta engine context. The micro-delta pass only needs system
 /// instruction + current schema JSON + one exchange (see schema_engine.rs).
@@ -398,9 +408,10 @@ pub const TRACKER_PROMPT_CHAR_BUDGET: usize = ((CTX_FABLE as f32
 /// (2026-08-22 re-track hardening) The SAME derivation as
 /// [`TRACKER_PROMPT_CHAR_BUDGET`], but for the edit/reroll RE-TRACK pass
 /// (`FableTurnMode::TrackerRetrack`): CTX_FABLE − TRACKER_RETRACK_MAX_TOKENS
-/// (512) × chars-per-token. The re-track's generation wall is DOUBLE the
-/// live turn's (a re-track re-emits a full beat's bracket set), so its
-/// prompt budget is correspondingly TIGHTER — the pair must move together
+/// (512) × chars-per-token. The re-track re-emits a full beat's bracket
+/// set, so its wall sits ABOVE the live turn's 384 (2026-08-27 evening
+/// decoupling — the edit path isn't beat-blocking) and its prompt budget
+/// is correspondingly TIGHTER — the pair must move together
 /// or the engine's over-budget REFUSAL fires on a prompt the lib.rs guard
 /// just blessed.
 pub const TRACKER_RETRACK_PROMPT_CHAR_BUDGET: usize = ((CTX_FABLE as f32
