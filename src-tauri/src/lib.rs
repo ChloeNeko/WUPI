@@ -1065,7 +1065,7 @@ pub fn run() {
             // key for Memory once cards own their partition; today Memory
             // stays on the Wupi sentinel namespace.
             let card = match resolve_wupi_sim_path(app.handle()) {
-                Some(path) => sim_card::load_or_fallback(&path),
+                Some(path) => sim_card::load_or_fallback_cached(&path),
                 None => {
                     tracing::warn!(
                         "no data/wupi.sim found; using minimal fallback persona \
@@ -5506,7 +5506,7 @@ async fn run_agent_loop(
         )
         .await?;
 
-        let calls = tools::parse_tool_calls(&result.raw);
+        let mut calls = tools::parse_tool_calls(&result.raw);
         if calls.is_empty() {
             // No tool calls this round → in non-hybrid mode the model
             // produced the final reply. In hybrid mode this decode was the
@@ -5516,6 +5516,15 @@ async fn run_agent_loop(
                 return Ok((chat_format::ParsedOutput::empty(), tools_fired, transcript));
             }
             return Ok((result, tools_fired, transcript));
+        }
+
+        // (2026-08-29 module A2) Normalize every call's `path` arg against the
+        // install root BEFORE validation/execution: the model habitually emits
+        // absolute Windows paths (with wrapping quotes), which the allowlist
+        // would default-deny as "not a writable tree" — the repair loop then
+        // spun blind because the error never named the wanted shape.
+        for call in &mut calls {
+            tools::normalize_path_args(&mut call.args, &ctx.install_root);
         }
 
         // We have tool calls. Commit the assistant's tool-call turn first
@@ -5606,7 +5615,27 @@ async fn run_agent_loop(
                                     }
                                 }
                             }
-                            Err(e) => (false, format!("invalid args: {e}")),
+                            Err(e) => {
+                                // (2026-08-29 module A3) When the args arrived
+                                // via the `{"raw": ...}` carrier (both parse
+                                // stages failed), name that fact + a short
+                                // excerpt — the model's retry (and the hybrid
+                                // API's paraphrase of the transcript) stops
+                                // being a blind "formatting issue" and can
+                                // re-emit valid JSON.
+                                let raw_note = call
+                                    .args
+                                    .get("raw")
+                                    .and_then(|v| v.as_str())
+                                    .map(|raw| {
+                                        let excerpt: String = raw.chars().take(120).collect();
+                                        format!(
+                                            " (arguments were not valid JSON; emitted: {excerpt:?})"
+                                        )
+                                    })
+                                    .unwrap_or_default();
+                                (false, format!("invalid args: {e}{raw_note}"))
+                            }
                         },
                         None => {
                             // (2026-08-24) Near-name hint so the repair loop
@@ -7273,6 +7302,12 @@ async fn apply_phase3_bracket_commands(
                         suitability = %suitability,
                         "[TASK] unparseable difficulty/suitability — dropping"
                     );
+                    // (2026-08-29 module B5) Coach through the emit-errors
+                    // channel — the silent drop left the tracker re-emitting
+                    // the same invented difficulty word every turn.
+                    reject_directives.push(format!(
+                        "Task not queued — difficulty/suitability must be the taught values (difficulty: trivial|routine|challenging|hard|near-impossible; suitability: hopeless|poor|adequate|well-suited|ideal). Got difficulty={difficulty:?}, suitability={suitability:?}."
+                    ));
                     continue;
                 };
                 // (P3 fix) Dedup + cap — mirrors the [RUMOR] treatment: a
@@ -7944,7 +7979,9 @@ async fn apply_phase3_bracket_commands(
                     // model needs the specific guidance).
                     if !s.site_maps.contains_key(&active_key) {
                         reject_directives.push(
-                            "No hidden site map exists at this location — [ROOM] cannot apply here."
+                            "No hidden site map exists at this location — [ROOM] cannot apply here. \
+                             An interior map generates on ARRIVAL: move with [TRAVEL <place>] (or \
+                             mint a new place with [DISCOVER]) and the site architect maps it."
                                 .to_string(),
                         );
                         continue;
@@ -8297,7 +8334,9 @@ async fn apply_phase3_bracket_commands(
                 let plan = {
                     let Some(map_ref) = s.site_maps.get(&active_key) else {
                         reject_directives.push(
-                            "No hidden site map exists at this location — [ASSET] cannot apply here."
+                            "No hidden site map exists at this location — [ASSET] cannot apply here. \
+                             An interior map generates on ARRIVAL: move with [TRAVEL <place>] (or \
+                             mint a new place with [DISCOVER]) and the site architect maps it."
                                 .to_string(),
                         );
                         continue;
@@ -9425,6 +9464,13 @@ async fn apply_phase3_bracket_commands(
                             reject_directives.push(format!(
                                 "Presence not recorded — \"{npc_id}\" is the player's own name. The player is never an NPC; never register or assert them."
                             ));
+                            // (2026-08-29 module C1) The known-id arm logs this
+                            // reject; the unknown-surface arm was invisible in
+                            // forensics — same wording, same level.
+                            tracing::debug!(
+                                npc_id = %npc_id,
+                                "[PRESENCE] rejected — player-name match on an unknown surface"
+                            );
                         } else if narrative_grounded(&narrative_corpus, npc_id, npc_id, npc_id) {
                             // (2026-08-22 Chloe ruling — auto-registration)
                             // The window NAMES this NPC (grounded) but the
@@ -9738,6 +9784,9 @@ async fn apply_phase3_bracket_commands(
         // `+Ledger`/`-Ledger` pair on one rack canceled the acquisition);
         // the removal is skipped so the add survives.
         let mut npc_item_adds: Vec<(String, String)> = Vec::new();
+        // (2026-08-29 module B3) The same-pass oscillation ledger — APPLIED
+        // add/remove flips per (owner, name); 2 flips freezes the pair.
+        let mut item_flips = ItemFlipLedger::default();
         for cmd in &equip_cmds {
             if let bracket_parser::BracketCommand::Equip {
                 slot,
@@ -10000,6 +10049,11 @@ async fn apply_phase3_bracket_commands(
                     );
                 }
                 let item_name: &str = belt_resolved.as_deref().unwrap_or(item_name);
+                // (2026-08-29 module B3) Frozen oscillating pair: skip.
+                if item_flips.is_frozen("player", item_name) {
+                    tracing::debug!(name = %item_name, "[BELT] skipped — pair frozen after repeated add/remove flips");
+                    continue;
+                }
                 let pre_list = s.player_state.belt.clone();
                 let pre_schema = s.clone();
                 if *remove {
@@ -10017,6 +10071,9 @@ async fn apply_phase3_bracket_commands(
                     }
                     let existed = equipment::stack_remove(&mut s.player_state.belt, item_name, 0);
                     if existed {
+                        if item_flips.record("player", item_name, false) {
+                            reject_directives.push(item_flip_teachback(item_name));
+                        }
                         untrack_player_item_add(&mut player_item_adds, item_name);
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
@@ -10132,6 +10189,9 @@ async fn apply_phase3_bracket_commands(
                         s.push_event(capped);
                     }
                     track_player_item_add(&mut player_item_adds, item_name);
+                    if item_flips.record("player", item_name, true) {
+                        reject_directives.push(item_flip_teachback(item_name));
+                    }
                     if s.player_state.belt != pre_list {
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
@@ -10190,6 +10250,11 @@ async fn apply_phase3_bracket_commands(
                     );
                 }
                 let item_name: &str = pack_resolved.as_deref().unwrap_or(item_name);
+                // (2026-08-29 module B3) Frozen oscillating pair: skip.
+                if item_flips.is_frozen("player", item_name) {
+                    tracing::debug!(name = %item_name, "[PACK] skipped — pair frozen after repeated add/remove flips");
+                    continue;
+                }
                 // (2026-08-23 pouch ruling) The stash target: wallet cargo
                 // lives in the POUCH, everything else the pack. The
                 // pre-mutation snapshot follows the target so the change gate
@@ -10224,6 +10289,9 @@ async fn apply_phase3_bracket_commands(
                         ""
                     };
                     if !removed_from.is_empty() {
+                        if item_flips.record("player", item_name, false) {
+                            reject_directives.push(item_flip_teachback(item_name));
+                        }
                         untrack_player_item_add(&mut player_item_adds, item_name);
                         undo_snapshot.get_or_insert(pre_schema);
                         mutated = true;
@@ -10245,6 +10313,9 @@ async fn apply_phase3_bracket_commands(
                             "[PACK] skipped — same-turn echo of an applied add"
                         );
                         continue;
+                    }
+                    if item_flips.record("player", item_name, true) {
+                        reject_directives.push(item_flip_teachback(item_name));
                     }
                     // (2026-08-19 clothes-on-person fix, Chloe ruling: the
                     // system KNOWS where things belong — no UI affordance) A
@@ -10500,13 +10571,14 @@ async fn apply_phase3_bracket_commands(
                             &stash_names,
                         );
                         let item_name: &str = resolved.as_deref().unwrap_or(item_name);
+                        // (2026-08-29 module B3) Frozen oscillating pair: skip.
+                        if item_flips.is_frozen("player", item_name) {
+                            tracing::debug!(name = %item_name, "[NPC_ITEM player] skipped — pair frozen after repeated add/remove flips");
+                            continue;
+                        }
                         let pre_schema = s.clone();
-                        let fits_pouch = equipment::pouch_fit(item_name);
-                        let pre_list = if fits_pouch {
-                            s.player_state.pouch.clone()
-                        } else {
-                            s.player_state.pack.clone()
-                        };
+                        let pre_pack = s.player_state.pack.clone();
+                        let pre_pouch = s.player_state.pouch.clone();
                         if *remove {
                             // (2026-08-27 playtest C5) Same-pass churn guard
                             // (the BELT/PACK branch twin).
@@ -10526,6 +10598,9 @@ async fn apply_phase3_bracket_commands(
                                 ""
                             };
                             if !removed_from.is_empty() {
+                                if item_flips.record("player", item_name, false) {
+                                    reject_directives.push(item_flip_teachback(item_name));
+                                }
                                 untrack_player_item_add(&mut player_item_adds, item_name);
                                 undo_snapshot.get_or_insert(pre_schema);
                                 mutated = true;
@@ -10557,28 +10632,50 @@ async fn apply_phase3_bracket_commands(
                                 );
                                 continue;
                             }
+                            if item_flips.record("player", item_name, true) {
+                                reject_directives.push(item_flip_teachback(item_name));
+                            }
                             let ps = &mut s.player_state;
-                            let (stash, stash_label) = equipment::stash_target(
-                                item_name,
-                                &mut ps.pouch,
-                                &mut ps.pack,
-                            );
-                            equipment::stack_upsert(
-                                stash,
-                                equipment::StackItem {
-                                    name: item_name.to_string(),
-                                    qty: *qty,
-                                    weight: 1.0,
-                                    stats: None,
-                                    tags: item_tags.clone(),
-                                },
-                            );
-                            let now_list: &Vec<equipment::StackItem> = if fits_pouch {
-                                &s.player_state.pouch
-                            } else {
-                                &s.player_state.pack
+                            // (2026-08-29 module B1) RESTATE, never stack — the
+                            // NPC-rack echo law mirrored onto the player stash:
+                            // a re-add of a name a stash already holds is the
+                            // tracker reading its own rack lines back (the
+                            // 2026-08-29 log forensics: a re-inventory through
+                            // `[NPC_ITEM player +…]` summed the whole kit every
+                            // pass — three rounds of duplication across
+                            // seed/re-track/resume). An echo with an explicit
+                            // qty asserts the NEW TOTAL (self-healing
+                            // over-counts); a qty-less echo keeps the stored
+                            // count. First acquisitions still upsert through
+                            // the stash router.
+                            let key = item_name.trim().to_lowercase();
+                            let held_in_pack =
+                                ps.pack.iter().any(|i| i.name.trim().to_lowercase() == key);
+                            let held_in_pouch =
+                                ps.pouch.iter().any(|i| i.name.trim().to_lowercase() == key);
+                            let incoming = equipment::StackItem {
+                                name: item_name.to_string(),
+                                qty: *qty,
+                                weight: 1.0,
+                                stats: None,
+                                tags: item_tags.clone(),
                             };
-                            if now_list != &pre_list {
+                            let stash_label: &'static str = if held_in_pack {
+                                equipment::stack_restate(&mut ps.pack, incoming, *qty_given);
+                                "pack"
+                            } else if held_in_pouch {
+                                equipment::stack_restate(&mut ps.pouch, incoming, *qty_given);
+                                "pouch"
+                            } else {
+                                let (stash, label) = equipment::stash_target(
+                                    item_name,
+                                    &mut ps.pouch,
+                                    &mut ps.pack,
+                                );
+                                equipment::stack_upsert(stash, incoming);
+                                label
+                            };
+                            if s.player_state.pack != pre_pack || s.player_state.pouch != pre_pouch {
                                 undo_snapshot.get_or_insert(pre_schema);
                                 mutated = true;
                                 track_player_item_add(&mut player_item_adds, item_name);
@@ -10639,6 +10736,11 @@ async fn apply_phase3_bracket_commands(
                 let resolved =
                     equipment::resolve_item_fragment(item_name, item_corpus, &npc_names);
                 let item_name: &str = resolved.as_deref().unwrap_or(item_name);
+                // (2026-08-29 module B3) Frozen oscillating pair: skip.
+                if item_flips.is_frozen(&id, item_name) {
+                    tracing::debug!(npc_id = %id, name = %item_name, "[NPC_ITEM] skipped — pair frozen after repeated add/remove flips");
+                    continue;
+                }
                 // (2026-08-22 playtest, Chloe directive) Two mirror guards on
                 // ADDS — the playtest's tracker hallucination classes:
                 // (a) PEOPLE AS ITEMS ("[NPC_ITEM wevlan +Ferenc Illes]" —
@@ -10758,6 +10860,9 @@ async fn apply_phase3_bracket_commands(
                     }
                     if existed {
                         changed = true;
+                        if item_flips.record(&id, item_name, false) {
+                            reject_directives.push(item_flip_teachback(item_name));
+                        }
                         tracing::info!(npc_id = %id, name = %item_name, "[NPC_ITEM] removed");
                     }
                 } else {
@@ -10797,6 +10902,12 @@ async fn apply_phase3_bracket_commands(
                         stats: None,
                         tags: item_tags.clone(),
                     };
+                    // (2026-08-29 module B3) The emission is applying — count
+                    // the flip BEFORE the rack writes (echo/restate no-ops
+                    // still count: the DIRECTION is what oscillates).
+                    if item_flips.record(&id, item_name, true) {
+                        reject_directives.push(item_flip_teachback(item_name));
+                    }
                     if is_echo {
                         if equipment::stack_restate(target, incoming, *qty_given) {
                             tracing::debug!(
@@ -11084,6 +11195,10 @@ fn item_name_looks_like_person(item_name: &str) -> bool {
     const PERSON_NOUNS: &[&str] = &[
         "figure", "man", "woman", "boy", "girl", "child", "lad", "lass",
         "maiden", "captive", "prisoner", "stranger",
+        // (2026-08-29 module B4c) Rank/title words — the same guard class:
+        // an item name ending in a rank is a PERSON addressed by title
+        // ("the old Colonel", "her captain"), never an object.
+        "colonel", "captain", "sir", "mister", "madam",
     ];
     let key = item_name.trim().to_lowercase();
     if key.is_empty() {
@@ -11127,6 +11242,72 @@ fn player_item_added_this_turn(tracked: &[String], name: &str) -> bool {
 fn untrack_player_item_add(tracked: &mut Vec<String>, name: &str) {
     let key = name.trim().to_lowercase();
     tracked.retain(|n| *n != key);
+}
+
+/// (2026-08-29 module B3) Same-pass item OSCILLATION ledger — per
+/// `(owner, name)` pair, counts APPLIED add↔remove direction flips. The C5
+/// churn guards above link a removal to a LATER same-rack add; what escaped
+/// them was the free-running `+X -X +X -X …` run (the 2026-08-29 Abba
+/// incident: an oscillating pair ran to the 512-token wall, and when the
+/// emission ended remove-first the final removal APPLIED with its re-add
+/// truncated — the uniform vanished right before a manual save). Past the
+/// 2nd flip the pair is FROZEN for the rest of the pass (every further op
+/// skips) and ONE teach-back line rides the reject channel. Covers every
+/// ±item verb (BELT/PACK/NPC_ITEM incl. the player-routing arm), so
+/// cross-rack and cross-owner ping-pongs link too.
+#[derive(Default)]
+struct ItemFlipLedger {
+    /// (owner, name-lower) → (last_op_was_add, flips, frozen)
+    entries: std::collections::HashMap<(String, String), (bool, u32, bool)>,
+}
+
+impl ItemFlipLedger {
+    fn key(owner: &str, name: &str) -> (String, String) {
+        (owner.trim().to_lowercase(), name.trim().to_lowercase())
+    }
+
+    /// Is this pair already frozen for the rest of the pass?
+    fn is_frozen(&self, owner: &str, name: &str) -> bool {
+        self.entries
+            .get(&Self::key(owner, name))
+            .map(|(_, _, frozen)| *frozen)
+            .unwrap_or(false)
+    }
+
+    /// Record an APPLIED (non-skipped) op. Returns `true` when THIS op was
+    /// the 2nd flip — the caller pushes the teach-back once and skips every
+    /// further op on the pair.
+    fn record(&mut self, owner: &str, name: &str, add: bool) -> bool {
+        let key = Self::key(owner, name);
+        match self.entries.get_mut(&key) {
+            None => {
+                self.entries.insert(key, (add, 0, false));
+                false
+            }
+            Some((last_add, flips, frozen)) => {
+                if *frozen {
+                    return true;
+                }
+                if *last_add != add {
+                    *last_add = add;
+                    *flips += 1;
+                    if *flips >= 2 {
+                        *frozen = true;
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+}
+
+/// The one teach-back line the freeze pushes through the reject channel
+/// (→ `tracker_emit_errors`, the tracker's next-turn teaching).
+fn item_flip_teachback(name: &str) -> String {
+    format!(
+        "Item change for \"{name}\" skipped — the same item flipped add/remove repeatedly in one emission. Emit each item change once; a transfer is one removal + one add, never a loop."
+    )
 }
 
 /// (2026-08-22 Chloe ruling — auto-registration) The stub a GROUNDED but
@@ -14447,7 +14628,7 @@ fn fable_cards_list(app: tauri::AppHandle) -> Result<Vec<FableCardMeta>, String>
     };
     let mut out = Vec::new();
     for path in iter_card_sim_paths(&dir) {
-        let card = sim_card::load_or_fallback(&path);
+        let card = sim_card::load_or_fallback_cached(&path);
         // Skip fallback stubs (a malformed file produced the fallback). The
         // id sentinel is the signal: see sim_card::FALLBACK_ID.
         if card.id == "__wupi_fallback__" {
@@ -14818,7 +14999,7 @@ async fn fable_write_card(
         if old_stem.is_empty() {
             return None;
         }
-        let card = sim_card::load_or_fallback(&old.join(format!("{old_stem}.sim")));
+        let card = sim_card::load_or_fallback_cached(&old.join(format!("{old_stem}.sim")));
         (card.id != "__wupi_fallback__").then_some(card.name)
     });
     let rename_moves_folder = old_card_name
@@ -14854,7 +15035,7 @@ async fn fable_write_card(
     //    existing card — same guarantee the schema/session saves have.
     std::fs::create_dir_all(&card_dir).map_err(|e| format!("mkdir card folder: {e}"))?;
     write_atomic(&path, xml.as_bytes()).map_err(|e| format!("write card: {e}"))?;
-    let reloaded = sim_card::load_or_fallback(&path);
+    let reloaded = sim_card::load_or_fallback_cached(&path);
     if reloaded.id == "__wupi_fallback__" {
         // The write succeeded but the re-read produced the fallback stub —
         // the card is malformed in a way the in-memory parse missed (shouldn't
@@ -15209,6 +15390,47 @@ fn seed_properties_into(
 /// finally stores the authoritative `active_player_id` (Some or None — never
 /// a stale prior id).
 #[allow(clippy::too_many_arguments)]
+/// (2026-08-29 module F2, Chloe-approved) The authored-kit clamp: rack
+/// entries whose names appear in the bound SavedPlayer's `<inventory>`
+/// starting kit reset to the authored quantity (1 — the `.player` format is
+/// name-only). Heals the tracker re-inventory duplication class (three
+/// rounds of kit-stacking across seed/re-track/resume in the friend logs);
+/// legitimately looted NON-kit stacks are untouched. Idempotent — running
+/// on every re-attach converges to the same state; INFO only on real
+/// change. Equipment slots hold single copies and never need clamping.
+fn clamp_player_kit_to_authored(
+    ps: &mut player_state::PlayerState,
+    inv: &player::PlayerInventory,
+) {
+    let kit: std::collections::HashSet<String> = inv
+        .clothing
+        .iter()
+        .chain(inv.equipped.iter())
+        .chain(inv.accessories.iter())
+        .chain(inv.stored.iter())
+        .map(|n| n.trim().to_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+    if kit.is_empty() {
+        return;
+    }
+    let mut clamped: Vec<String> = Vec::new();
+    for rack in [&mut ps.belt, &mut ps.pack, &mut ps.pouch] {
+        for item in rack.iter_mut() {
+            if item.qty > 1 && kit.contains(&item.name.trim().to_lowercase()) {
+                item.qty = 1;
+                clamped.push(item.name.clone());
+            }
+        }
+    }
+    if !clamped.is_empty() {
+        tracing::info!(
+            items = ?clamped,
+            "authored-kit clamp: kit stacks reset to authored qty (tracker re-inventory duplication healed)"
+        );
+    }
+}
+
 fn attach_saved_player(
     app: &tauri::AppHandle,
     state: &AppState,
@@ -15277,6 +15499,14 @@ fn attach_saved_player(
                         Some(economy::Owner::Player),
                         stamp,
                     );
+                }
+            }
+            // (2026-08-29 module F2) The authored-kit clamp runs on RESUME
+            // (fresh seeding above is already exact): kit-named rack stacks
+            // reset to authored qty — the re-inventory duplication heal.
+            if !fresh {
+                if let Some(inv) = sp.inventory.as_ref().filter(|i| !i.is_empty()) {
+                    clamp_player_kit_to_authored(&mut prior_schema.player_state, inv);
                 }
             }
             tracing::info!(player_id = pid, player_name = %card.player_name.as_deref().unwrap_or("?"), "attached saved player");
@@ -16180,7 +16410,7 @@ fn most_recent_continue_target(fable_root: &std::path::Path) -> Option<fable_sav
         // entirely. A missing/unparseable namesake falls back to the old
         // folder-name behavior (a saves tree whose card was hand-moved).
         let namesake = entry.path().join(format!("{card_folder}.sim"));
-        let card = sim_card::load_or_fallback(&namesake);
+        let card = sim_card::load_or_fallback_cached(&namesake);
         let card_id = if card.id.is_empty() {
             card_folder.clone()
         } else if card.card_type == "simulation" && card.format_v2 {
@@ -17284,9 +17514,9 @@ fn build_creator_assistant_system_prompt(creator_kind: &str) -> String {
             "entries (array of objects each {title, tags:[short keywords], body}). One \
              concept per entry. For EACH body: tighten the prose (strip filler, \
              redundancy, and meta-talk) but PRESERVE every lore fact — do not \
-             compress lore away to fit. The body MUST stay under 1400 characters \
+             compress lore away to fit. The body MUST stay under 1300 characters \
              (the embedding model's per-entry window — anything longer won't \
-             embed or retrieve whole). If a concept still exceeds 1400 chars \
+             embed or retrieve whole). If a concept still exceeds 1300 chars \
              after tightening, SPLIT it across multiple entries titled \
              \"<Concept> — Part 1\", \"<Concept> — Part 2\", … so the full \
              content carries across parts that each embed cleanly. Never \
@@ -18301,13 +18531,6 @@ async fn acquire_fable_engine_leased(
     Ok((lease, engine))
 }
 
-/// Send a narrator turn: render the narrator prompt from the active card +
-/// current game schema, post the request to the FableEngine, stream chunks
-/// to the Channel, parse bracket commands from the final raw output, and
-/// emit them as scene_event messages. After the turn, archive to memory
-/// (card-scoped) and fire the schema delta (card-scoped). Mirrors `chat_send`
-/// shape but routes to the FableEngine + uses the narrator system prompt.
-#[tauri::command]
 /// (2026-08-27 evening Chloe ruling — THE TURN INVERSION) The post-beat
 /// tracker stage: the local E4B decode + bracket apply + JIT architects,
 /// relocated from their old PRE-API position. The caller runs this AFTER the
@@ -18641,6 +18864,13 @@ async fn apply_post_beat_tracking(
     false
 }
 
+/// Send a narrator turn: render the narrator prompt from the active card +
+/// current game schema, post the request to the FableEngine, stream chunks
+/// to the Channel, parse bracket commands from the final raw output, and
+/// emit them as scene_event messages. After the turn, archive to memory
+/// (card-scoped) and fire the schema delta (card-scoped). Mirrors `chat_send`
+/// shape but routes to the FableEngine + uses the narrator system prompt.
+#[tauri::command]
 async fn fable_send(
     text: String,
     on_event: tauri::ipc::Channel<serde_json::Value>,
@@ -19097,6 +19327,7 @@ async fn fable_send(
                 ));
                 tracing::info!(
                     stamina = ?s.player_state.stamina,
+                    fired = ?player_state::transit_fired_keywords(&transit_lower),
                     "transit exertion tax applied (no injury roll — 2026-08-22 Chloe ruling)"
                 );
             }
@@ -19136,6 +19367,8 @@ async fn fable_send(
                 stamina = ?outcome.stamina_after,
                 lethal = outcome.lethal,
                 attacker_tier = ?attacker_tier,
+                // (2026-08-29 module D2) name the trigger words.
+                fired = ?player_state::combat_fired_keywords(&player_state::strip_dialogue(&text).to_lowercase()),
                 "referee fired on combat/exertion keyword"
             );
             // (2026-08-22 playtest) The injury was assigned with ZERO
@@ -19389,6 +19622,9 @@ async fn fable_send(
             tracing::info!(
                 count = skills.len(),
                 mode = ?pacing.mode,
+                // (2026-08-29 module D2/D3) name the skills that fired —
+                // the war-story mis-fire diagnosis starts here.
+                fired = ?skills.iter().map(|o| o.skill).collect::<Vec<_>>(),
                 "skill-check referee fired"
             );
         }
@@ -23247,7 +23483,7 @@ fn fable_codex_links_map(app: tauri::AppHandle) -> Result<Vec<CardCodexLinks>, S
     };
     let mut out = Vec::new();
     for path in iter_card_sim_paths(&cards_root) {
-        let card = sim_card::load_or_fallback(&path);
+        let card = sim_card::load_or_fallback_cached(&path);
         // Same skip rules as fable_cards_list: fallback stubs, non-simulation
         // cards, and pre-v2 cards never reach a picker, so their links are
         // invisible here too (a pre-v2 card can't be linked from the UI).
@@ -24222,7 +24458,7 @@ fn safe_shortcut_name(name: &str) -> String {
 /// `build_card_shortcut` (create) AND `fable_card_delete` (Desktop reap) so
 /// the two always agree on the filename.
 fn card_shortcut_label(sim_path: &std::path::Path, card_slug: &str) -> String {
-    let card_name = sim_card::load_or_fallback(sim_path).name;
+    let card_name = sim_card::load_or_fallback_cached(sim_path).name;
     let display_name = if card_name.trim().is_empty() || card_name == "unknown" {
         card_slug.to_string()
     } else {
@@ -26501,7 +26737,12 @@ async fn fable_load_save(
         })
         .collect();
     *state.fable_session.lock().await = loaded_session;
-    let loaded_schema = save.schema;
+    let mut loaded_schema = save.schema;
+    // (2026-08-29 modules E1+F2) Save-slot heal — the same one-shot pass
+    // `load_split` runs (a slot embeds a full schema snapshot; the version
+    // rides the struct). The history snapshots below stay untouched (the
+    // undo ring's timeline is authoritative — module F3).
+    schema::WorldSchema::heal_schema_state(&mut loaded_schema);
     *state.fable_schema.lock().await = loaded_schema;
     // (2026-08-21 resume-attach fix) Re-attach the SAVE's bound player: a
     // slot switch can cross timelines run with different SavedPlayers — the
@@ -28115,7 +28356,9 @@ fn resolve_fable_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf>
     }
     for dir in &candidates {
         if dir.is_dir() {
-            tracing::info!("resolved fable_cards dir: {}", dir.display());
+            // (2026-08-29 module H3) DEBUG — boot-time path resolution, not
+            // per-session signal.
+            tracing::debug!("resolved fable_cards dir: {}", dir.display());
             return Some(dir.clone());
         }
     }
@@ -28132,7 +28375,7 @@ fn resolve_fable_cards_dir(app: &tauri::AppHandle) -> Option<std::path::PathBuf>
 /// carrying the display folder name (the .lnk form).
 fn find_card_by_id(dir: &std::path::Path, target_id: &str) -> Result<sim_card::SimCard, String> {
     for path in iter_card_sim_paths(dir) {
-        let card = sim_card::load_or_fallback(&path);
+        let card = sim_card::load_or_fallback_cached(&path);
         // (v0.30.0 clean break) warn on a pre-v2 SKIP — the same per-skip
         // visibility fable_cards_list carries, so a legacy card that blocks
         // a by-id launch names itself in the log.
@@ -28152,7 +28395,7 @@ fn find_card_by_id(dir: &std::path::Path, target_id: &str) -> Result<sim_card::S
     for path in iter_card_sim_paths(dir) {
         let folder = path.parent().and_then(|p| p.file_name()).and_then(|n| n.to_str());
         if folder.is_some_and(|f| f.to_lowercase() == want) {
-            let card = sim_card::load_or_fallback(&path);
+            let card = sim_card::load_or_fallback_cached(&path);
             if card.card_type == "simulation" && card.format_v2 {
                 return Ok(card);
             }
@@ -28331,7 +28574,7 @@ fn resolve_card_folder(cards_root: &std::path::Path, card_id: &str) -> Option<st
         }
     }
     for path in iter_card_sim_paths(cards_root) {
-        let card = sim_card::load_or_fallback(&path);
+        let card = sim_card::load_or_fallback_cached(&path);
         if card.id == want && card.card_type == "simulation" && card.format_v2 {
             let folder = path.parent()?.to_path_buf();
             cache_card_folder(cards_root, &want, &folder);
@@ -29655,6 +29898,103 @@ mod tests {
         });
         assert!(player_holds_item(&ps, "Field Points"));
         assert!(!player_holds_item(&ps, ""), "empty name never matches");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // (2026-08-29 module B) Tracker item integrity: the oscillation freeze
+    // ledger + the rank-word person guard.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// The free-running `+X -X +X` run freezes at the 2nd flip; the first
+    /// ops apply normally. This is the guard the Abba uniform-loss shape
+    /// escapes the C5 churn guards through.
+    #[test]
+    fn item_flip_ledger_freezes_on_second_flip() {
+        let mut ledger = ItemFlipLedger::default();
+        // First op — no flip.
+        assert!(!ledger.record("player", "Uniform", true));
+        assert!(!ledger.is_frozen("player", "Uniform"));
+        // Flip 1 (add→remove).
+        assert!(!ledger.record("player", "Uniform", false));
+        assert!(!ledger.is_frozen("player", "Uniform"));
+        // Flip 2 (remove→add) — THIS op freezes the pair.
+        assert!(ledger.record("player", "Uniform", true));
+        assert!(ledger.is_frozen("player", "Uniform"));
+        // Case/whitespace-insensitive keying.
+        assert!(ledger.is_frozen("player", "  uniform "));
+        // Other owners/names unaffected.
+        assert!(!ledger.is_frozen("player", "Rope"));
+        assert!(!ledger.is_frozen("abba", "Uniform"));
+        assert!(!ledger.record("abba", "Uniform", true));
+    }
+
+    /// Same-direction repeats never flip: `[PACK +Rope]` re-emitted 5× in one
+    /// pass (the read-back loop) stays unfrozen — the echo guards own those.
+    #[test]
+    fn item_flip_ledger_ignores_same_direction_runs() {
+        let mut ledger = ItemFlipLedger::default();
+        for _ in 0..5 {
+            assert!(!ledger.record("player", "Rope", true));
+        }
+        assert!(!ledger.is_frozen("player", "Rope"));
+    }
+
+    /// (module B4c) Rank/title words join the person-noun suffix guard.
+    #[test]
+    fn rank_tailed_names_look_like_persons() {
+        assert!(item_name_looks_like_person("the old Colonel"));
+        assert!(item_name_looks_like_person("her Captain"));
+        assert!(item_name_looks_like_person("Sir"));
+        assert!(item_name_looks_like_person("the kind Mister"));
+        assert!(item_name_looks_like_person("Madam"));
+        // Object names never trip it.
+        assert!(!item_name_looks_like_person("captain's Log"));
+        assert!(!item_name_looks_like_person("siren song"));
+    }
+
+    /// (module F2, Chloe-approved) The authored-kit clamp: kit-named stacks
+    /// reset to authored qty (1); legitimately looted non-kit stacks keep
+    /// their counts. The re-inventory duplication heal.
+    #[test]
+    fn clamp_player_kit_to_authored_resets_kit_stacks_only() {
+        let mut ps = player_state::PlayerState::default();
+        for (name, qty) in [
+            ("Traveler's Cloak", 3), // kit item — the friend-log duplication
+            ("Field Points", 12),    // legit loot — untouched
+            ("Lantern", 2),          // kit item
+        ] {
+            ps.pack.push(equipment::StackItem {
+                name: name.into(),
+                qty,
+                ..Default::default()
+            });
+        }
+        ps.pouch.push(equipment::StackItem {
+            name: "Brass Key".into(),
+            qty: 2,
+            ..Default::default()
+        });
+        let inv = player::PlayerInventory {
+            clothing: vec!["Traveler's Cloak".into()],
+            equipped: vec![],
+            accessories: vec![],
+            stored: vec!["Lantern".into(), "Brass Key".into()],
+        };
+        clamp_player_kit_to_authored(&mut ps, &inv);
+        let qty_of = |rack: &Vec<equipment::StackItem>, name: &str| {
+            rack.iter()
+                .find(|i| i.name == name)
+                .map(|i| i.qty)
+                .unwrap_or(0)
+        };
+        assert_eq!(qty_of(&ps.pack, "Traveler's Cloak"), 1, "kit stack clamped");
+        assert_eq!(qty_of(&ps.pack, "Lantern"), 1, "kit stack clamped (stored list)");
+        assert_eq!(qty_of(&ps.pouch, "Brass Key"), 1, "pouch kit clamped too");
+        assert_eq!(qty_of(&ps.pack, "Field Points"), 12, "loot untouched");
+        // Idempotent: a second clamp changes nothing further.
+        clamp_player_kit_to_authored(&mut ps, &inv);
+        assert_eq!(qty_of(&ps.pack, "Traveler's Cloak"), 1);
+        assert_eq!(qty_of(&ps.pack, "Field Points"), 12);
     }
 
     /// (2026-08-22 playtest, Chloe directive) The person guard: a registered

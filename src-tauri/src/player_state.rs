@@ -991,25 +991,23 @@ pub(crate) const BASE_LETHAL_DC: i32 = 18;
 /// Matched through `keyword_present` (BOTH-side word boundaries,
 /// case-insensitive) over dialogue-STRIPPED text (see `strip_dialogue`).
 ///
-/// - **HARD** (below): direct first-person violence/action verbs — ONE fires
+/// - **HARD** (below): direct first-person violence verbs — ONE fires
 ///   alone. This is the full pre-P1e combat list (attack + swing + strike +
 ///   …) PLUS the plan's additions (shove, duck, lunge families).
+///   (2026-08-29 Chloe ruling) The MOVEMENT families (run/sprint/climb/
+///   jump/leap/swim + inflections) were REMOVED — they live in
+///   [`TRANSIT_VERBS`] only. A hug that "jumped" at a knock, a transit
+///   verb in a story about movement — none of it is violence. Combat now
+///   requires an actual violence verb (hard) or ≥2 distinct soft.
 /// - **SOFT** ([`COMBAT_SOFT_KEYWORDS`]): violence-adjacent but commonly
 ///   figurative or about-others (hunt / raid / arrest / fight / chase) —
 ///   they corroborate: ≥2 DISTINCT soft keywords, or any hard keyword.
-///   DEVIATION FROM THE PLAN (flagged for Chloe): the plan soft-listed
-///   "attack" too, but "I attack the goblin" / "The goblin is attacking me"
-///   are pinned combat controls (this file's sync test + scene_pacing's
-///   suite) and the game's core loop — a soft-single "attack" would break
-///   both. The evidence's false positives (arrests / hunting / raided) are
-///   fully covered by the other five families.
-///   both. Keep this file's TEST_COMBAT_KEYWORDS copy in lockstep (the sync
+///   Keep this file's TEST_COMBAT_KEYWORDS copy in lockstep (the sync
 ///   test pins the hard list fires BOTH consumers through the shared gate).
 const COMBAT_HARD_KEYWORDS: &[&str] = &[
     // base verbs
     "attack", "swing", "strike", "slash", "stab", "punch", "kick", "block", "dodge",
     "parry", "shoot", "fire", "cast", "throw", "tackle", "grapple", "charge",
-    "run", "sprint", "climb", "jump", "leap", "swim",
     // (P1e) the plan's first-person violence additions
     "shove", "shoves", "shoved", "shoving",
     "duck", "ducks", "ducked", "ducking",
@@ -1032,12 +1030,6 @@ const COMBAT_HARD_KEYWORDS: &[&str] = &[
     "tackles", "tackled", "tackling",
     "grapples", "grappled", "grappling",
     "charges", "charged", "charging",
-    "runs", "running", "ran",
-    "sprints", "sprinted", "sprinting",
-    "climbs", "climbed", "climbing",
-    "jumps", "jumped", "jumping",
-    "leaps", "leapt", "leaping", "leaped",
-    "swims", "swam", "swimming",
 ];
 
 /// (P1e) Soft combat triggers: violence-adjacent verbs that commonly appear
@@ -1067,6 +1059,35 @@ pub(crate) fn combat_triggered(lower_dialogue_stripped: &str) -> bool {
         .filter(|kw| keyword_present(lower_dialogue_stripped, kw))
         .count()
         >= 2
+}
+
+/// (2026-08-29 module D2) The hard+soft keywords present in this turn's
+/// dialogue-stripped text, for the referee `fired=[keywords]` diagnostics —
+/// the hug incident ("jumped" ∈ the old hard list) would have been named
+/// instantly instead of reconstructed from a log forensics pass.
+pub(crate) fn combat_fired_keywords(lower_dialogue_stripped: &str) -> Vec<&'static str> {
+    let mut fired: Vec<&'static str> = COMBAT_HARD_KEYWORDS
+        .iter()
+        .filter(|kw| keyword_present(lower_dialogue_stripped, kw))
+        .copied()
+        .collect();
+    fired.extend(
+        COMBAT_SOFT_KEYWORDS
+            .iter()
+            .filter(|kw| keyword_present(lower_dialogue_stripped, kw))
+            .copied(),
+    );
+    fired
+}
+
+/// (2026-08-29 module D2) The transit verbs present — same diagnostic
+/// contract, for the stamina-tax INFO line.
+pub(crate) fn transit_fired_keywords(lower_dialogue_stripped: &str) -> Vec<&'static str> {
+    TRANSIT_VERBS
+        .iter()
+        .filter(|kw| keyword_present(lower_dialogue_stripped, kw))
+        .copied()
+        .collect()
 }
 
 /// (2026-08-22 Chloe ruling — traversal is exertion, damage is
@@ -1837,6 +1858,8 @@ pub fn referee_evaluate_live(
         tracing::info!(
             defense,
             stamina_mod,
+            // (2026-08-29 module D2) name the trigger words.
+            fired = ?combat_fired_keywords(&lower),
             "combat referee: avoidance slip — clean dodge, no wound this exchange"
         );
         return None;
@@ -3186,18 +3209,19 @@ mod tests {
             crate::schema::SceneMode::Combat,
             "'runner' must not classify Combat"
         );
-        // (2026-08-22 ruling) Transit-only: no injury roll — but the scene
-        // still classifies Combat through the shared gate (the chase is
-        // kinetic; world ticks suspend, the DC mods apply).
+        // (2026-08-29 Chloe ruling, module D1) Movement verbs left the combat
+        // hard list entirely: 'running' is traversal — no injury roll AND no
+        // Combat pacing (a chase still paces Combat only when it carries ≥2
+        // distinct soft verbs or a violence verb).
         assert_eq!(
             referee_evaluate("I am running from the guards.", &s),
             None,
-            "'running' alone is traversal — exertion, never a limb injury (2026-08-22 Chloe ruling)"
+            "'running' alone is traversal — exertion, never a limb injury"
         );
         assert_ne!(
             crate::scene_pacing::evaluate("I am running from the guards.").mode,
             crate::schema::SceneMode::Combat,
-            "'running' must still classify Combat (shared gate untouched)"
+            "pure movement is kinetic-1 Exploration, never Combat (2026-08-29 ruling)"
         );
         // The playtest's exact case: climbing out of a pit rolled a Yellow
         // elbow + Depleted — pure traversal now rolls nothing.
@@ -3244,6 +3268,59 @@ mod tests {
         assert!(!t("I offer the elf some water"));
         // Dialogue is stripped before the gate: quoted speech never routes.
         assert!(t("*I climb* \"You should see me running up there\" — I keep climbing"));
+    }
+
+    /// (2026-08-29 module D1) The hug fixture — the friend-log incident: a
+    /// knock startles ("jumped") mid-hug and the combat Referee rolled a
+    /// limb injury on it. Movement verbs are gone from the hard list: no
+    /// roll, no Combat pacing, and the transit-tax decision is visible.
+    #[test]
+    fn hug_with_jumped_never_rolls_combat() {
+        let s = fresh_state();
+        let hug = "I jump a little at the knock, then pull Abba into a warm hug.";
+        // No injury roll.
+        assert_eq!(
+            referee_evaluate(hug, &s),
+            None,
+            "a startle-hug is not violence — 'jumped' left the hard list (2026-08-29 Chloe ruling)"
+        );
+        // No Combat pacing (kinetic 1 → Exploration at most).
+        assert_ne!(
+            crate::scene_pacing::evaluate(hug).mode,
+            crate::schema::SceneMode::Combat,
+            "movement-only text must not pace Combat"
+        );
+        // The transit-tax decision is visible: 'jumped' is a transit verb,
+        // so the turn pays exertion (the tax), not combat.
+        let lower = strip_dialogue(hug).to_lowercase();
+        assert!(transit_only_exertion(&lower), "the hug turn is transit-only exertion");
+        assert!(transit_fired_keywords(&lower).contains(&"jump"), "the tax log names its trigger");
+    }
+
+    /// (2026-08-29 module D3) The war-story boundary — a past-tense war
+    /// story told IN QUOTES is speech, not action: the dialogue strip keeps
+    /// every keyword referee off it (the documented "dialogue is speech, not
+    /// action" law; the skill referee strips internally). An UNQUOTED
+    /// past-tense telling remains a known ambiguity — first-person past
+    /// tense is a valid RP action style, and the plan's no-tense-heuristic
+    /// ruling leaves it to the `fired=` diagnostics to name the phrase when
+    /// it next occurs.
+    #[test]
+    fn quoted_war_story_fires_no_skill_checks() {
+        let quoted = "I lean in. \"Back in the war we snuck past the pickets, hid in a cellar for three days, and crept out before dawn.\"";
+        assert!(
+            referee_evaluate_skill_checks(quoted, 0, 0, 0, 0, &std::collections::BTreeMap::new(), false, None)
+                .is_empty(),
+            "quoted speech never attempts checks (strip_dialogue)"
+        );
+        // The same story UNQUOTED currently fires sneak — pinned as the
+        // documented known behavior, not an endorsement.
+        let unquoted = "I tell Abba how we snuck past the pickets and hid in a cellar for three days.";
+        assert!(
+            !referee_evaluate_skill_checks(unquoted, 0, 0, 0, 0, &std::collections::BTreeMap::new(), false, None)
+                .is_empty(),
+            "unquoted past-tense narration still matches (known ambiguity — see fired= diagnostics)"
+        );
     }
 
     /// (2026-08-16 P2b) The recovery Referee's rest keywords under the
@@ -4018,7 +4095,9 @@ mod tests {
     const TEST_COMBAT_KEYWORDS: &[&str] = &[
         "attack", "swing", "strike", "slash", "stab", "punch", "kick", "block", "dodge",
         "parry", "shoot", "fire", "cast", "throw", "tackle", "grapple", "charge",
-        "run", "sprint", "climb", "jump", "leap", "swim",
+        // (2026-08-29 Chloe ruling) movement families removed — they live in
+        // TRANSIT_VERBS only; see the movement_verbs_are_transit_not_combat
+        // test for the new contract.
         // (P1e) first-person violence additions
         "shove", "duck", "lunge",
         // inflected forms (2026-08-16 P2b) — the trailing boundary requires
@@ -4040,12 +4119,6 @@ mod tests {
         "tackles", "tackled", "tackling",
         "grapples", "grappled", "grappling",
         "charges", "charged", "charging",
-        "runs", "running", "ran",
-        "sprints", "sprinted", "sprinting",
-        "climbs", "climbed", "climbing",
-        "jumps", "jumped", "jumping",
-        "leaps", "leapt", "leaping", "leaped",
-        "swims", "swam", "swimming",
         "shoves", "lunges", "ducks",
     ];
 

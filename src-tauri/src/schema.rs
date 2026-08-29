@@ -932,6 +932,12 @@ pub fn infer_node_setting(name: &str) -> &'static str {
         "bathhouse", "theater", "theatre", "office", "study", "workshop",
         "archive", "observatory", "greenhouse", "boathouse", "mansion",
         "palace", "hospital", "clinic", "school", "academy",
+        // (2026-08-29 module E2) café-scale places — the friend-log worlds
+        // ran mapless because their named places ("the diner", "a cramped
+        // apartment") never matched an indoor word and the architect never
+        // fired. Settlement words keep priority.
+        "corridor", "hallway", "stairwell", "lobby", "cafe", "café",
+        "diner", "bar", "apartment", "dorm", "barracks", "lab", "garage",
     ];
     let lower = name.to_lowercase();
     let tokens: std::collections::HashSet<&str> = lower
@@ -1362,7 +1368,10 @@ pub fn resolve_npc_surface<'a>(entries: &'a [NpcEntry], surface: &str) -> Option
         .collect();
     hits.dedup_by(|a, b| a.id == b.id);
     if hits.len() == 1 {
-        tracing::info!(
+        // (2026-08-29 module C3) DEBUG — the combined-bracket split (C2)
+        // collapsed the ~11 resolutions/turn to ~1/NPC; what remains is
+        // routine resolution, not signal.
+        tracing::debug!(
             surface = %c,
             resolved = %hits[0].id,
             "[PRESENCE] fragment alias: shorthand resolved to the existing entry"
@@ -2173,6 +2182,15 @@ pub struct WorldSchema {
     /// 0 for legacy saves (unstamped files load as-is — can't retrofit).
     #[serde(default)]
     pub split_gen: u64,
+
+    /// (2026-08-29 module F1) The SAVE-HEAL generation this schema last
+    /// healed through (`heal_schema_state`, gated on `HEAL_VERSION`). Rides
+    /// world.json's split root + every save slot (the field lives on the
+    /// struct both serialize); 0 = a pre-heal save (every existing save on
+    /// first load after this ships). Referee-owned bookkeeping — `merge_patch`
+    /// refuses it, prompts never render it.
+    #[serde(default)]
+    pub heal_version: u32,
 
     /// The player's canonical state (Fable Seam #7, Player State).
     /// Rust is the SOLE authority here — the schema-delta LLM pass never
@@ -4564,6 +4582,81 @@ fn type_name_of_value(v: &serde_json::Value) -> &'static str {
     }
 }
 
+/// (2026-08-29 module F2) The current save-heal generation. Bump when a new
+/// heal action is added to `heal_schema_state`; schemas below it heal on
+/// their next load. v1 shipped with the 2026-08-29 hardening pass.
+pub const HEAL_VERSION: u32 = 1;
+
+/// (2026-08-29 modules E1+F2) The one-shot SAVE HEAL — repairs pre-fix
+/// saves/sessions IN PLACE (no new game required). Idempotent +
+/// conservative: every action only ever REMOVES garbage or backfills EMPTY
+/// fields, never touches authored state, and each action INFO-logs only
+/// when it actually changed something. Runs at `load_split` completion and
+/// save-slot load, gated on `heal_version < HEAL_VERSION`; the version
+/// persists with the next normal autosave/mutation save — no dedicated
+/// write on load.
+///
+/// v1 actions:
+/// - NODE SETTING BACKFILL (E1): every travel node with an empty `setting`
+///   gets `infer_node_setting(name)` — pre-H2 saves minted `""` everywhere
+///   and the JIT site architect never fired (whole campaigns ran mapless).
+/// - GARBAGE-ITEM SWEEP (B4): the player racks (belt/pack/pouch) + NPC
+///   interior racks lose entries whose names fail the B4 gates —
+///   verb-tailed prose fragments ("tobacco smell came", "pipe turned"),
+///   embedded-`+` merges ("Adopolous +Pipe"), person/rank tails.
+///
+/// The AUTHORED-KIT CLAMP is NOT here — it needs the bound SavedPlayer and
+/// runs at session entry (`clamp_player_kit_to_authored`, lib.rs).
+pub fn heal_schema_state(schema: &mut WorldSchema) {
+    if schema.heal_version >= Self::HEAL_VERSION {
+        return;
+    }
+    // E1: node setting backfill.
+    let mut backfilled = 0usize;
+    for node in &mut schema.travel_graph.nodes {
+        if node.setting.is_empty() {
+            let inferred = infer_node_setting(&node.name);
+            if !inferred.is_empty() {
+                node.setting = inferred.to_string();
+                backfilled += 1;
+            }
+        }
+    }
+    if backfilled > 0 {
+        tracing::info!(
+            count = backfilled,
+            "save heal v1: backfilled empty node settings (JIT architect re-armed)"
+        );
+    }
+    // B4: garbage-item sweep (player racks + NPC interior racks).
+    let is_garbage = |name: &str| {
+        crate::bracket_parser::item_name_is_verb_garbage(name)
+            || crate::bracket_parser::split_embedded_item_names(name).len() > 1
+            || crate::item_name_looks_like_person(name)
+    };
+    let mut swept = 0usize;
+    let ps = &mut schema.player_state;
+    for rack in [&mut ps.belt, &mut ps.pack, &mut ps.pouch] {
+        let before = rack.len();
+        rack.retain(|i| !is_garbage(&i.name));
+        swept += before - rack.len();
+    }
+    for interior in schema.npc_interior.values_mut() {
+        for rack in [&mut interior.items, &mut interior.worn] {
+            let before = rack.len();
+            rack.retain(|i| !is_garbage(&i.name));
+            swept += before - rack.len();
+        }
+    }
+    if swept > 0 {
+        tracing::info!(
+            count = swept,
+            "save heal v1: swept garbage item names from racks"
+        );
+    }
+    schema.heal_version = Self::HEAL_VERSION;
+}
+
 /// The inverse of [`save_split`]: read the three sibling files, deep-merge
     /// their `entities` maps, and deserialize the merged object into one
     /// `WorldSchema`. Any missing file contributes nothing (its keys fall back
@@ -4707,6 +4800,11 @@ fn type_name_of_value(v: &serde_json::Value) -> &'static str {
                 node.name = cleaned;
             }
         }
+
+        // (2026-08-29 modules E1+F2) The one-shot save heal — node setting
+        // backfill + garbage-item sweep, version-gated on `heal_version`.
+        // No-op (single comparison) for already-healed saves.
+        Self::heal_schema_state(&mut schema);
 
         Ok(schema)
     }
@@ -9055,5 +9153,105 @@ mod tests {
         assert!(!is_generic_place_name("North Road"));
         assert!(!is_generic_place_name("Iron Alley"));
         assert!(!is_generic_place_name("Greymist"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // (2026-08-29 modules E1+E2+F2) The one-shot save heal + the E2 lexicon.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn infer_node_setting_extends_to_cafe_scale_places() {
+        // (E2) The friend-log worlds' named places — none matched before.
+        assert_eq!(infer_node_setting("The Corner Café"), "indoor");
+        assert_eq!(infer_node_setting("Riverside Diner"), "indoor");
+        assert_eq!(infer_node_setting("cramped apartment"), "indoor");
+        assert_eq!(infer_node_setting("the guard barracks"), "indoor");
+        assert_eq!(infer_node_setting("east corridor"), "indoor");
+        assert_eq!(infer_node_setting("subway lab"), "indoor");
+        // Settlement words keep priority ("Harbor Diner" is a building in a
+        // port — the node IS the settlement's docks).
+        assert_eq!(infer_node_setting("Harbor Diner"), "settlement");
+        // A whole-level node stays unset (outdoor/unknown).
+        assert_eq!(infer_node_setting("the-backrooms"), "");
+    }
+
+    /// (F2) A synthetic PRE-FIX save heals in place: settings backfill,
+    /// garbage sweep, version stamp — and the second run is a no-op.
+    #[test]
+    fn heal_schema_state_fixes_prefab_save_idempotently() {
+        let mut s = WorldSchema::default();
+        assert_eq!(s.heal_version, 0, "a pre-heal save deserializes at v0");
+        // Nodes: one inferable indoor, one settlement, one that stays empty.
+        for (id, name) in [
+            ("diner", "Riverside Diner"),
+            ("market", "Harbor Market"),
+            ("field", "Open Field"),
+        ] {
+            s.travel_graph.nodes.push(Node {
+                id: id.into(),
+                name: name.into(),
+                setting: String::new(), // the pre-H2 mint shape
+                ..Default::default()
+            });
+        }
+        // Player pack: two garbage names + one legit stack.
+        for (name, qty) in [
+            ("tobacco smell came", 2), // B4b verb tail
+            ("Adopolous +Pipe", 1),    // B4a embedded ` +`
+            ("Field Points", 12),      // legit loot — untouched
+        ] {
+            s.player_state.pack.push(crate::equipment::StackItem {
+                name: name.into(),
+                qty,
+                ..Default::default()
+            });
+        }
+        // NPC worn rack: one verb-tail garbage garment.
+        s.npc_interior.entry("abba".into()).or_default().worn.push(
+            crate::equipment::StackItem {
+                name: "pipe turned".into(),
+                ..Default::default()
+            },
+        );
+
+        WorldSchema::heal_schema_state(&mut s);
+
+        // E1 backfill.
+        let by_id = |id: &str| {
+            s.travel_graph
+                .nodes
+                .iter()
+                .find(|n| n.id == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_id("diner").setting, "indoor");
+        assert_eq!(by_id("market").setting, "settlement");
+        assert_eq!(by_id("field").setting, "", "no signal stays empty");
+        // Sweep.
+        let names: Vec<&str> = s.player_state.pack.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["Field Points"], "garbage swept, legit kept");
+        assert!(
+            s.npc_interior["abba"].worn.is_empty(),
+            "NPC racks swept too"
+        );
+        // Version stamped.
+        assert_eq!(s.heal_version, WorldSchema::HEAL_VERSION);
+
+        // Idempotent: a second run changes nothing (also proves the guard).
+        // WorldSchema carries no PartialEq — compare through the JSON
+        // projection (the same projection saves travel through).
+        let mut again = s.clone();
+        WorldSchema::heal_schema_state(&mut again);
+        assert_eq!(
+            serde_json::to_value(&again).unwrap(),
+            serde_json::to_value(&s).unwrap(),
+            "second heal is a no-op"
+        );
+
+        // Already-healed schemas skip entirely (the single-comparison gate).
+        let before = serde_json::to_value(&again).unwrap();
+        WorldSchema::heal_schema_state(&mut again);
+        assert_eq!(serde_json::to_value(&again).unwrap(), before);
     }
 }

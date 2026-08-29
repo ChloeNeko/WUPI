@@ -38,6 +38,9 @@
 //!    into `max_tokens`).
 //! 6. Markdown fences (belt-and-suspenders with `extract_reply_channel`: a
 //!    stray ``` after the channel strip gets removed).
+//! 7. Invalid escape sequences inside string values (`"C:\Users"` — JSON
+//!    permits only `\" \\ \/ \b \f \n \r \t \uXXXX`; a backslash before any
+//!    other char becomes a literal `\\` so the intended text survives).
 //!
 //! Each pass is idempotent and runs only on text that hasn't already been
 //! mangled by a prior pass (the repair is a best-effort normalization, not a
@@ -57,6 +60,13 @@
 pub fn repair(raw: &str) -> String {
     let s = raw.to_string();
     let s = normalize_quotes(&s);
+    // Invalid escapes run early (right after the delimiters are ASCII) so
+    // every later string-aware pass tracks escape state over ALREADY-legal
+    // sequences — a stray `\U` in a Windows path would otherwise be carried
+    // verbatim and kill the strict parse downstream (the 2026-08-29 Wupi
+    // file_write failure: args collapsed to the `{"raw":...}` carrier and
+    // the tool loop rejected "missing argument path" 3× blind).
+    let s = escape_invalid_escapes_in_strings(&s);
     let s = strip_trailing_commas(&s);
     // (#49) wrap_bare_object runs BEFORE quote_unquoted_keys: a brace-less
     // body's LEADING key (`summary: "ok"`) is never preceded by `{`/`,`, so
@@ -214,6 +224,64 @@ fn normalize_quotes(s: &str) -> String {
                 }
             }
         }
+    }
+    out
+}
+
+/// Escape INVALID escape sequences inside string values. JSON permits only
+/// `\"`, `\\`, `\/`, `\b`, `\f`, `\n`, `\r`, `\t`, and `\uXXXX`. An LLM
+/// emitting an unescaped Windows path (`{"path": "C:\Users\shark"}`) breaks
+/// those rules — `\U`, `\s` etc. are invalid and serde rejects the WHOLE
+/// document, even though every other member was fine. Each backslash
+/// preceding a non-escapable char becomes a literal escaped backslash
+/// (`\\U`), preserving the model's intended text byte-for-byte while making
+/// the document valid.
+///
+/// Runs after `normalize_quotes` (delimiters are ASCII by then) and is
+/// string-state aware: backslashes OUTSIDE strings (rare, never legal JSON
+/// anyway) are left for serde to report. A dangling backslash at the very
+/// end of an unterminated string is left for `balance_brackets`, which owns
+/// the truncated-tail repair.
+/// Legal escapes pass through untouched (below); a backslash before one of
+/// the escape letters (`\n`, `\t`, …) inside what is CLEARLY a path stays
+/// a legal escape — that ambiguity is semantic (out of this module's
+/// syntactic contract), and the A2 path-normalization layer sees the
+/// parsed result either way.
+fn escape_invalid_escapes_in_strings(s: &str) -> String {
+    const ESCAPABLE: &[char] = &['"', '\\', '/', 'b', 'f', 'n', 'r', 't', 'u'];
+    let mut out = String::with_capacity(s.len());
+    let mut in_string = false;
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if !in_string {
+            if ch == '"' {
+                in_string = true;
+            }
+            out.push(ch);
+            continue;
+        }
+        if ch == '"' {
+            in_string = false;
+            out.push(ch);
+            continue;
+        }
+        if ch == '\\' {
+            match chars.peek() {
+                // Dangling backslash at end-of-input: balance_brackets owns
+                // closing the (truncated) string; don't pre-empt it.
+                None => out.push('\\'),
+                // Legal escape — pass both chars through untouched.
+                Some(&next) if ESCAPABLE.contains(&next) => {
+                    out.push('\\');
+                    out.push(chars.next().unwrap());
+                }
+                // Invalid escape (a multibyte char is never escapable) —
+                // the backslash was meant literally: double it.
+                Some(_) => out.push_str("\\\\"),
+            }
+            continue;
+        }
+        out.push(ch);
     }
     out
 }
@@ -764,6 +832,77 @@ mod tests {
     #[test]
     fn no_extra_quote_when_cut_after_closed_string() {
         assert_eq!(repair("{\"a\":\"x\""), "{\"a\":\"x\"}");
+    }
+
+    // ---------- escape_invalid_escapes_in_strings (2026-08-29 tool-call fix) ----------
+
+    /// The live Wupi failure shape: the local model emits `file_write` with an
+    /// unescaped Windows path. Single backslashes break JSON escape rules,
+    /// the strict parse failed, `json_repair` couldn't fix it, args collapsed
+    /// to the `{"raw":...}` carrier, and the tool loop rejected "missing
+    /// argument `path`" 3× blind (GLM then paraphrased the failure into the
+    /// visible reply). The invalid-escape pass doubles each offending
+    /// backslash so the path text survives verbatim.
+    #[test]
+    fn repairs_unescaped_windows_path() {
+        // NOTE: the fixture deliberately avoids an escape-letter follower
+        // (`\n`otes, `\f`ile, `\t`mp) — those are LEGAL escapes and out of
+        // this pass's syntactic contract (see the fn doc).
+        let broken = "{\"path\": \"C:\\Users\\shark\\Documents\\WUPI\\data\\docs\\memo.txt\", \"content\": \"hi\"}";
+        // In Rust source the single-backslash form above IS the raw
+        // single-backslash byte sequence the model emits (double-escaping
+        // in the fixture itself would defeat the point).
+        let repaired = repair(broken);
+        let v: serde_json::Value = serde_json::from_str(&repaired).expect("repaired parses");
+        assert_eq!(
+            v["path"], "C:\\Users\\shark\\Documents\\WUPI\\data\\docs\\memo.txt",
+            "path text must survive byte-exact: {repaired}"
+        );
+        assert_eq!(v["content"], "hi");
+    }
+
+    /// Mixed separators (`C:\Users/shark/data.txt`) — each invalid escape is
+    /// fixed independently; the legal `/` chars pass through untouched.
+    #[test]
+    fn repairs_mixed_slash_path() {
+        let broken = "{\"path\": \"C:\\Users/shark\\data.txt\"}";
+        let v: serde_json::Value =
+            serde_json::from_str(&repair(broken)).expect("repaired parses");
+        assert_eq!(v["path"], "C:\\Users/shark/data.txt");
+    }
+
+    /// The path arrives inside smart-quote delimiters (the model substituted
+    /// typographic quotes for ASCII ones). `normalize_quotes` runs FIRST —
+    /// by the time the escape pass sees the string, its delimiters are ASCII
+    /// and the fix applies inside them.
+    #[test]
+    fn repairs_windows_path_inside_smart_quotes() {
+        let broken = "{\u{201C}path\u{201D}: \u{201C}C:\\Users\\shark\\memo.txt\u{201D}";
+        let v: serde_json::Value =
+            serde_json::from_str(&repair(broken)).expect("repaired parses");
+        assert_eq!(v["path"], "C:\\Users\\shark\\memo.txt");
+    }
+
+    /// Legal escapes must pass through UNTOUCHED — the pass only fires on
+    /// non-escapable followers. A `\\` pair, `\"`, `\n`, and a `\uXXXX` all
+    /// survive verbatim.
+    #[test]
+    fn leaves_legal_escapes_alone() {
+        let legal = r#"{"note":"line\nbreak \\ backslash \"quote\" u:\u0041"}"#;
+        assert_eq!(
+            repair(legal), legal,
+            "a fully legal document must round-trip unchanged"
+        );
+        let v: serde_json::Value = serde_json::from_str(&repair(legal)).unwrap();
+        assert_eq!(v["note"], "line\nbreak \\ backslash \"quote\" u:A");
+    }
+
+    /// Invalid escapes OUTSIDE any string are not this pass's business — left
+    /// for serde to report (the conservative contract).
+    #[test]
+    fn leaves_outside_string_backslashes_alone() {
+        let broken = r#"{"a":1} \junk"#;
+        assert_eq!(repair(broken), broken);
     }
 
     // ---------- end-to-end: serde round-trips ----------

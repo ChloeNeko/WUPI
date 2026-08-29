@@ -157,13 +157,19 @@ pub(crate) async fn seed_linked_codices<E: Embedder>(
                 Vec::new()
             }
         };
-        per_file.push((link.name.clone(), expand_oversize_entries(dedupe_duplicate_titles(entries))));
+        let before = entries.len();
+        let expanded = expand_oversize_entries(dedupe_duplicate_titles(entries));
+        // (2026-08-29 module G1) Persist the split to the library file.
+        normalize_oversize_on_disk(&link.path, before, &expanded);
+        per_file.push((link.name.clone(), expanded));
     }
 
     // 2) Cross-file priority merge — index 0 wins same-title collisions.
     let (merged, dropped) = merge_linked_entries(per_file);
     if dropped > 0 {
-        tracing::info!(
+        // (2026-08-29 module G5) DEBUG — routine priority-merge behavior
+        // (a linked file shadowing another), not an actionable signal.
+        tracing::debug!(
             card_id,
             dropped,
             "linked codex merge: lower-priority same-title entries dropped (index 0 = top priority)"
@@ -411,12 +417,11 @@ async fn seed_compound_codex<E: Embedder>(
         return Ok(report);
     }
 
-    // Chunk-budget gate: split any entry whose body exceeds the 1300-byte
-    // CHUNK_CHAR_BUDGET (byte-enforced — see memory.rs) into paginated
-    // "Title - Part N" children BEFORE the reconcile loop. Post-parse/
-    // pre-reconcile placement keeps the parts the canonical title-keyed set
-    // (idempotent re-seeds) and guarantees every body reaching
-    // `add_codex_entry` is ≤1300 bytes — under the ~1400-byte bge
+    // Chunk-budget gate: split any entry whose body exceeds the 1300-char
+    // CHUNK_CHAR_BUDGET (module G4) into paginated "Title - Part N" children
+    // BEFORE the reconcile loop. Post-parse/pre-reconcile placement keeps the
+    // parts the canonical title-keyed set (idempotent re-seeds) and keeps
+    // every body reaching `add_codex_entry` under the ~1400-char bge
     // truncate (see memory.rs's clamp for the final backstop).
     //
     // Duplicate-title disambiguation runs FIRST (before the part split, so
@@ -428,7 +433,11 @@ async fn seed_compound_codex<E: Embedder>(
     // loop could never see. Later dupes are deterministically renamed
     // "Title (N)" (file order, N from 2) so every boot maps the same source
     // entry to the same title → re-seeds stay idempotent.
+    let before_count = sources.len();
     let sources = expand_oversize_entries(dedupe_duplicate_titles(sources));
+    // (2026-08-29 module G1) Persist the split to the library file (the
+    // playbook path self-excludes in `is_library_codex_path`).
+    normalize_oversize_on_disk(path, before_count, &sources);
 
     // Reconcile diff: title-keyed, hash-detected. Rows are grouped per title
     // in Vecs — a title may LEGITIMATELY have multiple stored rows (legacy
@@ -580,18 +589,18 @@ fn dedupe_duplicate_titles(sources: Vec<ParsedEntry>) -> Vec<ParsedEntry> {
 }
 
 /// Expand any entry whose body exceeds the episodic chunker's
-/// [`CHUNK_CHAR_BUDGET`] (1300, enforced on UTF-8 BYTES) into paginated
-/// `"{title} - Part N"` children, each within that budget, split on
-/// sentence/paragraph boundaries via [`crate::memory::chunk_text`] (reused
-/// from the episodic chunker). Gating at the SAME budget the episodic path
-/// uses keeps codex rows consistent with chat rows; bge-small silently
-/// truncates bodies past its cap, so 1300 also sits safely under it.
-/// (2026-08-20 audit P2-8) The gate reads BYTES — `chunk_text`, the
-/// `add_codex_entry` embed clamp, and `insert_entry`'s backstop log all
-/// measure bytes, and every downstream consumer of a "≤1300" body means
-/// bytes. The old chars-count gate let a ≤1300-CHAR CJK/accented body
-/// (2–4× its byte length) skip the split + take a permanently clamped,
-/// degraded embedding.
+/// [`CHUNK_CHAR_BUDGET`] (1300) into paginated `"{title} - Part N"`
+/// children, each within that budget, split on sentence/paragraph
+/// boundaries via [`crate::memory::chunk_text`] (reused from the episodic
+/// chunker). Gating at the SAME budget the episodic path uses keeps codex
+/// rows consistent with chat rows; bge-small silently truncates bodies
+/// past its cap, so 1300 also sits safely under it.
+/// (2026-08-20 audit P2-8 / 2026-08-29 module G4) The gate reads CHARS
+/// (Chloe ruling — the budget is named + taught in chars, and the UTF-8
+/// law bans byte gates over text; the ~1400-char clamps in `insert_entry`
+/// + `add_codex_entry` remain as backstops). `chunk_text` still produces
+/// ≤1300-BYTE parts, which are trivially ≤1300 chars — a normalized file
+/// re-seeds idempotently.
 ///
 /// **Placement matters:** called post-parse + pre-reconcile in
 /// [`seed_compound_codex`], so the parts become the canonical title-keyed set.
@@ -610,7 +619,13 @@ pub(crate) fn expand_oversize_entries(sources: Vec<ParsedEntry>) -> Vec<ParsedEn
     const CAP: usize = crate::memory::CHUNK_CHAR_BUDGET;
     let mut out = Vec::with_capacity(sources.len());
     for src in sources {
-        if src.body.len() <= CAP {
+        // (2026-08-29 module G4, Chloe ruling) The gate reads CHARS —
+        // matching CHUNK_CHAR_BUDGET's name, the creator prompt's "under
+        // 1300 characters" teaching, and the UTF-8 law (anti-pattern #6:
+        // char gates, never byte gates, over text). The 1400-char embed
+        // clamps stay as backstops. Parts are ≤1300 BYTES via chunk_text,
+        // hence ≤1300 chars — re-seeding a normalized file is idempotent.
+        if src.body.chars().count() <= CAP {
             out.push(src);
             continue;
         }
@@ -618,9 +633,9 @@ pub(crate) fn expand_oversize_entries(sources: Vec<ParsedEntry>) -> Vec<ParsedEn
         let n = chunks.len();
         tracing::warn!(
             title = %src.title,
-            body_bytes = src.body.len(),
+            body_chars = src.body.chars().count(),
             parts = n,
-            "codex entry exceeds the 1300-byte chunk budget; auto-splitting into paginated parts"
+            "codex entry exceeds the 1300-char chunk budget; auto-splitting into paginated parts"
         );
         for (i, body) in chunks.into_iter().enumerate() {
             let title = if n > 1 {
@@ -638,6 +653,58 @@ pub(crate) fn expand_oversize_entries(sources: Vec<ParsedEntry>) -> Vec<ParsedEn
         }
     }
     out
+}
+
+/// (2026-08-29 module G1, Chloe ruling: codex library disk rewrites ARE
+/// allowed) When a seed pass's oversize split actually fired, rewrite the
+/// SOURCE `.codex` atomically with the expanded entries in the canonical
+/// compound format (the split children keep their "X - Part N" titles —
+/// the reconcile keys stay stable). After one pass nothing in the file is
+/// oversize, so the split WARN class dies permanently instead of
+/// re-firing ~70× at every session entry + link sweep. Hand-edited files
+/// are included per the ruling. The rewrite right belongs to the universal
+/// LIBRARY tree only — `data/wupi.codex` (the engine-owned playbook) and
+/// anything outside the codex library directory are never rewritten.
+fn normalize_oversize_on_disk(path: &Path, sources_before: usize, expanded: &[ParsedEntry]) {
+    if expanded.len() <= sources_before {
+        return; // nothing split — disk is already normalized
+    }
+    if !is_library_codex_path(path) {
+        return;
+    }
+    let text = format_compound_text(expanded);
+    let tmp = path.with_extension("codex.tmp");
+    let wrote = std::fs::write(&tmp, text.as_bytes())
+        .and_then(|()| {
+            let _ = std::fs::File::open(&tmp).and_then(|f| f.sync_all());
+            std::fs::rename(&tmp, path)
+        });
+    match wrote {
+        Ok(()) => tracing::info!(
+            file = %path.display(),
+            entries = expanded.len(),
+            "codex library file normalized on disk (oversize entries split + persisted — the split warning will not recur)"
+        ),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::warn!(
+                file = %path.display(),
+                error = %e,
+                "codex library normalization write failed (in-memory split still seeds correctly; retried on the next seed)"
+            );
+        }
+    }
+}
+
+/// The rewrite gate for [`normalize_oversize_on_disk`]: the universal codex
+/// library lives under a `codex` directory (`apps/fable/data/codex/<Name>
+/// .codex`). Path-component test — the engine playbook (`data/wupi.codex`)
+/// has no `codex` directory component and is excluded by construction.
+fn is_library_codex_path(path: &Path) -> bool {
+    path.extension().map_or(false, |e| e == "codex")
+        && path
+            .components()
+            .any(|c| c.as_os_str() == std::ffi::OsStr::new("codex"))
 }
 
 /// Insert one parsed entry via `add_codex_entry`, building its `metadata_json`.
@@ -700,7 +767,51 @@ async fn insert_entry(
 ///
 /// (2026-08-22) Pub(crate): lib.rs's library-listing IPC counts entries per
 /// library file. A missing file is NOT an error (empty Vec).
+/// (2026-08-29 module G2) Process-wide parse cache for compound codex
+/// files, keyed by `(mtime, size)` — a hand-edit or the G1 normalization
+/// rewrite bumps the key naturally; an unchanged file is parsed ONCE per
+/// process. Shared by every consumer (seeds, the library list, the links
+/// map), killing the re-read/re-parse churn the friend logs showed
+/// (~70 parses per session entry).
+static COMPOUND_PARSE_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, ((std::time::SystemTime, u64), std::sync::Arc<Vec<ParsedEntry>>)>>,
+> = std::sync::OnceLock::new();
+
 pub(crate) fn parse_compound_file(path: &Path) -> anyhow::Result<Vec<ParsedEntry>> {
+    // Cache key: the file's (mtime, size) — cheap stat, distinguishes every
+    // write. A missing file is the documented NOT-an-error case (empty Vec)
+    // and is cached as such too (the stat key won't exist until it does).
+    let cache = COMPOUND_PARSE_CACHE
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some((key, entries)) = cache.get(path) {
+        if Some(*key) == file_cache_key(path) {
+            return Ok(entries.as_ref().clone());
+        }
+    }
+    drop(cache);
+
+    let parsed = parse_compound_file_uncached(path)?;
+
+    let mut cache = COMPOUND_PARSE_CACHE
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(key) = file_cache_key(path) {
+        cache.insert(path.to_path_buf(), (key, std::sync::Arc::new(parsed.clone())));
+    }
+    Ok(parsed)
+}
+
+/// `(mtime, size)` for a file, or None when it doesn't exist (no cache
+/// entry — a create later inserts one).
+fn file_cache_key(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+fn parse_compound_file_uncached(path: &Path) -> anyhow::Result<Vec<ParsedEntry>> {
     let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1915,6 +2026,66 @@ The Flagon's cellar floods every spring; the keeper keeps the good casks on raft
             assert_eq!(x.body, y.body);
             assert_eq!(x.hash, y.hash);
         }
+    }
+
+    /// (2026-08-29 module G1, Chloe ruling) The one-time disk normalization:
+    /// a seed pass that actually split entries rewrites the LIBRARY file
+    /// with the parts (stable "X - Part N" titles); re-parsing yields the
+    /// split set with nothing oversize — the split WARN class dies
+    /// permanently. Engine paths (the playbook shape) are never rewritten.
+    #[test]
+    fn normalize_oversize_on_disk_persists_the_split() {
+        let root = std::env::temp_dir().join("wupi_codex_test_normalize");
+        let lib_dir = root.join("codex");
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        let lib_path = lib_dir.join("Library.codex");
+        let para = "Long sentence here. Another sentence follows it. A third closes.\n\n";
+        let long_body = para.repeat(60);
+        std::fs::write(
+            &lib_path,
+            format!("---\ntitle: Big Lore\ntags: lore\n---\n\n{long_body}\n"),
+        )
+        .unwrap();
+
+        let parsed = parse_compound_file(&lib_path).unwrap();
+        assert_eq!(parsed.len(), 1, "fixture parses to one oversize entry");
+        let expanded = expand_oversize_entries(dedupe_duplicate_titles(parsed));
+        assert!(expanded.len() >= 2, "fixture body must split");
+        normalize_oversize_on_disk(&lib_path, 1, &expanded);
+
+        // Re-parse (the mtime bump invalidates the G2 cache): the file now
+        // carries the parts, nothing oversize.
+        let reparsed = parse_compound_file(&lib_path).unwrap();
+        assert_eq!(
+            reparsed.len(),
+            expanded.len(),
+            "the normalized file holds the split children"
+        );
+        for e in &reparsed {
+            assert!(
+                e.body.chars().count() <= crate::memory::CHUNK_CHAR_BUDGET,
+                "entry '{}' still oversize after normalization",
+                e.title
+            );
+        }
+        assert!(reparsed[0].title.starts_with("Big Lore - Part 1"));
+
+        // The playbook shape (no `codex` directory component) is untouched.
+        let engine_dir = root.join("data");
+        std::fs::create_dir_all(&engine_dir).unwrap();
+        let playbook_path = engine_dir.join("wupi.codex");
+        std::fs::write(
+            &playbook_path,
+            format!("---\ntitle: Big Lore\ntags: lore\n---\n\n{long_body}\n"),
+        )
+        .unwrap();
+        let parsed = parse_compound_file(&playbook_path).unwrap();
+        let expanded = expand_oversize_entries(dedupe_duplicate_titles(parsed));
+        normalize_oversize_on_disk(&playbook_path, 1, &expanded);
+        let reparsed = parse_compound_file(&playbook_path).unwrap();
+        assert_eq!(reparsed.len(), 1, "engine path never rewritten");
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// (2026-08-16 audit follow-up pin) A lore body containing a blank-line-

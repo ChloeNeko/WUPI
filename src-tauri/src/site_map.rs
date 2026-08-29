@@ -1121,8 +1121,10 @@ pub fn normalize_generated(map: &mut SiteMap) {
         kept.extend(others.into_iter().take(MAX_SITE_AREAS - kept.len()));
         map.areas = kept;
     }
-    let known: std::collections::HashSet<&str> =
-        map.areas.iter().map(|a| a.id.as_str()).collect();
+    // Owned ids, not borrows: steps 2/5/6 below mutate `map.areas` while
+    // this set stays live.
+    let known: std::collections::HashSet<String> =
+        map.areas.iter().map(|a| a.id.clone()).collect();
 
     // 2. Drop edges into unknown areas (targets removed by the cap, or ids
     //    the model hallucinated).

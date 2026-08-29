@@ -408,11 +408,11 @@ pub const TRACKER_PROMPT_CHAR_BUDGET: usize = ((CTX_FABLE as f32
 /// (2026-08-22 re-track hardening) The SAME derivation as
 /// [`TRACKER_PROMPT_CHAR_BUDGET`], but for the edit/reroll RE-TRACK pass
 /// (`FableTurnMode::TrackerRetrack`): CTX_FABLE − TRACKER_RETRACK_MAX_TOKENS
-/// (512) × chars-per-token. The re-track re-emits a full beat's bracket
-/// set, so its wall sits ABOVE the live turn's 384 (2026-08-27 evening
-/// decoupling — the edit path isn't beat-blocking) and its prompt budget
-/// is correspondingly TIGHTER — the pair must move together
-/// or the engine's over-budget REFUSAL fires on a prompt the lib.rs guard
+/// × chars-per-token. The re-track wall sits in LOCKSTEP with the live
+/// tracker's (both 512 — the 2026-08-27 evening final ruling; an earlier
+/// same-day ruling had briefly split them 384/1024), so the two prompt
+/// budgets derive identically — the pair must move together or the
+/// engine's over-budget REFUSAL fires on a prompt the lib.rs guard
 /// just blessed.
 pub const TRACKER_RETRACK_PROMPT_CHAR_BUDGET: usize = ((CTX_FABLE as f32
     - crate::fable_engine::TRACKER_RETRACK_MAX_TOKENS as f32)

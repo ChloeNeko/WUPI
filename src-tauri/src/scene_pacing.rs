@@ -197,6 +197,16 @@ const KINETIC_MOBILE: &[&str] = &[
     "leave", "leaves", "left", "leaving",
     "enter", "enters", "entered", "entering",
     "arrive", "arrives", "arrived", "arriving",
+    // (2026-08-29 module D1) The movement families the Chloe ruling removed
+    // from the COMBAT hard list stay MOTION (kinetic 1 → Exploration, never
+    // Combat): a sprint is traversal, not violence — the transit referee
+    // still taxes it through TRANSIT_VERBS.
+    "run", "runs", "running", "ran",
+    "sprint", "sprints", "sprinted", "sprinting",
+    "climb", "climbs", "climbed", "climbing",
+    "jump", "jumps", "jumped", "jumping",
+    "leap", "leaps", "leapt", "leaping", "leaped",
+    "swim", "swims", "swam", "swimming",
 ];
 
 // ---------------------------------------------------------------------------
@@ -386,8 +396,11 @@ mod tests {
         // Combat inflections.
         assert_eq!(mode_of("The goblin is attacking me."), SceneMode::Combat);
         assert_eq!(mode_of("I was attacked from the shadows."), SceneMode::Combat);
-        assert_eq!(mode_of("We swam across the lake."), SceneMode::Combat);
         assert_eq!(mode_of("They charged the gate."), SceneMode::Combat);
+        // (2026-08-29 module D1) Movement inflections → kinetic 1
+        // (Exploration), never Combat — the families left the hard list.
+        assert_eq!(mode_of("We swam across the lake."), SceneMode::Exploration);
+        assert_eq!(mode_of("I sprinted down the alley."), SceneMode::Exploration);
         // Mobile inflections → Exploration.
         assert_eq!(mode_of("I am walking to the market."), SceneMode::Exploration);
         assert_eq!(mode_of("We traveled north for hours."), SceneMode::Exploration);

@@ -198,10 +198,18 @@ pub fn begin_session_logging() {
         return;
     }
     let _ = SESSION_FILE.set(open_session_file());
+    // (2026-08-29 module I1) Default directive: INFO for the world, DEBUG
+    // for the app's own crates. The old bare "debug" let rustls/hyper/
+    // reqwest/tao DEBUG noise (CloseNotify, connection churn, NewEvents
+    // pairs) flood every session log — ~85% of the friend's log lines were
+    // third-party chatter while every WUPI telemetry line is emitted by
+    // `wupi_lib`/`wupi`/`fable` and keeps its DEBUG visibility. `RUST_LOG`
+    // still overrides verbatim.
+    let default_filter = "info,wupi_lib=debug,wupi=debug,fable=debug";
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter)),
         )
         .with_target(false)
         .with_writer(|| SessionWriter::new())

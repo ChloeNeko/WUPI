@@ -44,9 +44,12 @@ use std::path::{Component, Path, PathBuf};
 /// spirit of `schema_engine::MAX_DELTA_PASSES = 3` (the LLM-repair cliff).
 pub const MAX_TOOL_ITERATIONS: usize = 3;
 
-/// Cap on how many failed-tool carriers we keep for the next-turn retry prompt.
-/// Mirrors `MAX_FAILED_DELTA_ATTEMPTS` (lib.rs) — FIFO eviction above this.
-pub const MAX_FAILED_TOOL_ATTEMPTS: usize = 8;
+/// Cap on failed-tool carriers: NONE is needed — there is no persistent
+/// failed-tool queue. The repair feedback loop is per-iteration inside
+/// `run_agent_loop` (lib.rs): every failed call's error text rides the
+/// `<|tool_response>` turn into the next decode, capped naturally by
+/// `MAX_TOOL_ITERATIONS`. (The old `MAX_FAILED_TOOL_ATTEMPTS` constant was
+/// dead — nothing referenced it.)
 
 /// (2026-08-24 hybrid chat) The tool-call OPEN marker as it appears in a raw
 /// model turn. Pub so the hybrid API handoff can filter the local dispatcher's
@@ -364,6 +367,97 @@ pub fn is_readable(rel: &Path) -> bool {
     false
 }
 
+/// Normalize a model-supplied `path` argument BEFORE validation/execution
+/// (2026-08-29 tool-call repair, module A2). The observed failure chain: the
+/// model emits an absolute Windows path (`C:\Users\…\WUPI\data\docs\notes.txt`),
+/// the allowlist default-denies it as "not in a writable user-data tree", and
+/// the repair loop spins blind because the error never names the wanted
+/// shape. This pass converts the COMMON user intent into the install-relative
+/// form the tools actually take:
+///
+/// 1. Trim surrounding whitespace.
+/// 2. Strip wrapping quotes — ASCII `"…"`/`'…'` AND typographic `“…”`/`‘…’`
+///    (models quote path values when narrating what they're doing).
+/// 3. `\` → `/` (JSON args with legal `\\` escapes already hold single
+///    backslashes by the time they reach here).
+/// 4. When `install_root` is known and the path is absolute UNDER it, strip
+///    the root (case-insensitive — Windows FS) → install-relative.
+///
+/// A path that stays absolute (outside the install) or escapes is NOT
+/// rewritten into something legal — the caller's sandbox/allowlist gate
+/// rejects it with the teaching error, which is the model's cue for the
+/// next iteration.
+pub fn normalize_path_arg(raw: &str, install_root: Option<&Path>) -> String {
+    let mut s = raw.trim();
+    // Strip wrapping quote pairs (ASCII + typographic). A path the model
+    // quoted for prose reasons (`"data/docs/notes.md"`) is the same path.
+    loop {
+        let inner = if let Some(rest) = s.strip_prefix('"') {
+            rest.strip_suffix('"')
+        } else if let Some(rest) = s.strip_prefix('\'') {
+            rest.strip_suffix('\'')
+        } else if let Some(rest) = s.strip_prefix('\u{201C}') {
+            rest.strip_suffix('\u{201D}')
+        } else if let Some(rest) = s.strip_prefix('\u{2018}') {
+            rest.strip_suffix('\u{2019}')
+        } else {
+            None
+        };
+        match inner {
+            Some(u) => s = u.trim(),
+            None => break,
+        }
+    }
+    let mut p = s.replace('\\', "/");
+    if let Some(root) = install_root {
+        p = strip_install_root_prefix(&p, root);
+    }
+    p
+}
+
+/// Strip a leading absolute install-root prefix from a `/`-separated path,
+/// case-insensitively. `C:/WUPI/data/docs/x.md` (install at `C:\WUPI`) →
+/// `data/docs/x.md`. Byte-slice safe: a case-insensitive prefix match means
+/// the boundary lands on a char edge by construction.
+fn strip_install_root_prefix(p: &str, root: &Path) -> String {
+    let root_str = root.to_string_lossy().replace('\\', "/");
+    let root_norm = root_str.trim_end_matches('/');
+    if p.eq_ignore_ascii_case(root_norm) {
+        return String::new();
+    }
+    let with_slash = format!("{}/", root_norm);
+    if p.len() >= with_slash.len() && p[..with_slash.len()].eq_ignore_ascii_case(&with_slash) {
+        return p[with_slash.len()..].to_string();
+    }
+    p.to_string()
+}
+
+/// Normalize the `path` field of a parsed tool-call args object in place
+/// (the agent-loop chokepoint — one call site in `run_agent_loop`). The
+/// `{"raw": ...}` carrier is left untouched: it isn't a path, it's unparsed
+/// JSON kept verbatim for the repair loop's feedback.
+pub fn normalize_path_args(args: &mut serde_json::Value, install_root: &Path) {
+    let raw = match args.get("path").and_then(|v| v.as_str()) {
+        Some(p) => p.to_string(),
+        None => return,
+    };
+    let norm = normalize_path_arg(&raw, Some(install_root));
+    if norm != raw {
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert("path".to_string(), serde_json::Value::String(norm));
+        }
+    }
+}
+
+/// The teaching error for a path that is still absolute or escaping after
+/// normalization (module A2): names the WANTED shape so the repair loop's
+/// next iteration can actually fix the call instead of failing identically.
+fn path_shape_error(got: &str) -> ToolError {
+    ToolError::new(format!(
+        "path must be install-relative, e.g. data/docs/notes.txt (got {got})"
+    ))
+}
+
 /// Sandbox an arbitrary user-supplied path against the install root:
 /// - Reject absolute paths (caller must pass install-relative).
 /// - Reject any `..` component (canonicalization bypass).
@@ -443,8 +537,7 @@ impl ToolCtx {
     }
     /// Resolve a sandboxed relative path against the install root.
     pub fn resolve(&self, rel: &str) -> Result<PathBuf, ToolError> {
-        let safe = sandbox_path(rel)
-            .ok_or_else(|| ToolError::new(format!("unsafe path (absolute or traverses): {rel:?}")))?;
+        let safe = sandbox_path(rel).ok_or_else(|| path_shape_error(rel))?;
         Ok(self.install_root.join(safe))
     }
 }
@@ -796,8 +889,7 @@ impl Tool for FileRead {
         // read-only). The previous "read anything under the install" posture
         // exposed engine surfaces (wupi.sim, the .prompt files, session
         // logs) to the model for no workflow gain.
-        let safe = sandbox_path(&rel)
-            .ok_or_else(|| ToolError::new(format!("unsafe path (absolute or traverses): {rel:?}")))?;
+        let safe = sandbox_path(&rel).ok_or_else(|| path_shape_error(&rel))?;
         if !is_readable(&safe) {
             return Err(ToolError::new(format!(
                 "refused: {rel:?} is not readable (user data or data/wupi.codex only; engine files are off-limits)"
@@ -867,8 +959,7 @@ impl Tool for FileWrite {
                 "content exceeds 200 KB cap; split into smaller writes",
             ));
         }
-        let safe = sandbox_path(&path)
-            .ok_or_else(|| ToolError::new(format!("unsafe path: {path:?}")))?;
+        let safe = sandbox_path(&path).ok_or_else(|| path_shape_error(&path))?;
         if !is_writable(&safe) {
             return Err(ToolError::new(format!(
                 "path {path:?} is not in a writable user-data tree"
@@ -934,8 +1025,7 @@ impl Tool for FileDelete {
     }
     fn validate_args(&self, args: &serde_json::Value) -> Result<(), ToolError> {
         let path = req_str_nonempty(args, "path")?;
-        let safe = sandbox_path(&path)
-            .ok_or_else(|| ToolError::new(format!("unsafe path: {path:?}")))?;
+        let safe = sandbox_path(&path).ok_or_else(|| path_shape_error(&path))?;
         if !is_writable(&safe) {
             return Err(ToolError::new(format!(
                 "path {path:?} is not in a writable user-data tree"
@@ -974,8 +1064,7 @@ impl Tool for FileList {
         let rel = req_str(args, "path")?;
         // Same read scope as file_read (2026-08-24): listings stay inside the
         // readable trees so directory walks can't probe engine surfaces.
-        let safe = sandbox_path(&rel)
-            .ok_or_else(|| ToolError::new(format!("unsafe path (absolute or traverses): {rel:?}")))?;
+        let safe = sandbox_path(&rel).ok_or_else(|| path_shape_error(&rel))?;
         if !is_readable(&safe) {
             return Err(ToolError::new(format!(
                 "refused: {rel:?} is not listable (user-data trees only)"
@@ -1604,6 +1693,119 @@ mod tests {
         let err = validate_fable_state_tool("file_read", &args("{}"))
             .expect_err("not a stateful tool");
         assert!(err.to_string().contains("not a fable-state tool"));
+    }
+
+    // === normalize_path_arg (2026-08-29 module A2) =========================
+
+    #[test]
+    fn normalize_path_arg_table() {
+        let root = Path::new("C:\\WUPI");
+        // (input, expected) — the common model-emitted shapes all collapse to
+        // the install-relative form the tools take.
+        let cases: Vec<(&str, &str)> = vec![
+            // Already-correct relative paths pass through untouched.
+            ("data/docs/notes.txt", "data/docs/notes.txt"),
+            // Whitespace + wrapping quotes (ASCII + typographic) stripped.
+            ("  data/docs/notes.txt  ", "data/docs/notes.txt"),
+            ("\"data/docs/notes.txt\"", "data/docs/notes.txt"),
+            ("\u{201C}data/docs/notes.txt\u{201D}", "data/docs/notes.txt"),
+            ("'apps/fable/cards/Liam/Liam.sim'", "apps/fable/cards/Liam/Liam.sim"),
+            // Backslashes → forward slashes.
+            ("data\\docs\\notes.txt", "data/docs/notes.txt"),
+            // Absolute path UNDER the install root (either separator, any
+            // case) → install-relative.
+            ("C:\\WUPI\\data\\docs\\notes.txt", "data/docs/notes.txt"),
+            ("c:/wupi/data/docs/notes.txt", "data/docs/notes.txt"),
+            ("C:/WUPI/apps/fable/cards/Liam/Liam.sim", "apps/fable/cards/Liam/Liam.sim"),
+            ("\"C:\\WUPI\\data\\docs\\notes.txt\"", "data/docs/notes.txt"),
+        ];
+        for (input, want) in cases {
+            assert_eq!(
+                normalize_path_arg(input, Some(root)),
+                want,
+                "input: {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_path_arg_leaves_foreign_absolutes_absolute() {
+        // An absolute path NOT under the install root is NOT rewritten into
+        // something legal — the sandbox gate rejects it with the teaching
+        // error, which is the model's cue for the next iteration.
+        let root = Path::new("C:\\WUPI");
+        let got = normalize_path_arg("D:\\Other\\place\\notes.txt", Some(root));
+        assert_eq!(got, "D:/Other/place/notes.txt");
+        assert!(sandbox_path(&got).is_none(), "still rejects as absolute");
+        // No install root available (pure call site) — same discipline.
+        assert_eq!(
+            normalize_path_arg("C:\\Users\\shark\\notes.txt", None),
+            "C:/Users/shark/notes.txt"
+        );
+    }
+
+    #[test]
+    fn normalize_path_args_rewrites_the_path_field_in_place() {
+        let root = Path::new("C:\\WUPI");
+        let mut args = serde_json::json!({
+            "path": "  \"C:\\WUPI\\data\\docs\\x.md\"  ",
+            "content": "hi"
+        });
+        normalize_path_args(&mut args, root);
+        assert_eq!(args["path"], "data/docs/x.md");
+        assert_eq!(args["content"], "hi");
+        // The {"raw": ...} carrier is untouched — it isn't a path.
+        let mut carrier = serde_json::json!({ "raw": "{path: C:\\WUPI\\x}" });
+        normalize_path_args(&mut carrier, root);
+        assert_eq!(carrier["raw"], "{path: C:\\WUPI\\x}");
+        assert!(carrier.get("path").is_none());
+    }
+
+    /// The teaching error names the WANTED shape so the repair loop's next
+    /// iteration can actually fix the call (the 2026-08-29 blind-loop fix).
+    #[test]
+    fn unsafe_paths_error_teaches_the_shape() {
+        let err = FileWrite
+            .validate_args(&args(r#"{"path":"D:/elsewhere/x.txt","content":"hi"}"#))
+            .unwrap_err();
+        assert!(
+            err.message.contains("path must be install-relative"),
+            "teaching error missing: {err}"
+        );
+        assert!(err.message.contains("data/docs/notes.txt"));
+        assert!(err.message.contains("D:/elsewhere/x.txt"));
+        let err = FileRead
+            .execute(&args(r#"{"path":"D:/elsewhere/x.txt"}"#), &ToolCtx::new(PathBuf::from("C:/WUPI")))
+            .unwrap_err();
+        assert!(err.message.contains("path must be install-relative"));
+    }
+
+    /// End-to-end through the normalization chokepoint shape: a Windows
+    /// absolute path under the install root becomes a legal write.
+    #[test]
+    fn file_write_accepts_absolute_path_under_install_root() {
+        let (_guard, ctx) = temp_ctx();
+        let mut args = serde_json::json!({
+            // tempdir roots have no drive-letter on some platforms; build the
+            // absolute form FROM the ctx root so the strip is exercised.
+            "path": "",
+            "content": "hello"
+        });
+        let abs = ctx
+            .install_root
+            .join("data")
+            .join("docs")
+            .join("notes.txt")
+            .to_string_lossy()
+            .replace('/', "\\");
+        args["path"] = serde_json::Value::String(abs);
+        normalize_path_args(&mut args, &ctx.install_root);
+        FileWrite.validate_args(&args).expect("must validate post-normalize");
+        FileWrite.execute(&args, &ctx).unwrap();
+        let out = FileRead
+            .execute(&serde_json::json!({"path": "data/docs/notes.txt"}), &ctx)
+            .unwrap();
+        assert_eq!(out, "hello");
     }
 
     // === Tool round-trips (use tempdir) =====================================

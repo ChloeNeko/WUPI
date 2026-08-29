@@ -746,7 +746,9 @@ pub fn fallback() -> SimCard {
 pub fn load_or_fallback(path: &Path) -> SimCard {
     match try_load(path) {
         Ok(card) => {
-            tracing::info!(
+            // (2026-08-29 module H3) DEBUG — routine load telemetry, not
+            // session-log signal (the cache-miss twin logs the same).
+            tracing::debug!(
                 card_path = %path.display(),
                 card_id = %card.id,
                 card_name = %card.name,
@@ -764,6 +766,88 @@ pub fn load_or_fallback(path: &Path) -> SimCard {
             fallback()
         }
     }
+}
+
+// ── (2026-08-29 module H1+H2) The parsed-card process cache ────────────────
+
+struct CardCacheEntry {
+    /// The `(mtime, size)` the entry was parsed under. `None` = the file
+    /// didn't stat (missing/placeholder) — a negative entry.
+    key: Option<(std::time::SystemTime, u64)>,
+    /// `None` = the load FAILED under `key` (the negative cache — the WARN
+    /// fired once; later identical-stat loads return the fallback silently,
+    /// killing the repeated-WARN churn a OneDrive placeholder caused).
+    card: Option<std::sync::Arc<SimCard>>,
+}
+
+static CARD_LOAD_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, CardCacheEntry>>,
+> = std::sync::OnceLock::new();
+
+fn card_load_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, CardCacheEntry>> {
+    CARD_LOAD_CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn card_stat_key(path: &Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// (2026-08-29 module H1+H2) The cached walker-side loader. The friend logs'
+/// O(N²) parse storms — every listing / links-map / by-id resolve re-parsing
+/// every card — collapse to one parse per (path, mtime, size) per process.
+///
+/// Invalidation is BY KEY, not by writer hook: every card write (IPC write,
+/// portrait, rename, intro-variant) changes the file's mtime, so a stale
+/// entry can never serve; a delete leaves an inert entry no walker reaches
+/// again. The failure path is cached NEGATIVELY (once per stat shape): a
+/// OneDrive placeholder that passes `is_file()` then fails the read WARNs
+/// ONCE per process instead of on every listing, and the fallback stub
+/// stays excluded from listings (its `card_type` is "system").
+///
+/// The success log is DEBUG (module H3): routine cache-miss telemetry, not
+/// session-log signal.
+pub fn load_or_fallback_cached(path: &Path) -> SimCard {
+    let key = card_stat_key(path);
+    {
+        let cache = card_load_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache.get(path) {
+            if entry.key == key {
+                return match &entry.card {
+                    Some(card) => (**card).clone(),
+                    // Silent: the WARN below already fired for this stat.
+                    None => fallback(),
+                };
+            }
+        }
+    }
+    let (stored, out) = match try_load(path) {
+        Ok(card) => {
+            tracing::debug!(
+                card_path = %path.display(),
+                card_id = %card.id,
+                card_name = %card.name,
+                intros = card.introductions.len(),
+                "simulation card loaded (cache miss)"
+            );
+            let out = card.clone();
+            (Some(std::sync::Arc::new(card)), out)
+        }
+        Err(e) => {
+            tracing::warn!(
+                card_path = %path.display(),
+                error = %format!("{e}"),
+                "simulation card load failed; using minimal fallback (persona section suppressed; warning once per process for this file)"
+            );
+            (None, fallback())
+        }
+    };
+    card_load_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(path.to_path_buf(), CardCacheEntry { key, card: stored });
+    out
 }
 
 fn try_load(path: &Path) -> anyhow::Result<SimCard> {
@@ -1514,6 +1598,45 @@ fn nested_text(root: roxmltree::Node, parent: &str, child: &str) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (2026-08-29 module H1+H2) The parsed-card process cache: a changed
+    /// file re-parses (mtime+size key), an unchanged file hits the cache,
+    /// and a FAILED load (the OneDrive-placeholder shape) returns the
+    /// fallback without re-warning once the negative entry is in.
+    #[test]
+    fn card_load_cache_invalidates_on_write_and_caches_failures() {
+        let dir = std::env::temp_dir().join("wupi_card_cache_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Cache Test.sim");
+
+        // A failed load (missing file) → fallback + negative entry.
+        let card = load_or_fallback_cached(&path);
+        assert_eq!(card.id, FALLBACK_ID);
+        // The negative hit is silent + still the fallback.
+        let card = load_or_fallback_cached(&path);
+        assert_eq!(card.id, FALLBACK_ID);
+
+        // Write a v2 card (different size than "missing" → key change) —
+        // the next load sees it.
+        std::fs::write(&path, V2_NPC).unwrap();
+        let card = load_or_fallback_cached(&path);
+        assert_eq!(card.id, "liam");
+        assert!(card.format_v2);
+
+        // An EDIT (content + size change) re-parses: different parsed id.
+        let edited = V2_NPC.replace("<id>liam</id>", "<id>liam_v2</id>");
+        assert_ne!(edited.len(), V2_NPC.len(), "fixture edit must change the size");
+        std::fs::write(&path, &edited).unwrap();
+        let card = load_or_fallback_cached(&path);
+        assert_eq!(card.id, "liam_v2", "a rewritten card must re-parse");
+
+        // Unchanged reload hits the cache (same result, no re-parse).
+        let card = load_or_fallback_cached(&path);
+        assert_eq!(card.id, "liam_v2");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     const SAMPLE: &str = r#"<?xml version="1.0"?>
 <sim_card>

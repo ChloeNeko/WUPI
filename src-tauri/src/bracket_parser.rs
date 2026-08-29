@@ -611,6 +611,70 @@ fn dedup_equivalent(seen: &BracketCommand, cmd: &BracketCommand) -> bool {
 /// The B8 same-turn dedup below compares through [`dedup_equivalent`] —
 /// exact `PartialEq` except that BELT/PACK ignore the `asserted`
 /// provenance marker.
+/// (2026-08-29 module C2) Split a combined `[PRESENCE a "stance", b
+/// "stance"]` bracket into one bracket per NPC. The combined form parses
+/// today but collapses everything after the first token into ONE stance,
+/// and the applier's fragment-alias resolver then runs over the polluted
+/// surface ~11× per turn. Quote-aware: a comma inside a quoted stance is
+/// literal (`"by the table, arms crossed"`). Repeated npc ids inside one
+/// bracket dedupe — first assertion wins. Returns the original (single)
+/// bracket when there is nothing to split, so the caller's normal path —
+/// including its reject behavior — is unchanged.
+fn split_combined_presence(bracket: &str) -> Vec<String> {
+    let Some(rest) = strip_prefix_ci(bracket, "PRESENCE") else {
+        return vec![bracket.to_string()];
+    };
+    let rest = rest.trim();
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quote: Option<char> = None;
+    for c in rest.chars() {
+        match in_quote {
+            Some(q) => {
+                current.push(c);
+                if c == q || (q == '“' && c == '”') {
+                    in_quote = None;
+                }
+            }
+            None => {
+                if c == '"' || c == '“' {
+                    in_quote = Some(c);
+                    current.push(c);
+                } else if c == ',' {
+                    segments.push(current.trim().to_string());
+                    current.clear();
+                } else {
+                    current.push(c);
+                }
+            }
+        }
+    }
+    segments.push(current.trim().to_string());
+    if segments.len() <= 1 {
+        return vec![bracket.to_string()];
+    }
+    let mut seen: Vec<String> = Vec::new();
+    let mut out: Vec<String> = Vec::new();
+    for seg in segments.into_iter().filter(|s| !s.is_empty()) {
+        let id = seg
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_lowercase();
+        if id.is_empty() || seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        out.push(format!("PRESENCE {seg}"));
+    }
+    if out.is_empty() {
+        vec![bracket.to_string()]
+    } else {
+        out
+    }
+}
+
 pub fn parse(raw: &str) -> ParsedNarration {
     // Bug A fix (2026-07-28): pre-extract fenced JSON blocks BEFORE the
     // bracket scan. Modern instruct-tuned models reach for JSON when they
@@ -654,9 +718,26 @@ pub fn parse(raw: &str) -> ParsedNarration {
         // terminator. Indices returned by `parse_one` are relative to this
         // slice (not the full `raw`), so the caller adds `end + 1`.
         let text_after = &raw[end + 1..];
+        // (2026-08-29 module C2) A combined `[PRESENCE a "…", b "…"]`
+        // bracket splits into one bracket per NPC — each parses (and
+        // resolves) exactly once; duplicate ids inside one bracket dedupe.
+        // The `!= bracket` arm catches the fully-deduped shape (one clean
+        // sub rebuilt from a multi-segment original).
+        let presence_subs = split_combined_presence(bracket);
+        if presence_subs.len() != 1 || presence_subs[0].as_str() != bracket {
+            for sub in &presence_subs {
+                if let Some((cmd, _)) = parse_one(sub, text_after) {
+                    commands.push(cmd);
+                }
+            }
+            i = end + 1;
+            continue;
+        }
         match parse_one(bracket, text_after) {
             Some((cmd, consumed_after_bracket)) => {
-                commands.push(cmd);
+                // (2026-08-29 module B4a) An embedded ` +` item split expands
+                // into one command per segment.
+                commands.extend(expand_item_split(cmd));
                 // For CHARACTER_TURN we also consumed the body + close tag;
                 // advance past them.
                 i = end + 1 + consumed_after_bracket;
@@ -689,7 +770,7 @@ pub fn parse(raw: &str) -> ParsedNarration {
     // commands" → frozen schema.
     for body in &json_bodies {
         if let Some(cmd) = parse_json_command(body) {
-            commands.push(cmd);
+            commands.extend(expand_item_split(cmd));
         } else {
             // Retry as text brackets: the body may be a text bracket the
             // model wrapped in a ```json fence.
@@ -1391,6 +1472,39 @@ fn has_control_chars(s: &str) -> bool {
     })
 }
 
+/// (2026-08-29 module B4a) Expand a parsed BELT/PACK/NPC_ITEM command whose
+/// item name carried an embedded ` +` split into ONE command per segment
+/// (each segment re-run through `clean_item_name`; segments that fail the
+/// gates drop individually). Every other command passes through as-is.
+/// Applied at every command-minting push site so text brackets, fence
+/// hybrids, and JSON duals behave identically.
+fn expand_item_split(cmd: BracketCommand) -> Vec<BracketCommand> {
+    let segments = match &cmd {
+        BracketCommand::Belt { item_name, .. }
+        | BracketCommand::Pack { item_name, .. }
+        | BracketCommand::NpcItem { item_name, .. } => split_embedded_item_names(item_name),
+        _ => return vec![cmd],
+    };
+    if segments.len() <= 1 {
+        return vec![cmd];
+    }
+    let mut out = Vec::with_capacity(segments.len());
+    for seg in segments {
+        if let Some(n) = clean_item_name(&seg) {
+            let mut c = cmd.clone();
+            match &mut c {
+                BracketCommand::Belt { item_name, .. }
+                | BracketCommand::Pack { item_name, .. }
+                | BracketCommand::NpcItem { item_name, .. } => *item_name = n,
+                // The early return above guarantees an item command.
+                _ => unreachable!("expand_item_split on a non-item command"),
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// (2026-08-17 E4B shakedown P1a) The inventory-name gate, applied to every
 /// EQUIP/BELT/PACK `item_name` (text + JSON duals). The E4B occasionally
 /// mangles its own quoting — names arrive with literal leading/trailing
@@ -1402,6 +1516,77 @@ fn has_control_chars(s: &str) -> bool {
 /// at INV_NAME_MAX. Returns `None` when the input carries control chars or
 /// what remains is empty / a 1-2 char fragment — a dropped bracket is
 /// better than a phantom `"Worn` stack the merge logic can never match.
+/// (2026-08-29 module B4a) Split an item name carrying embedded ` +`
+/// boundaries — the tracker emitting TWO items in one token
+/// (`[NPC_ITEM gideon +Adopolous +Pipe]` → name "Adopolous +Pipe", the
+/// second item swallowed into the first by the multi-word bare rule).
+/// Quote-aware: a ` +` inside a quoted span is literal name text. Each
+/// following segment loses its leading `+`. One segment (the whole input)
+/// when there is nothing to split; empty vec when every segment empties.
+pub fn split_embedded_item_names(name: &str) -> Vec<String> {
+    const OPENERS: &[char] = &['"', '“', '\'', '‘'];
+    let chars: Vec<char> = name.chars().collect();
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quote: Option<char> = None;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = in_quote {
+            current.push(c);
+            if c == q || (q == '“' && c == '”') || (q == '‘' && c == '’') {
+                in_quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if OPENERS.contains(&c) {
+            in_quote = Some(c);
+            current.push(c);
+            i += 1;
+            continue;
+        }
+        if c == ' ' && i + 1 < chars.len() && chars[i + 1] == '+' {
+            segments.push(current.trim().to_string());
+            current.clear();
+            i += 2; // skip the boundary's ` +`
+            continue;
+        }
+        current.push(c);
+        i += 1;
+    }
+    segments.push(current.trim().to_string());
+    let cleaned: Vec<String> = segments.into_iter().filter(|s| !s.is_empty()).collect();
+    if cleaned.len() == 1 && cleaned[0] == name.trim() {
+        // Nothing split — return the single original segment (callers use a
+        // 1-length vec as "no split").
+        return cleaned;
+    }
+    cleaned
+}
+
+/// (2026-08-29 module B4b) The final-word VERB garbage gate's stoplist —
+/// past-tense verbs the tracker drags into item names when it inventories
+/// prose instead of objects ("tobacco smell came", "pipe turned"). Same
+/// last-word anchoring as the person-noun guard: a real object name never
+/// ENDS in one of these. Pub so the F2 save-heal sweep reuses the exact
+/// gate.
+pub fn item_name_is_verb_garbage(name: &str) -> bool {
+    const VERB_TAILS: &[&str] = &[
+        "came", "turned", "sat", "stood", "said", "looked", "walked", "ran",
+        "smelled", "felt",
+    ];
+    let key = name.trim().to_lowercase();
+    if key.is_empty() {
+        return false;
+    }
+    let last_word = key
+        .rsplit(|c: char| c.is_whitespace() || c == '-' || c == '_')
+        .next()
+        .unwrap_or("");
+    VERB_TAILS.contains(&last_word)
+}
+
 fn clean_item_name(raw: &str) -> Option<String> {
     const EDGE_QUOTES: &[char] = &['"', '\'', '“', '”', '‘', '’'];
     if has_control_chars(raw) {
@@ -1469,6 +1654,13 @@ fn clean_item_name(raw: &str) -> Option<String> {
         cleaned
     };
     if matches!(cleaned.to_lowercase().as_str(), "none" | "null" | "nan" | "extra") {
+        return None;
+    }
+    // (2026-08-29 module B4b) Final-word verb gate — "tobacco smell came" /
+    // "pipe turned" are the tracker inventoring PROSE, not objects; a real
+    // item name never ends in a past-tense verb. Mirrors the person-noun
+    // suffix guard's pattern.
+    if item_name_is_verb_garbage(cleaned) {
         return None;
     }
     let count = cleaned.chars().count();
@@ -2002,8 +2194,22 @@ fn scan_text_brackets(body: &str, commands: &mut Vec<BracketCommand>) {
         let Some(end) = find_bracket_close(bytes, start) else { break };
         let bracket = &body[start + 1..end];
         let text_after = &body[end + 1..];
+        // (2026-08-29 module C2) Combined-PRESENCE split — same as `parse`'s
+        // main loop, so fence-hybrid bodies behave identically.
+        let presence_subs = split_combined_presence(bracket);
+        if presence_subs.len() != 1 || presence_subs[0].as_str() != bracket {
+            for sub in &presence_subs {
+                if let Some((cmd, _)) = parse_one(sub, text_after) {
+                    commands.push(cmd);
+                }
+            }
+            // PRESENCE consumes nothing past its closer (only CHARACTER_TURN
+            // does), so advance exactly past the bracket.
+            i = end + 1;
+            continue;
+        }
         if let Some((cmd, consumed_after_bracket)) = parse_one(bracket, text_after) {
-            commands.push(cmd);
+            commands.extend(expand_item_split(cmd));
             i = end + 1 + consumed_after_bracket;
         } else {
             i = end + 1;
@@ -3708,6 +3914,9 @@ fn parse_one(bracket: &str, text_after: &str) -> Option<(BracketCommand, usize)>
         if npc_id.is_empty() {
             return None;
         }
+        // A combined assertion (`a "…", b "…"`) was pre-split by
+        // `split_combined_presence` in `parse()` — each sub-bracket arriving
+        // here carries exactly one npc_id.
         // Strip a single surrounding pair of double quotes if present
         // (`"by the table"` → `by the table`). Only the outermost pair —
         // internal quotes are preserved. Then the stance-cleanup contract
@@ -5211,6 +5420,154 @@ mod tests {
             }
             other => panic!("expected one PACK add, got {other:?}"),
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // (2026-08-29 module B4) Item-name garbage gates: embedded ` +` splits
+    // + the final-word verb stoplist — the friend-log garbage class
+    // ("Adopolous +Pipe", "tobacco smell came", "pipe turned").
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn embedded_plus_splits_into_separate_items() {
+        // The observed shape: two items in one token, the second swallowed
+        // into the first by the multi-word bare rule.
+        let parsed = parse("[NPC_ITEM gideon +Adopolous +Pipe]");
+        let names: Vec<&str> = parsed
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                BracketCommand::NpcItem { item_name, npc_id, remove: false, .. } => {
+                    assert_eq!(npc_id, "gideon");
+                    Some(item_name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["Adopolous", "Pipe"], "split: {:?}", parsed.commands);
+    }
+
+    #[test]
+    fn embedded_plus_split_survives_pack_and_belt() {
+        let parsed = parse("[PACK +Rope +Torch]");
+        match parsed.commands.as_slice() {
+            [BracketCommand::Pack { item_name: a, .. }, BracketCommand::Pack { item_name: b, .. }] => {
+                assert_eq!(a, "Rope");
+                assert_eq!(b, "Torch");
+            }
+            other => panic!("expected two PACK adds, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn split_is_quote_aware() {
+        // A ` +` inside a quoted span is literal name text.
+        let segs = split_embedded_item_names("\"rod +7\"");
+        assert_eq!(segs, vec!["\"rod +7\""]);
+        // No split → single segment identical to the trimmed input.
+        assert_eq!(split_embedded_item_names("Worn Traveling Cloak"), vec!["Worn Traveling Cloak"]);
+        // Multi-split.
+        assert_eq!(split_embedded_item_names("A +B +C"), vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn verb_tailed_names_reject() {
+        // The observed garbage: prose fragments the tracker minted as items.
+        for garbage in ["tobacco smell came", "pipe turned", "figure sat", "bottle stood"] {
+            let parsed = parse(&format!("[PACK +{garbage}]"));
+            assert!(
+                parsed.commands.is_empty(),
+                "verb-tailed name must reject: {garbage} → {:?}",
+                parsed.commands
+            );
+        }
+        // Real object names never end in the stoplist verbs — untouched.
+        for fine in ["Brass Camel", "He Came At Dawn Banner", "Turning Key"] {
+            let parsed = parse(&format!("[PACK +{fine}]"));
+            assert_eq!(parsed.commands.len(), 1, "legal name must survive: {fine}");
+        }
+    }
+
+    #[test]
+    fn verb_garbage_gate_is_word_anchored() {
+        assert!(item_name_is_verb_garbage("tobacco smell CAME"));
+        assert!(item_name_is_verb_garbage("ran"));
+        // Hyphen/underscore are word separators: the TAIL decides.
+        assert!(item_name_is_verb_garbage("figure-sat"));
+        // "looked-away" tails on "away" — not a verb, must not fire.
+        assert!(!item_name_is_verb_garbage("looked-away"));
+        assert!(!item_name_is_verb_garbage("cameo brooch"));
+        assert!(!item_name_is_verb_garbage(""));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // (2026-08-29 module C2) Combined-PRESENCE brackets split into one
+    // assertion per NPC; duplicate ids dedupe; quoted commas stay literal.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn combined_presence_splits_per_npc() {
+        let parsed = parse("[PRESENCE abba \"behind the bar, polishing a glass\", gideon \"at the door\"]");
+        let mut ids = Vec::new();
+        let mut stances = Vec::new();
+        for c in &parsed.commands {
+            if let BracketCommand::Presence { npc_id, stance } = c {
+                ids.push(npc_id.clone());
+                stances.push(stance.clone());
+            }
+        }
+        assert_eq!(ids, vec!["abba", "gideon"], "one assertion per NPC: {ids:?}");
+        // The comma INSIDE abba's quoted stance is literal — the stance
+        // survives intact instead of swallowing gideon's segment.
+        assert_eq!(stances[0], "behind the bar, polishing a glass");
+        assert_eq!(stances[1], "at the door");
+    }
+
+    #[test]
+    fn combined_presence_dedupes_repeated_ids() {
+        let parsed = parse("[PRESENCE abba \"wary\", gideon \"calm\", abba \"relaxed\"]");
+        let ids: Vec<&str> = parsed
+            .commands
+            .iter()
+            .filter_map(|c| match c {
+                BracketCommand::Presence { npc_id, .. } => Some(npc_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["abba", "gideon"], "first assertion wins");
+    }
+
+    #[test]
+    fn single_presence_unchanged_by_split_path() {
+        // No top-level comma → the original path (incl. its stance cleanup)
+        // is untouched.
+        let parsed = parse("[PRESENCE elara by the table]");
+        match parsed.commands.as_slice() {
+            [BracketCommand::Presence { npc_id, stance }] => {
+                assert_eq!(npc_id, "elara");
+                assert_eq!(stance, "by the table");
+            }
+            other => panic!("expected one PRESENCE, got {other:?}"),
+        }
+        // A comma inside the QUOTED stance of a single assertion does not
+        // split.
+        let parsed = parse("[PRESENCE elara \"by the table, arms crossed\"]");
+        match parsed.commands.as_slice() {
+            [BracketCommand::Presence { stance, .. }] => {
+                assert_eq!(stance, "by the table, arms crossed");
+            }
+            other => panic!("expected one PRESENCE, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rank_words_read_as_persons() {
+        // (module B4c, in lib.rs — pinned here for the name-gate family)
+        // Covered by lib.rs's item_name_looks_like_person tests; this test
+        // pins the PARSER side: a rank-tailed NPC_ITEM add still parses
+        // (the reject happens in the applier's person guard, by design).
+        let parsed = parse("[PACK +the old Colonel]");
+        assert_eq!(parsed.commands.len(), 1, "parser stays permissive; applier owns the person reject");
     }
 
     // ─────────────────────────────────────────────────────────────────────
