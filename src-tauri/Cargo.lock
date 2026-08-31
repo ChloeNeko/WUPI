@@ -6616,7 +6616,7 @@ dependencies = [
 
 [[package]]
 name = "wupi"
-version = "0.32.2"
+version = "0.33.0"
 dependencies = [
  "anyhow",
  "cc",
