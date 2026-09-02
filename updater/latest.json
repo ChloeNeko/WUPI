@@ -1,11 +1,11 @@
 {
-  "version": "0.33.3",
-  "notes": "WUPI Version 0.33.3",
-  "pub_date": "2026-09-02T03:02:49.068Z",
+  "version": "0.33.4",
+  "notes": "WUPI Version 0.33.4",
+  "pub_date": "2026-09-02T03:51:55.659Z",
   "platforms": {
     "windows-x86_64": {
-      "url": "https://github.com/ChloeNeko/WUPI/releases/download/v0.33.3/WUPI.zip",
-      "sha256": "e38321013dfac52fd1aa3261f9d274428c3e1f9a0e9fce19627a990447f48d24"
+      "url": "https://github.com/ChloeNeko/WUPI/releases/download/v0.33.4/WUPI.zip",
+      "sha256": "67f6112032c1de1677c3d338457ad8d3b8a3876c8faada6def550113efa2d17d"
     }
   }
 }
